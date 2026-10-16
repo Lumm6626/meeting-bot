@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 会议记录/
 models/
+*.egg-info/
