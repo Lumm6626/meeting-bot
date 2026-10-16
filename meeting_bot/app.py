@@ -80,7 +80,13 @@ class MainWindow(QMainWindow):
         try:
             diarizer = Diarizer(self.settings)
         except DiarizationError as e:
-            QMessageBox.warning(self, "说话人功能不可用", f"{e}\n\n将继续记录，但无法区分说话人。")
+            # 预期内：未配置 HF_TOKEN / 模型不可用等
+            self._warn_diarizer_unavailable(e)
+            diarizer = None
+        except Exception as e:
+            # 非预期：Pipeline.from_pretrained 的网络异常（HTTPError/ConnectionError）等。
+            # Qt 槽内异常若外冒会直接终止进程（qFatal），故与预期内一样降级为「无说话人」继续记录。
+            self._warn_diarizer_unavailable(e)
             diarizer = None
         self.recorder = Recorder(self.settings, translator=translator, diarizer=diarizer)
         self.recorder.on_segment(self.bridge.segment.emit)
@@ -92,6 +98,9 @@ class MainWindow(QMainWindow):
             args=(self.title_input.text().strip(),),
             daemon=True,
         ).start()
+
+    def _warn_diarizer_unavailable(self, e: Exception) -> None:
+        QMessageBox.warning(self, "说话人功能不可用", f"{e}\n\n将继续记录，但无法区分说话人。")
 
     def _on_segment(self, seg):
         name = self.recorder.store.display_name(seg.speaker)
@@ -123,15 +132,19 @@ class MainWindow(QMainWindow):
             return
         self.stop_btn.setEnabled(False)
         self.status.setText("正在收尾（补译 + 生成纪要）…")
+        # Qt 控件只能在 GUI 线程访问：标题在主线程取值、recorder 取快照，
+        # finish() 线程内不再触碰任何控件，也不再动态查 self.recorder。
+        title_hint = self.title_input.text().strip()
+        recorder = self.recorder
 
         def finish():
-            self.recorder.stop()
-            title = self.title_input.text().strip() or self.recorder.title or "未命名会议"
+            recorder.stop()
+            title = title_hint or recorder.title or "未命名会议"
             try:
                 transcript_path, minutes_path = export_all(
-                    self.recorder.store, self.settings, title,
-                    self.recorder.started_at or datetime.now(),
-                    translator=self.recorder.translator)
+                    recorder.store, self.settings, title,
+                    recorder.started_at or datetime.now(),
+                    translator=recorder.translator)
                 self.bridge.finished.emit(True,
                     f"已生成：\n逐字稿：{transcript_path}\n纪要：{minutes_path}")
             except Exception as e:
@@ -147,6 +160,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "完成", msg)
         else:
             QMessageBox.critical(self, "导出失败", msg)
+
+    def closeEvent(self, e):
+        """关闭窗口：录制 / 收尾中先确认，避免静默丢弃本次记录。"""
+        if self.recorder is not None and not self.start_btn.isEnabled():
+            ret = QMessageBox.question(
+                self, "退出确认",
+                "正在录制/生成纪要，退出将丢弃本次记录。确定退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ret != QMessageBox.StandardButton.Yes:
+                e.ignore()
+                return
+            try:
+                self.recorder.stop()
+            except Exception:
+                pass
+        e.accept()
 
 
 def main():

@@ -811,3 +811,34 @@ def test_diarize_worker_survives_post_label_error(monkeypatch):
     assert len(r.store.segments()) == 3
     assert all(s.speaker == "" for s in r.store.segments())   # 分配失败 → 无人被标注
     assert any("说话人标注失败" in m for m in statuses)
+
+
+# ---------------------------------------------------------------------------
+# Task 12 修复轮 1：stop-before-start 守卫（Major-3）
+# ---------------------------------------------------------------------------
+
+def test_start_after_stop_does_not_open_capture(monkeypatch):
+    """Major-3 回归：stop() 先于 start() 落地时，start() 不得打开采集。
+
+    场景：用户点「开始记录」后立刻点「结束并生成纪要」——start() 在工作线程里
+    晚于 GUI 线程的 stop() 执行。旧实现照常 _capture.start() 并跑主循环（_stop
+    已置位 → 主循环立即退出），但此后无人再调用 stop()：采集被打开却永不关闭，
+    loopback 通道一直占用到进程退出。守卫必须在 _capture.start() 之前返回。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    capture = FakeCapture()
+    r = Recorder(_settings(), capture=capture, asr=FakeASR(),
+                 translator=FakeTranslator(), diarizer=None)
+    statuses = []
+    r.on_status(statuses.append)
+
+    r.stop()                    # stop-before-start：先到者把 _stop 置位
+    r.start("竞态会议")          # 晚到的 start 必须被取消
+
+    assert capture.started is False          # 采集从未被打开（旧实现此处为 True）
+    assert statuses[-1] == "录制已取消"
+    assert r.title == ""                     # 取消后不接受标题
+    assert r.started_at is None              # 未进入录制
+    assert r.store.segments() == []          # 无语句入库
+    assert r._translate_thread is None       # 翻译 worker 未启动
+    assert r._diarize_thread is None

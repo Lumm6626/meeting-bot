@@ -146,6 +146,12 @@ class Recorder:
         return self._translator
 
     def start(self, title: str = "") -> None:
+        if self._stop.is_set():
+            # stop() 先于 start() 落地（用户点「开始」后立刻点「结束」，start 所在线程晚一步执行）：
+            # 此时若照常开采集，主循环会因 _stop 已置位而立刻退出，且再无人调用 stop() ——
+            # 采集被打开却永不关闭（loopback 占用到进程退出）。守卫必须在 _capture.start() 之前。
+            self._say("录制已取消")
+            return
         self.title = title
         self._started_at = datetime.now()
         self._say("开始录制（等待语音…）")
