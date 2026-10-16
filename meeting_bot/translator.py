@@ -88,6 +88,10 @@ class Translator:
                 if attempt == 2:
                     raise TranslationError(f"翻译接口不可用：{e}") from e
                 time.sleep(2 ** attempt)
+            except (IndexError, AttributeError, ValueError) as e:
+                # 响应结构异常（choices 为空 / message 缺失 / 字段类型不合法）：
+                # 非 APIError，不重试，直接降级为 TranslationError 交调用方处理
+                raise TranslationError(f"接口响应结构异常：{e}") from e
         raise TranslationError("翻译接口不可用")
 
     def translate(self, text: str, lang: str = "") -> str:

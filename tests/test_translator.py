@@ -90,3 +90,20 @@ def test_parse_minutes_falls_back_on_bad_json():
     m = parse_minutes("这不是 JSON，是纯文本纪要。")
     assert m.title == "会议纪要"
     assert m.summary == "这不是 JSON，是纯文本纪要。"
+
+
+def test_translate_empty_choices_raises_translation_error(monkeypatch):
+    """响应结构异常（choices 为空）必须降级为 TranslationError，不泄漏 IndexError。"""
+
+    class EmptyChoicesResponse:
+        choices = []
+
+    def fake_create(self, **kwargs):
+        return EmptyChoicesResponse()
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    with pytest.raises(TranslationError) as excinfo:
+        t.translate("hello", "en")
+    # 保留 from e 因果链
+    assert isinstance(excinfo.value.__cause__, IndexError)
