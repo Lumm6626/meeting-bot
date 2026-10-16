@@ -200,3 +200,41 @@ def test_unsafe_title_illegal_chars_no_crash(tmp_path):
         assert d.exists()
         assert d.resolve().is_relative_to(out)
         assert d.name.endswith(expect)
+
+
+def test_control_chars_in_title_sanitized(tmp_path):
+    """title 含 C0 控制符：替换为下划线、产物不逃出 output_dir（不崩溃）。"""
+    s = _settings(tmp_path)
+    out = s.output_dir.resolve()
+    store = TranscriptStore()
+    store.add(0.0, 2.0, "hello", lang="en")
+
+    t_path, m_path = export_all(store, s, "a\x01b", datetime(2026, 10, 16, 9, 30))
+    assert t_path.exists() and m_path.exists()
+    assert t_path.resolve().is_relative_to(out)
+    assert m_path.resolve().is_relative_to(out)
+    assert "_" in t_path.parent.name
+    assert t_path.parent.name.endswith("a_b")  # 控制符必须被替换而非原样落盘
+
+
+def test_xml_unsafe_minutes_content_cleaned(tmp_path):
+    """纪要内容含 XML 非法控制符：不抛 ValueError，清洗后 docx 可正常读回。"""
+    m = MinutesResult(title="周会\x01纪要", summary="概要\x02正文",
+                      key_points=["要点\x0b一"], decisions=["结论\x0c乙"],
+                      action_items=[ActionItem("任务\x1f", "张三", "10/20")],
+                      open_questions=["问题\x08丙"])
+    p = minutes_to_docx(m, tmp_path / "纪要.docx")
+    texts = _docx_text(p)  # 重新打开 docx 即「可读回」
+    assert "概要正文" in texts
+    assert "要点一" in texts
+    assert "任务" in texts
+    assert "问题丙" in texts
+    assert not any(c in texts for c in "\x01\x02\x08\x0b\x0c\x1f")
+
+
+def test_blank_owner_placeholder(tmp_path):
+    """行动项 owner 纯空白：归一为「待定」，与 task 的空白处理一致。"""
+    m = MinutesResult(title="周会纪要", summary="概要",
+                      action_items=[ActionItem("写方案", "  ", "10/20")])
+    texts = _docx_text(minutes_to_docx(m, tmp_path / "纪要.docx"))
+    assert "负责人：待定" in texts
