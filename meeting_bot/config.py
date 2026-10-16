@@ -27,6 +27,22 @@ class Settings:
     root: Path
 
 
+def _clean_hf_token(raw: str) -> str:
+    """清洗 HF token：占位符（含中文/非 ASCII）一律视为未配置。
+
+    原因：faster-whisper 会把 os.getenv("HF_TOKEN") 直接塞进 HTTP
+    Authorization 头，非 ASCII 值会导致 UnicodeEncodeError 崩溃。
+    """
+    token = raw.strip()
+    if not token:
+        return ""
+    try:
+        token.encode("ascii")
+    except UnicodeEncodeError:
+        return ""
+    return token
+
+
 def load_settings(env_path: Path | None = None) -> Settings:
     env_path = env_path or PROJECT_ROOT / ".env"
     load_dotenv(env_path)
@@ -46,8 +62,8 @@ def load_settings(env_path: Path | None = None) -> Settings:
         opencode_api_key=key,
         translate_model=os.getenv("TRANSLATE_MODEL") or "deepseek-v4-flash",
         minutes_model=os.getenv("MINUTES_MODEL") or "deepseek-v4-pro",
-        whisper_model=os.getenv("WHISPER_MODEL") or "medium",
-        hf_token=(os.getenv("HF_TOKEN") or "").strip(),
+        whisper_model=os.getenv("WHISPER_MODEL") or "small",
+        hf_token=_clean_hf_token(os.getenv("HF_TOKEN") or ""),
         output_dir=Path(output_dir),
         root=PROJECT_ROOT,
     )
