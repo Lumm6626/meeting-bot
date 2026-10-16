@@ -992,10 +992,14 @@ class FakeTranslatorChoicesNone:
 
 
 class FakeCaptureNSamples:
-    """喂入 n 块固定样本数的静音后返回结束哨兵（缓冲裁剪用）。"""
+    """喂入 n 块固定样本数的静音后返回结束哨兵（缓冲裁剪用）。
 
-    def __init__(self, chunks: int, samples: int):
+    delay > 0 时每块之前 sleep（模拟实时采集节奏），供标注线程在喂入期间穿插跑轮。
+    """
+
+    def __init__(self, chunks: int, samples: int, delay: float = 0.0):
         self.chunks = [np.zeros(samples, dtype=np.float32) for _ in range(chunks)]
+        self.delay = delay
         self._i = 0
 
     def start(self):
@@ -1003,6 +1007,8 @@ class FakeCaptureNSamples:
 
     def read(self, timeout=1.0):
         if self._i < len(self.chunks):
+            if self.delay:
+                time.sleep(self.delay)
             c = self.chunks[self._i]
             self._i += 1
             return c
@@ -1010,6 +1016,17 @@ class FakeCaptureNSamples:
 
     def stop(self):
         pass
+
+
+class FakeDiarizerCounter:
+    """只统计 label 调用次数（音频内容无关），用于断言标注线程是否持续跑轮。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def label(self, audio, sample_rate=16000):
+        self.calls += 1
+        return []
 
 
 def test_stop_backfill_survives_unexpected_error(monkeypatch, tmp_path):
@@ -1081,3 +1098,37 @@ def test_diarize_buffer_is_trimmed(monkeypatch):
     audio, base = r._take_diarize_window()
     assert len(audio) == kept                      # 窗口不超过缓冲
     assert base == r._diarize_base / 16000.0       # 窗口起点 = 裁剪量换算的绝对秒数
+
+
+def test_diarize_keeps_running_after_trim(monkeypatch):
+    """最终复审 N-1 回归：缓冲进入裁剪稳态后，说话人标注不得永久停摆。
+
+    故障链：DIARIZE_BUFFER_SECONDS 很小 → 几块后每轮「append 1 块 + trim 丢 1 块」，
+    len(_diarize_audio) 恒定 → 旧门控（与上次块数比较）从首个稳态 tick 起永远判定
+    「无新音频」→ 标注永久停摆（真实会议里录制 6-7 分钟、缓冲填满后开始）。
+    修复后门控用单调递增的 _diarize_appended。
+
+    变异自查点：门控改回 len(self._diarize_audio) 比较 → label 只被调 1 次 → 本用例失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.05)
+    # 800 样本 ≈ 2 块：喂到第 3 块起进入「每 append 必 trim」的稳态
+    monkeypatch.setattr("meeting_bot.recorder.DIARIZE_BUFFER_SECONDS", 0.05)
+
+    diarizer = FakeDiarizerCounter()
+    # 每块间隔 0.02s（共 30 块 ≈ 0.6s）：喂入比标注周期慢，稳态下每轮 tick 都能看到新块
+    capture = FakeCaptureNSamples(chunks=30, samples=400, delay=0.02)
+    r = Recorder(_settings(), capture=capture, asr=FakeASR(),
+                 translator=None, diarizer=diarizer)
+    r.on_status(lambda m: None)
+
+    thread = threading.Thread(target=r.start, args=("裁剪稳态会议",), daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: diarizer.calls >= 3), (
+            f"裁剪稳态后说话人标注停摆：label 只被调 {diarizer.calls} 次")
+        assert r._diarize_base > 0, "用例前提不成立：缓冲尚未进入裁剪稳态"
+    finally:
+        r.stop()
+        thread.join(timeout=5)
+    assert not thread.is_alive()

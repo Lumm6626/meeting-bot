@@ -100,6 +100,15 @@ class Recorder:
         self._diarize_audio: list[np.ndarray] = []
         # 已被 _trim_diarize_buffer 裁掉的样本数：滑动窗口的绝对时间原点
         self._diarize_base = 0
+        # 已 append 的块数（只增不减）：标注线程用它判断「有无新增音频」。
+        # 不能用 len(_diarize_audio) 当判据 —— 稳态下每轮 append 1 块、trim 又丢 1 块，
+        # 块数恒定 → 门控从首个稳态 tick 起永远判定「无新音频」→ 说话人标注永久停摆
+        # （录制 6-7 分钟、缓冲进入裁剪稳态后开始，最终复审 N-1）。
+        self._diarize_appended = 0
+        # 缓冲的写（主循环 append + trim）与读（标注线程快照 + base）必须原子：
+        # 否则 list() 快照与读 _diarize_base 之间被插队 append+trim，base 会多记本次
+        # 被裁样本 → 窗口绝对起点每次后移一个块累积漂移（最终复审 N-2）。
+        self._diarize_lock = threading.Lock()
         self._started_at: datetime | None = None
         self.title = ""
 
@@ -181,8 +190,10 @@ class Recorder:
                     continue
                 if chunk is None:
                     break        # 结束哨兵：采集已停止
-                self._diarize_audio.append(chunk)
-                self._trim_diarize_buffer()
+                with self._diarize_lock:
+                    self._diarize_audio.append(chunk)
+                    self._diarize_appended += 1
+                    self._trim_diarize_buffer()
                 for offset, utterance in buf.push(chunk):
                     self._process_utterance(utterance, offset / 16000)
             for offset, utterance in buf.flush():
@@ -282,7 +293,12 @@ class Recorder:
         长会每次对全量累积音频重跑 pyannote 是 O(T²)；只喂滑动窗口后单次开销恒定。
         """
         n = int(DIARIZE_WINDOW * 16000)
-        chunks = list(self._diarize_audio)      # 快照：主循环可能正在 append
+        # 快照与 base 必须同一临界区读取：主循环 append+trim 若插在两者之间，
+        # base 会多记本次被裁样本 → 窗口绝对起点后移（N-2）。concatenate 与切片
+        # 放锁外（base 已固化，纯本地数据），避免长时间持锁拖住主循环。
+        with self._diarize_lock:
+            chunks = list(self._diarize_audio)  # 快照：主循环可能正在 append
+            base = self._diarize_base
         if not chunks:
             return np.zeros(0, dtype=np.float32), 0.0
         audio = np.concatenate(chunks)
@@ -290,7 +306,7 @@ class Recorder:
         if total > n:
             audio = audio[total - n:]
         # 绝对起点 = 已被裁掉的样本 + 本次窗口前的样本（_diarize_base 是裁剪记账）
-        return audio, (self._diarize_base + (total - len(audio))) / 16000.0
+        return audio, (base + (total - len(audio))) / 16000.0
 
     def _next_speaker_num(self) -> int:
         """下一个可用的全局说话人编号 = 现有标签最大数字后缀 + 1。"""
@@ -333,9 +349,11 @@ class Recorder:
             # _stop.wait 代替 time.sleep：stop() 时立即醒来，不必等满一个周期
             if self._stop.wait(DIARIZE_INTERVAL):
                 break
-            if not self._diarize_audio or len(self._diarize_audio) == last_n:
+            # 判据必须是单调递增的「已 append 块数」：裁剪稳态下块数恒定，
+            # 用 len() 比较会让标注从首个稳态 tick 起永久停摆（N-1）。
+            if not self._diarize_audio or self._diarize_appended == last_n:
                 continue
-            last_n = len(self._diarize_audio)
+            last_n = self._diarize_appended
             audio, base = self._take_diarize_window()
             try:
                 spans = self._diarizer.label(audio)
