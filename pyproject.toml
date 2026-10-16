@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meeting-bot"
+version = "0.1.0"
+description = "本地 Teams 会议旁听翻译助手：实时字幕 + 会后纪要"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["meeting_bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
