@@ -559,3 +559,96 @@ def test_diarize_maps_local_labels_across_windows(monkeypatch):
     assert [s.speaker for s in segs] == ["SPEAKER_00"] * 3
     assert [sp.label for sp in r.store.speakers()] == ["SPEAKER_00"]   # 没多出 SPEAKER_01
     assert max(diarizer.window_lens) <= 32000                          # 从不喂全量音频
+
+
+# ---------------------------------------------------------------------------
+# 修复轮 3：幽灵说话人标签 + 翻译 worker 异常免疫
+# ---------------------------------------------------------------------------
+
+class FakeTranslatorUnexpectedErrorOnce:
+    """第 1 次 translate 抛非 TranslationError 的意外异常（模拟 openai 库边界异常）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def translate(self, text, lang=""):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("模拟翻译接口意外异常")
+        return "你好世界"
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+class FakeDiarizerNoOverlap:
+    """返回与所有语句零重叠的 span（语句都在 0~3s，span 在 10~12s）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def label(self, audio, sample_rate=16000):
+        self.calls += 1
+        return [(10.0, 12.0, "SPK_GHOST")]
+
+
+def test_worker_survives_unexpected_error(monkeypatch):
+    """N2 回归：翻译接口抛非 TranslationError 的意外异常时，worker 不得猝死。
+
+    旧实现只捕 TranslationError：第 1 段 translate 抛 RuntimeError 时 worker 线程当场
+    死亡，后续语句留在队列里 —— 只入库、永不翻译、永不 emit。新实现捕 Exception →
+    告警后继续，该段照常 emit 原文，后续段落正常处理；失败段由 stop() 补译补齐。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.1)
+    tr = FakeTranslatorUnexpectedErrorOnce()
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+                 translator=tr, diarizer=None)
+    events = []
+    statuses = []
+    r.on_segment(events.append)
+    r.on_status(statuses.append)
+
+    r.start("意外异常会议")        # 主循环同步跑完：3 块音频 → 3 条语句
+    try:
+        # 关键断言（变异自查点）：第 1 段抛异常后 worker 必须继续干完剩下 2 段。
+        # 去掉 worker 里「except Exception」保护时 worker 猝死 → events 恒为 0 → 此处超时失败。
+        assert _wait_until(lambda: len(events) == 3), (
+            f"worker 未在意外异常后继续处理：events={[s.text for s in events]}")
+    finally:
+        r.stop()                   # 不得向外抛异常
+
+    segs = r.store.segments()
+    assert len(segs) == 3                                     # store 条目齐全
+    assert [s.text for s in segs] == ["line 1", "line 2", "line 3"]
+    assert len(events) == 3                                   # 每段都 emit，且未重复
+    assert [s.text for s in events] == ["line 1", "line 2", "line 3"]
+    assert all(s.translation for s in segs)                   # 失败段由 stop() 补译补齐
+    assert tr.calls == 4                                      # 1 失败 + 2 正常 + 1 补译
+    assert any("翻译异常" in m for m in statuses)             # 告警文案区别于 TranslationError
+
+
+def test_no_ghost_speaker(monkeypatch):
+    """N1 回归：与所有语句零重叠的 turn 不得注册出「幽灵说话人」。
+
+    语句落在 0~3s，pyannote 却返回 10~12s 的 turn（真实场景：短 turn 与语句重叠
+    <30% 时 assign_speakers 不标注任何语句）。旧实现 _globalize_spans 对未映射局部
+    标签无条件 register_label → store.speakers() 多出一个无人使用的标签（纪要列出
+    幽灵发言人、编号被顶高）。修复后只注册真正落到语句上的标签。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.05)
+    diarizer = FakeDiarizerNoOverlap()
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+                 translator=FakeTranslator(), diarizer=diarizer)
+    statuses = []
+    r.on_status(statuses.append)
+    r.start("幽灵说话人会议")
+    assert _wait_until(lambda: diarizer.calls >= 1), "diarize 一轮都没跑，断言无意义"
+    r.stop()                       # 收尾 join 标注线程，确保这一轮跑完
+
+    segs = r.store.segments()
+    assert len(segs) == 3
+    assert all(s.speaker == "" for s in segs)      # 零重叠 → 无语句被标注
+    assert r.store.speakers() == []                # 未映射标签不注册 → 无幽灵说话人
+    assert any("已识别说话人：0" in m for m in statuses)   # 该轮确实跑完（而非从没跑）

@@ -90,6 +90,8 @@ class Recorder:
         self._translate_thread: threading.Thread | None = None
         self._diarize_thread: threading.Thread | None = None
         self._translate_queue: Queue[Segment] = Queue()
+        # 已 emit 的 seq：stop() 兜底补发时去重（store 跨 start 不重置，seq 全局唯一 → 无需 clear）
+        self._emitted: set[int] = set()
         self._diarize_audio: list[np.ndarray] = []
         self._started_at: datetime | None = None
         self.title = ""
@@ -104,6 +106,20 @@ class Recorder:
     def _emit(self, seg: Segment) -> None:
         for fn in self._events:
             fn(seg)
+
+    def _emit_once(self, seg: Segment) -> None:
+        """发送语句事件并记账（每个 seq 最多一次）。
+
+        回调异常只告警：翻译 worker 与 stop() 都不能因消费者异常而中断（审查 N2）。
+        去重同时兜住「stop() 兜底补发」与「worker 迟到 emit」的竞态。
+        """
+        if seg.seq in self._emitted:
+            return
+        try:
+            self._emit(seg)
+        except Exception as e:
+            self._say(f"[警告] 语句事件回调异常：{e}")
+        self._emitted.add(seg.seq)
 
     def _say(self, msg: str) -> None:
         for fn in self._status:
@@ -193,7 +209,12 @@ class Recorder:
                 except TranslationError:
                     seg.translation = ""   # 会议结束后统一补译
                     self._say(f"[警告] 翻译失败（{seg.text[:20]}…），已保留原文")
-                self._emit(seg)
+                except Exception as e:
+                    # 意外异常（openai 库边界异常、回调异常等）不得杀死 worker：
+                    # 否则后续语句只入库、永不翻译、永不 emit（审查 N2）。
+                    seg.translation = ""
+                    self._say(f"[警告] 翻译异常（{seg.text[:20]}…）：{e}，已保留原文")
+                self._emit_once(seg)
         finally:
             self._worker_done.set()
 
@@ -237,8 +258,11 @@ class Recorder:
         for lbl in dict.fromkeys(lbl for _, _, lbl in abs_spans):
             if lbl in mapping:
                 continue
+            # 只分配、不注册：该标签最终是否真有语句落上，由随后的 assign_speakers 决定。
+            # 若在此无条件 register_label，与语句重叠 <30% 的短 turn 会注册出无人使用的
+            # 「幽灵说话人」（纪要列出幽灵发言人、编号被顶高）——审查 N1。
+            # 真正的注册在 _diarize_worker 末尾遍历「有 speaker 的语句」时完成。
             mapping[lbl] = f"SPEAKER_{next_num:02d}"
-            self._store.register_label(mapping[lbl])
             next_num += 1
         return [(s, e, mapping[lbl]) for s, e, lbl in abs_spans]
 
@@ -285,6 +309,8 @@ class Recorder:
                         seg.translation = self._translator.translate(seg.text, seg.lang)
                     except TranslationError:
                         pass
+                # 兜底补发：worker 猝死/超时未 emit 的语句在这里补上（审查 N2）
+                self._emit_once(seg)
 
         # 尾部：等说话人标注线程收尾（把手上这一轮窗口跑完即退出）。
         # 当前线程就是标注线程时不 join 自己；未启动（无 diarizer）则跳过。
