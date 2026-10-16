@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 from datetime import datetime
@@ -22,10 +23,48 @@ from .vad import UtteranceBuffer
 SegmentEvent = Callable[[Segment], None]
 StatusEvent = Callable[[str], None]
 
-DIARIZE_INTERVAL = 15.0       # 每 15 秒跑一次说话人聚类
+DIARIZE_INTERVAL = 60.0       # 每 60 秒跑一次说话人聚类
+DIARIZE_WINDOW = 300.0        # 每次只处理最近 5 分钟音频（滑动窗口，避免长会 O(T²) 重算）
+DIARIZE_JOIN_TIMEOUT = 180.0  # stop() 等说话人标注线程收尾的上限
 PRODUCER_DONE_TIMEOUT = 10.0  # stop() 等主循环完成尾部 flush 的上限
 TRANSLATE_DRAIN_TIMEOUT = 20.0  # stop() 等翻译 worker 排空退出的上限
 TRANSLATE_POLL_TIMEOUT = 0.5  # 翻译 worker 队列轮询间隔
+
+
+def map_local_labels(prev_labeled: list[tuple[float, float, str]],
+                     new_spans: list[tuple[float, float, str]],
+                     overlap_start: float) -> dict[str, str]:
+    """把新窗口的局部标签映射到全局标签。
+
+    prev_labeled: list[(start, end, global_label)] 重叠区域内已标注的语句（旧全局标签）
+    new_spans: list[(start, end, local_label)] 新窗口 pyannote 结果（绝对时间轴）
+    overlap_start: float 重叠区起点（秒）
+
+    对每个 local_label：在 overlap_start 之后的 prev_labeled 中，累计与该 label 的
+    span 重叠的时长，按 global_label 分组求和，取最大者（平局取先出现者）。
+    返回 {local_label: global_label}；无法映射的 local_label 不出现在结果中。
+    """
+    # 保持局部标签首次出现顺序（平局判「先出现者」时用到）
+    local_labels: list[str] = []
+    for _, _, label in new_spans:
+        if label not in local_labels:
+            local_labels.append(label)
+
+    mapping: dict[str, str] = {}
+    for local in local_labels:
+        spans = [(s, e) for s, e, lbl in new_spans if lbl == local]
+        votes: dict[str, float] = {}   # 插入序 = prev_labeled 顺序 → 平局时 max() 取先出现者
+        for p_start, p_end, global_label in prev_labeled:
+            if p_end <= overlap_start:
+                continue               # 整条都在重叠区之前 → 不参与投票
+            overlap = 0.0
+            for s, e in spans:
+                overlap += max(0.0, min(e, p_end) - max(s, p_start))
+            if overlap > 0.0:
+                votes[global_label] = votes.get(global_label, 0.0) + overlap
+        if votes:
+            mapping[local] = max(votes, key=votes.__getitem__)
+    return mapping
 
 
 class Recorder:
@@ -49,6 +88,7 @@ class Recorder:
         self._worker_done = threading.Event()   # 翻译 worker 已退出（排空完成）
         self._running = threading.Event()       # 主循环是否在跑（start 时 set、退出时 clear）
         self._translate_thread: threading.Thread | None = None
+        self._diarize_thread: threading.Thread | None = None
         self._translate_queue: Queue[Segment] = Queue()
         self._diarize_audio: list[np.ndarray] = []
         self._started_at: datetime | None = None
@@ -91,7 +131,9 @@ class Recorder:
         self._capture.start()
         self._translate_thread = threading.Thread(target=self._translate_worker, daemon=True)
         self._translate_thread.start()
-        threading.Thread(target=self._diarize_worker, daemon=True).start()
+        if self._diarizer:
+            self._diarize_thread = threading.Thread(target=self._diarize_worker, daemon=True)
+            self._diarize_thread.start()
         self._main_loop()
 
     def _main_loop(self) -> None:
@@ -155,22 +197,70 @@ class Recorder:
         finally:
             self._worker_done.set()
 
+    def _take_diarize_window(self) -> tuple[np.ndarray, float]:
+        """取最近 DIARIZE_WINDOW 秒音频，返回 (窗口音频, 窗口起点绝对秒数)。
+
+        长会每次对全量累积音频重跑 pyannote 是 O(T²)；只喂滑动窗口后单次开销恒定。
+        """
+        n = int(DIARIZE_WINDOW * 16000)
+        chunks = list(self._diarize_audio)      # 快照：主循环可能正在 append
+        if not chunks:
+            return np.zeros(0, dtype=np.float32), 0.0
+        audio = np.concatenate(chunks)
+        total = len(audio)
+        if total > n:
+            audio = audio[total - n:]
+        return audio, (total - len(audio)) / 16000.0
+
+    def _next_speaker_num(self) -> int:
+        """下一个可用的全局说话人编号 = 现有标签最大数字后缀 + 1。"""
+        best = -1
+        for sp in self._store.speakers():
+            m = re.match(r"SPEAKER_(\d+)$", sp.label)
+            if m:
+                best = max(best, int(m.group(1)))
+        return best + 1
+
+    def _globalize_spans(self, spans: list[tuple[float, float, str]], base: float
+                         ) -> list[tuple[float, float, str]]:
+        """把窗口内 (相对时间, 局部标签) 的 spans 换成 (绝对时间, 全局标签)。
+
+        pyannote 的 SPEAKER_xx 只在单次窗口内自洽、跨窗口会换标签，必须用重叠区
+        旧全局标签投票映射；映射不到的局部标签视为新说话人，分配新全局标签。
+        """
+        abs_spans = [(s + base, e + base, lbl) for s, e, lbl in spans]
+        prev_labeled = [(seg.start, seg.end, seg.speaker)
+                        for seg in self._store.segments()
+                        if seg.speaker and seg.start >= base]
+        mapping = map_local_labels(prev_labeled, abs_spans, base)
+        next_num = self._next_speaker_num()
+        for lbl in dict.fromkeys(lbl for _, _, lbl in abs_spans):
+            if lbl in mapping:
+                continue
+            mapping[lbl] = f"SPEAKER_{next_num:02d}"
+            self._store.register_label(mapping[lbl])
+            next_num += 1
+        return [(s, e, mapping[lbl]) for s, e, lbl in abs_spans]
+
     def _diarize_worker(self) -> None:
         if not self._diarizer:
             return
         last_n = 0
         while not self._stop.is_set():
-            time.sleep(DIARIZE_INTERVAL)
-            if len(self._diarize_audio) == last_n:
+            # _stop.wait 代替 time.sleep：stop() 时立即醒来，不必等满一个周期
+            if self._stop.wait(DIARIZE_INTERVAL):
+                break
+            if not self._diarize_audio or len(self._diarize_audio) == last_n:
                 continue
             last_n = len(self._diarize_audio)
-            audio = np.concatenate(self._diarize_audio)
+            audio, base = self._take_diarize_window()
             try:
                 spans = self._diarizer.label(audio)
             except Exception as e:
                 self._say(f"[警告] 说话人标注失败：{e}")
                 continue
-            assign_speakers(self._store.segments(), spans)
+            mapped_spans = self._globalize_spans(spans, base)
+            assign_speakers(self._store.segments(), mapped_spans)
             for seg in self._store.segments():
                 if seg.speaker:
                     self._store.register_label(seg.speaker)
@@ -195,3 +285,11 @@ class Recorder:
                         seg.translation = self._translator.translate(seg.text, seg.lang)
                     except TranslationError:
                         pass
+
+        # 尾部：等说话人标注线程收尾（把手上这一轮窗口跑完即退出）。
+        # 当前线程就是标注线程时不 join 自己；未启动（无 diarizer）则跳过。
+        diar = self._diarize_thread
+        if diar is not None and diar is not threading.current_thread() and diar.is_alive():
+            diar.join(timeout=DIARIZE_JOIN_TIMEOUT)
+            if diar.is_alive():
+                self._say(f"[警告] 说话人标注线程未在 {DIARIZE_JOIN_TIMEOUT:.0f} 秒内退出")
