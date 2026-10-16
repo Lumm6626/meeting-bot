@@ -162,3 +162,60 @@ def test_read_timeout_raises_queue_empty(monkeypatch):
         pass
     else:  # pragma: no cover - 契约被破坏时触发
         raise AssertionError("read() 超时应抛 queue.Empty")
+
+
+class _MidStreamFailingRecorder:
+    """录到第 N 块后抛错（模拟 WASAPI 流中断/设备热拔）。"""
+
+    def __init__(self, fail_after: int = 2):
+        self.fail_after = fail_after
+        self.calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def record(self, frames):
+        self.calls += 1
+        if self.calls > self.fail_after:
+            raise RuntimeError("fake stream broken")
+        return np.zeros(frames)
+
+
+def test_mid_stream_error_is_recorded_not_swallowed(monkeypatch):
+    """流中断必须记进 cap.error：否则上层只看到「正常结束哨兵」，音频静默截断。"""
+    rec = _MidStreamFailingRecorder(fail_after=2)
+    _install_fake_device(monkeypatch, rec)
+    cap = AudioCapture()
+    cap.start()
+    chunks = []
+    try:
+        for _ in range(6):
+            item = cap.read(timeout=2.0)
+            if item is None:
+                break
+            chunks.append(item)
+    finally:
+        cap.stop()
+
+    assert len(chunks) == 2, f"应读到中断前的 2 块，实际 {len(chunks)}"
+    assert isinstance(cap.error, RuntimeError)
+    assert "stream broken" in str(cap.error)
+
+
+def test_dropped_chunks_counted_when_queue_full(monkeypatch):
+    """队列满时丢块要计数（背压可观测），不再静默 pass。"""
+    rec = _FastRecorder(delay=0.0)
+    _install_fake_device(monkeypatch, rec)
+    cap = AudioCapture()
+    cap.start()
+    try:
+        time.sleep(2.0)
+        dropped = cap.dropped_chunks
+    finally:
+        cap.stop()
+
+    assert cap._queue.qsize() <= 100
+    assert dropped > 0, "队列满丢块未被计数"

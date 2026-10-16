@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+import uuid
 from dataclasses import dataclass, field
 
 import openai
@@ -13,6 +15,18 @@ from .config import Settings
 
 class TranslationError(Exception):
     """翻译接口不可用（重试后仍失败）。"""
+
+
+def session_headers() -> dict[str, str]:
+    """OpenCode Go 路由所需请求头。
+
+    接口对缺少 ``x-opencode-session`` 的请求直接返回 400
+    （``MissingSessionID``：「cannot be routed efficiently」），
+    翻译/纪要会全线不可用。会话 ID 仅用于服务端路由，取进程级随机值即可；
+    需要固定值（例如复现问题）时可用环境变量 ``OPENCODE_SESSION_ID`` 覆盖。
+    """
+    sid = (os.getenv("OPENCODE_SESSION_ID") or "").strip()
+    return {"x-opencode-session": sid or f"meeting-bot-{uuid.uuid4().hex[:8]}"}
 
 
 @dataclass
@@ -59,6 +73,7 @@ class Translator:
             api_key=settings.opencode_api_key,
             timeout=30.0,
             max_retries=0,
+            default_headers=session_headers(),
         )
         self._thinking_disabled_ok: bool | None = None
 
@@ -103,9 +118,12 @@ class Translator:
         return self._chat(messages, max_tokens=512)
 
     def minutes(self, transcript_md: str) -> MinutesResult:
+        # 不能用 str.format：模板内的 JSON 字面量（{"title": …}）会被当成占位符，
+        # 直接抛 KeyError: '"title"'，纪要功能全线不可用。用 replace 注入逐字稿。
         messages = [
             {"role": "system", "content": "你是资深会议记录助理，输出严格 JSON。"},
-            {"role": "user", "content": MINUTES_PROMPT.format(transcript=transcript_md[-180000:])},
+            {"role": "user", "content": MINUTES_PROMPT.replace("{transcript}",
+                                                               transcript_md[-180000:])},
         ]
         raw = self._chat(messages, max_tokens=8000, model=self._settings.minutes_model)
         return parse_minutes(raw)

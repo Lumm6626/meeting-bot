@@ -183,6 +183,14 @@ class Recorder:
             for offset, utterance in buf.flush():
                 self._process_utterance(utterance, offset / 16000)
         finally:
+            # 采集侧故障对外可见：record() 抛错只会让采集线程退出，主循环收到的是
+            # 「正常结束哨兵」，若不检查就表现为「录到一半音频没了」且无任何提示。
+            err = getattr(self._capture, "error", None)
+            if err is not None:
+                self._say(f"[警告] 声音采集中断（后续音频未记录）：{err}")
+            dropped = getattr(self._capture, "dropped_chunks", 0)
+            if dropped:
+                self._say(f"[警告] 处理跟不上实时，已丢弃 {dropped} 块音频（约 {dropped * 0.5:.0f} 秒）")
             # 尾部 flush 结束（或主循环异常）才算生产者完结；顺序不能反：
             # 必须先 set(producer_done) 再 clear(running)，否则 stop() 可能跳过等待。
             self._producer_done.set()

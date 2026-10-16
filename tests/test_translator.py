@@ -3,7 +3,7 @@ import openai
 import pytest
 
 from meeting_bot.translator import (ActionItem, MinutesResult, TranslationError,
-                                    Translator, parse_minutes)
+                                    Translator, parse_minutes, session_headers)
 
 
 def _settings():
@@ -107,3 +107,57 @@ def test_translate_empty_choices_raises_translation_error(monkeypatch):
         t.translate("hello", "en")
     # 保留 from e 因果链
     assert isinstance(excinfo.value.__cause__, IndexError)
+
+
+def test_translator_sets_opencode_session_header(monkeypatch):
+    """OpenCode Go 缺 x-opencode-session 头会直接 400（MissingSessionID），客户端必须带上。"""
+    monkeypatch.delenv("OPENCODE_SESSION_ID", raising=False)
+    t = Translator(_settings())
+    headers = {k.lower(): v for k, v in t._client.default_headers.items()}
+    assert headers.get("x-opencode-session")
+
+
+def test_session_id_can_be_overridden_by_env(monkeypatch):
+    monkeypatch.setenv("OPENCODE_SESSION_ID", "fixed-session-123")
+    assert session_headers() == {"x-opencode-session": "fixed-session-123"}
+
+
+def test_session_headers_ignores_blank_env(monkeypatch):
+    monkeypatch.setenv("OPENCODE_SESSION_ID", "   ")
+    assert session_headers()["x-opencode-session"].startswith("meeting-bot-")
+
+
+def test_minutes_embeds_transcript_without_format_crash(monkeypatch):
+    """回归：模板含 JSON 花括号，用 str.format 会抛 KeyError('"title"')，纪要曾全线不可用。"""
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse('{"title": "周会", "summary": "讨论了定价", "key_points": [],'
+                            '"decisions": [], "action_items": [], "open_questions": []}')
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    m = t.minutes("# 会议逐字稿：周会\n原文：hello\n译文：你好")
+    assert m.title == "周会"
+    prompt = calls[0]["messages"][1]["content"]
+    assert "{transcript}" not in prompt
+    assert "原文：hello" in prompt
+    assert '"key_points"' in prompt      # JSON 示例模板原样保留
+    assert calls[0]["model"] == "deepseek-v4-pro"
+
+
+def test_minutes_truncates_long_transcript(monkeypatch):
+    """超长逐字稿只取尾部 18 万字符，避免请求体过大。"""
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse('{"title": "t", "summary": "s"}')
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    t.minutes("A" * 200000 + "TAIL")
+    prompt = calls[0]["messages"][1]["content"]
+    assert len(prompt) < 200000
+    assert prompt.endswith("TAIL")

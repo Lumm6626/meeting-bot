@@ -27,6 +27,12 @@ class AudioCapture:
         self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=100)
         self._thread: threading.Thread | None = None
         self._running = threading.Event()
+        # 采集中断的异常：record() 一旦抛错，采集线程只会退出，
+        # 主循环看到的是「正常结束哨兵」——不记下来就变成「音频莫名截断」，
+        # 事后无从定位（上层 Recorder 会读它并上报）。
+        self.error: Exception | None = None
+        # 背压丢弃计数：队列满时丢块保实时，丢多了意味着处理跟不上，需要可见。
+        self.dropped_chunks = 0
 
     def start(self) -> None:
         self._running.set()
@@ -40,13 +46,14 @@ class AudioCapture:
                 while self._running.is_set():
                     try:
                         data = rec.record(frames)
-                    except Exception:
+                    except Exception as e:
+                        self.error = e      # 不能静默 break：上层要能上报「采集中断」
                         break
                     chunk = np.asarray(data, dtype=np.float32).reshape(-1)
                     try:
                         self._queue.put_nowait(chunk)
                     except queue.Full:
-                        pass  # 丢弃当前块保实时
+                        self.dropped_chunks += 1   # 丢弃当前块保实时
         finally:
             # 无论录音器打开/读取/运行期出现任何异常，都必须投递结束哨兵，
             # 否则消费者会永久阻塞在 read() 上。哨兵同样不能阻塞：

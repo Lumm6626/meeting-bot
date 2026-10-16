@@ -930,3 +930,40 @@ def test_forced_interleave_stop_wins_capture_is_still_closed(monkeypatch):
     assert "录制已取消" not in statuses
     assert r.store.segments() == []
     assert r._translate_thread is not None    # start() 确实跑到了主循环之后
+
+
+class FakeCaptureWithError(FakeCapture):
+    """采集线程中途出错（error 已记录）+ 背压丢块，用于验证上层上报。"""
+
+    def __init__(self):
+        super().__init__(chunks=2)
+        from meeting_bot.capture import AudioCapture
+        self.error = RuntimeError("WASAPI stream broken")
+        self.dropped_chunks = 4
+
+
+def test_capture_failure_is_reported_to_status():
+    """采集中断/丢块必须冒到状态回调：否则用户只看到「录音正常结束」而音频已缺。"""
+    logs: list[str] = []
+    rec = Recorder(_settings(), capture=FakeCaptureWithError())
+    rec.on_status(logs.append)
+    rec.start("测试")
+    rec.stop()
+
+    joined = "\n".join(logs)
+    assert "声音采集中断" in joined
+    assert "WASAPI stream broken" in joined
+    assert "丢弃 4 块" in joined
+
+
+def test_no_warning_when_capture_healthy():
+    """采集正常（无 error / 无丢块）时不能误报。"""
+    logs: list[str] = []
+    rec = Recorder(_settings(), capture=FakeCapture(chunks=2))
+    rec.on_status(logs.append)
+    rec.start("测试")
+    rec.stop()
+
+    joined = "\n".join(logs)
+    assert "声音采集中断" not in joined
+    assert "丢弃" not in joined
