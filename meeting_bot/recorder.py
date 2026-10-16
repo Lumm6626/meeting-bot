@@ -92,6 +92,9 @@ class Recorder:
         self._translate_queue: Queue[Segment] = Queue()
         # 已 emit 的 seq：stop() 兜底补发时去重（store 跨 start 不重置，seq 全局唯一 → 无需 clear）
         self._emitted: set[int] = set()
+        # _emit_once 的记账锁：worker 与 stop() 会并发对同一 seq 兜底补发，
+        # 「检查 + 记账」必须原子，否则两者都判定「未发过」→ 重复 emit（审查 Minor-1）
+        self._emit_lock = threading.Lock()
         self._diarize_audio: list[np.ndarray] = []
         self._started_at: datetime | None = None
         self.title = ""
@@ -112,14 +115,19 @@ class Recorder:
 
         回调异常只告警：翻译 worker 与 stop() 都不能因消费者异常而中断（审查 N2）。
         去重同时兜住「stop() 兜底补发」与「worker 迟到 emit」的竞态。
+
+        先记账再发送（at-most-once）：「检查 + 记账」若不加锁，worker 与 stop() 会并发
+        判定「未发过」→ 同一 seq 冒出两条事件（审查 Minor-1）。锁只护记账不包住 _emit：
+        用户回调可能很慢甚至反向调用本类，在锁内执行有死锁风险。
         """
-        if seg.seq in self._emitted:
-            return
+        with self._emit_lock:
+            if seg.seq in self._emitted:
+                return
+            self._emitted.add(seg.seq)
         try:
             self._emit(seg)
         except Exception as e:
             self._say(f"[警告] 语句事件回调异常：{e}")
-        self._emitted.add(seg.seq)
 
     def _say(self, msg: str) -> None:
         for fn in self._status:
@@ -280,15 +288,17 @@ class Recorder:
             audio, base = self._take_diarize_window()
             try:
                 spans = self._diarizer.label(audio)
+                # label() 成功后的映射 / 分配 / 注册同样不能抛穿：异常会杀死标注线程，
+                # 此后整场会议再无说话人标注，且本轮注册全部丢失（审查 Minor-3）。
+                mapped_spans = self._globalize_spans(spans, base)
+                assign_speakers(self._store.segments(), mapped_spans)
+                for seg in self._store.segments():
+                    if seg.speaker:
+                        self._store.register_label(seg.speaker)
+                self._say(f"已识别说话人：{len(self._store.speakers())} 人")
             except Exception as e:
                 self._say(f"[警告] 说话人标注失败：{e}")
                 continue
-            mapped_spans = self._globalize_spans(spans, base)
-            assign_speakers(self._store.segments(), mapped_spans)
-            for seg in self._store.segments():
-                if seg.speaker:
-                    self._store.register_label(seg.speaker)
-            self._say(f"已识别说话人：{len(self._store.speakers())} 人")
 
     def stop(self) -> None:
         self._stop.set()

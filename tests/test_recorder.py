@@ -652,3 +652,162 @@ def test_no_ghost_speaker(monkeypatch):
     assert all(s.speaker == "" for s in segs)      # 零重叠 → 无语句被标注
     assert r.store.speakers() == []                # 未映射标签不注册 → 无幽灵说话人
     assert any("已识别说话人：0" in m for m in statuses)   # 该轮确实跑完（而非从没跑）
+
+
+# ---------------------------------------------------------------------------
+# 修复轮 4：emit 记账原子化（at-most-once）+ diarize 标注段异常保护
+# ---------------------------------------------------------------------------
+
+class FakeTranslatorBlocking:
+    """每次 translate 阻塞 delay 秒后返回（模拟慢接口，制造 stop() 与 worker 的交叠窗口）。"""
+
+    def __init__(self, delay: float = 0.3):
+        self.delay = delay
+        self.calls = 0
+        self.first_started = threading.Event()
+        self._lock = threading.Lock()
+
+    def translate(self, text, lang=""):
+        with self._lock:
+            self.calls += 1
+            first = self.calls == 1
+        if first:
+            self.first_started.set()
+        time.sleep(self.delay)
+        return "你好世界"
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+class FakeDiarizerAssignBoom:
+    """label() 正常返回；配合「assign_speakers 抛异常」验证标注线程不猝死。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def label(self, audio, sample_rate=16000):
+        self.calls += 1
+        return [(0.0, max(len(audio) / sample_rate, 0.1), "SPK_A")]
+
+
+def test_stop_backfill_does_not_duplicate_events(monkeypatch):
+    """Minor-1 回归：stop() 兜底补发与 worker 并发时，同一 seq 不得 emit 两次。
+
+    构造：翻译接口每次阻塞 0.3s + TRANSLATE_DRAIN_TIMEOUT=0.05 → stop() 必然等不到
+    worker 排空，于是走补译 / 兜底补发循环，与 worker 并发对同一 seq 做「检查 → 发送」。
+
+    on_segment 回调故意 sleep 0.25s，把「检查 → 记账」窗口拉宽，让 stop() 的并发检查
+    必然落在窗口内：旧实现 check-then-act 非原子 → 同一 seq 两条事件（本用例失败）；
+    修复后先把 seq 记入 _emitted 再发送 → 至多一次。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.05)
+    monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_DRAIN_TIMEOUT", 0.05)
+    tr = FakeTranslatorBlocking(delay=0.3)
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+                 translator=tr, diarizer=None)
+    events = []
+
+    def _slow_append(seg):
+        time.sleep(0.25)          # 拉宽「检查 → 记账」窗口（见 docstring）
+        events.append(seg)
+
+    r.on_segment(_slow_append)
+    r.on_status(lambda m: None)
+
+    thread = threading.Thread(target=r.start, args=("兜底补发会议",), daemon=True)
+    thread.start()
+    try:
+        assert tr.first_started.wait(timeout=5), "翻译 worker 未开始第一段翻译"
+        assert _wait_until(lambda: len(r.store.segments()) == 3), "三句未全部入库"
+        r.stop()                  # drain 超时 → 走补译 + 兜底补发路径
+    finally:
+        thread.join(timeout=5)    # 主循环结束（producer_done 已置位）
+        if r._translate_thread is not None:
+            r._translate_thread.join(timeout=15)   # 等 worker 收尾，消除断言竞态
+    assert not thread.is_alive()
+
+    segs = r.store.segments()
+    assert len(segs) == 3
+    assert all(s.translation for s in segs), "stop() 兜底后仍有缺译文的语句"
+    seqs = [s.seq for s in events]
+    assert len(seqs) == 3, f"事件数应为 3（每 seq 一次），实际 {[s.text for s in events]}"
+    assert len(set(seqs)) == 3, f"同一 seq 被重复 emit：{seqs}"
+    assert set(seqs) == {s.seq for s in segs}
+
+
+def test_segment_callback_exception_does_not_kill_worker(monkeypatch):
+    """Minor-1/2 回归：on_segment 回调抛 RuntimeError 时线程不死、异常不外冒。
+
+    正常回调注册在前、抛异常回调注册在后（_emit 按注册顺序投递：抛异常回调会中断其后的
+    回调，但不得杀死翻译 worker、不得中断后续语句的翻译与投递）。
+    关键在 stop() 之前等满 3 条事件：若 _emit_once 不捕回调异常，worker 处理第 1 段时
+    就猝死，第 2、3 段永远不会 emit → 此处超时失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.1)
+
+    def _boom(seg):
+        raise RuntimeError("模拟事件回调异常")
+
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+                 translator=FakeTranslator(), diarizer=None)
+    events = []
+    statuses = []
+    r.on_segment(events.append)
+    r.on_segment(_boom)
+    r.on_status(statuses.append)
+
+    r.start("回调异常会议")       # 主循环同步跑完；回调异常不得冒出
+    try:
+        assert _wait_until(lambda: len(events) == 3), (
+            f"回调异常后事件未继续投递：{[s.text for s in events]}")
+    finally:
+        r.stop()                  # 不得向外抛异常
+    if r._translate_thread is not None:
+        r._translate_thread.join(timeout=10)
+
+    segs = r.store.segments()
+    assert len(segs) == 3
+    assert [s.text for s in events] == ["line 1", "line 2", "line 3"]
+    assert all(s.translation for s in segs)
+    warnings = [m for m in statuses if "语句事件回调异常" in m]
+    assert len(warnings) == 3, f"每段一条告警，实际 {warnings}"
+
+
+def test_diarize_worker_survives_post_label_error(monkeypatch):
+    """Minor-3 回归：label() 之后的映射 / 分配 / 注册抛异常不得杀死标注线程。
+
+    在 assign_speakers 处注入 RuntimeError：旧实现异常直穿 while 循环 → 标注线程猝死，
+    此后整场会议再无说话人标注；修复后告警并进入下一轮（本用例断言第二轮照样开跑）。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.05)
+
+    def _boom(segments, spans, min_overlap=0.3):
+        raise RuntimeError("模拟标注分配失败")
+
+    monkeypatch.setattr("meeting_bot.recorder.assign_speakers", _boom)
+
+    diarizer = FakeDiarizerAssignBoom()
+    capture = FakeCaptureStaged(chunks=3, chunk_samples=16000)
+    r = Recorder(_settings(), capture=capture, asr=FakeASRPerChunk(),
+                 translator=FakeTranslator(), diarizer=diarizer)
+    statuses = []
+    r.on_status(statuses.append)
+
+    thread = threading.Thread(target=r.start, args=("标注异常会议",), daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: diarizer.calls >= 1), "第一轮标注未开跑"
+        capture.release(2)        # 放行第三块 → 触发第二轮
+        assert _wait_until(lambda: diarizer.calls >= 2), "标注线程在异常后已猝死"
+    finally:
+        r.stop()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    assert len(r.store.segments()) == 3
+    assert all(s.speaker == "" for s in r.store.segments())   # 分配失败 → 无人被标注
+    assert any("说话人标注失败" in m for m in statuses)
