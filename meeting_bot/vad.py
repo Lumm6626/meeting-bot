@@ -54,15 +54,20 @@ class UtteranceBuffer:
         self._frames: list[np.ndarray] = []   # 未决帧，每帧 FRAME 样本
         self._probs: list[float] = []
         self._dropped = 0                     # 已丢弃的样本数（绝对偏移基准）
+        self._pending = np.empty(0, dtype=np.float32)   # 不足一帧的余样，跨 push 续接
 
     def push(self, chunk: np.ndarray) -> list[tuple[int, np.ndarray]]:
         arr = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if self._pending.size:                # 续接余样，帧边界与绝对偏移才不错位
+            arr = np.concatenate((self._pending, arr))
+            self._pending = np.empty(0, dtype=np.float32)
         n = len(arr) // FRAME * FRAME
         for i in range(0, n, FRAME):
             frame = arr[i:i + FRAME]
             prob = float(self._model(torch.from_numpy(frame), self.sample_rate))
             self._frames.append(frame)
             self._probs.append(prob)
+        self._pending = arr[n:].copy()        # 余样留到下一次 push，不丢不偏移
         return self._emit()
 
     def _emit(self) -> list[tuple[int, np.ndarray]]:
@@ -88,6 +93,7 @@ class UtteranceBuffer:
         return out
 
     def flush(self) -> list[tuple[int, np.ndarray]]:
+        self._pending = np.empty(0, dtype=np.float32)   # 流结束，尾部不足一帧残留丢弃
         probs = np.asarray(self._probs, dtype=np.float32)
         out = [(self._dropped + a * FRAME, np.concatenate(self._frames[a:b]))
                for a, b in utterance_bounds(probs)]
