@@ -262,12 +262,13 @@ def test_close_event_without_recorder_accepts_without_dialog(win, dialogs):
     assert [d for d in recorded if d[0] == "question"] == []
 
 
-def test_close_event_confirm_branches(win, dialogs):
-    """录制中：选 No → 不退出、不收尾；选 Yes → 先 stop() 再退出。"""
+def test_close_event_confirm_branches(win, qapp, dialogs):
+    """录制中：选 No → 不退出、不收尾；选 Yes → 隐藏窗口 + 后台收尾 + 完成后再关闭。"""
     recorded, answer = dialogs
     recorder = FakeRecorder()
     _prepare_recording(win, recorder)
     win.show()
+    gui_thread = threading.current_thread()
 
     # --- No：留在窗口里，不触发收尾 ---
     answer["ret"] = appmod.QMessageBox.StandardButton.No
@@ -277,20 +278,59 @@ def test_close_event_confirm_branches(win, dialogs):
     assert recorded[-1][0] == "question" and recorded[-1][1] == "退出确认"
     assert "退出将丢弃本次记录" in recorded[-1][2]
 
-    # --- Yes：先收尾再接受退出 ---
+    # --- Yes：第一次 close 立即返回（收尾在后台，不冻结 GUI 线程）---
     answer["ret"] = appmod.QMessageBox.StandardButton.Yes
-    assert win.close() is True
-    assert recorder.stop_calls == 1
-    assert not win.isVisible()
+    assert win.close() is False            # e.ignore()：真正的关闭等收尾完成
+    assert not win.isVisible()             # 窗口已隐藏，而非冻结在屏幕上
+
+    # 收尾完成（bridge.shutdown_done 队列投递）→ _finish_close 复位并 close()
+    assert _pump_until(qapp, lambda: recorder.stop_calls == 1 and not win._closing)
+    assert recorder.stop_thread is not gui_thread   # 关键：stop() 不在 GUI 线程跑
+    assert win.start_btn.isEnabled()                # 复位：二次 close 不会再弹框
+    assert win.close() is True                      # 二次 close 走 e.accept()
 
 
-def test_close_event_accepts_when_recorder_stop_raises(win, dialogs):
-    """收尾抛异常仍要放行退出：退出路径不能把用户锁死在窗口里。"""
+def test_close_event_accepts_when_recorder_stop_raises(win, qapp, dialogs):
+    """收尾抛异常仍要放行退出：退出路径不能把用户锁死在窗口里（异步路径同样成立）。"""
     _, answer = dialogs
     recorder = FakeRecorder(stop_boom=True)
     _prepare_recording(win, recorder)
     win.show()
     answer["ret"] = appmod.QMessageBox.StandardButton.Yes
 
+    assert win.close() is False
+    assert _pump_until(qapp, lambda: recorder.stop_calls == 1 and not win._closing)
+    assert win.start_btn.isEnabled()
     assert win.close() is True
-    assert recorder.stop_calls == 1
+
+
+def test_close_event_does_not_block_gui_thread(win, qapp, dialogs):
+    """Critical-2 回归：closeEvent 不得在 GUI 线程同步等 stop()。
+
+    recorder.stop() 最坏要等 10s（producer 收尾）+ 20s（翻译排空）+ 补译 + 180s（标注
+    线程）同步调用会把窗口冻结数分钟。用「stop() 阻塞到测试放行」的假 recorder 量化：
+    close() 必须在远小于阻塞时长内返回（修复前为同步 → 至少阻塞 0.5s）。
+    """
+    _, answer = dialogs
+    released = threading.Event()
+
+    class _SlowStop(FakeRecorder):
+        def stop(self):
+            released.wait(timeout=5)      # 模拟慢收尾（真实场景可达数分钟）
+            super().stop()
+
+    recorder = _SlowStop()
+    _prepare_recording(win, recorder)
+    win.show()
+    answer["ret"] = appmod.QMessageBox.StandardButton.Yes
+
+    t0 = time.monotonic()
+    assert win.close() is False
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.2, f"closeEvent 在 GUI 线程阻塞了 {elapsed:.2f}s（窗口冻结）"
+    assert not win.isVisible()
+    assert recorder.stop_calls == 0       # 收尾还被卡着 —— 但界面已经返回了
+
+    released.set()
+    assert _pump_until(qapp, lambda: recorder.stop_calls == 1 and not win._closing)
+    assert win.close() is True

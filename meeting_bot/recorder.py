@@ -25,10 +25,12 @@ StatusEvent = Callable[[str], None]
 
 DIARIZE_INTERVAL = 60.0       # 每 60 秒跑一次说话人聚类
 DIARIZE_WINDOW = 300.0        # 每次只处理最近 5 分钟音频（滑动窗口，避免长会 O(T²) 重算）
+DIARIZE_BUFFER_SECONDS = DIARIZE_WINDOW + 60.0  # 滚动缓冲上限 = 窗口 + 一轮余量（防内存无上限增长）
 DIARIZE_JOIN_TIMEOUT = 180.0  # stop() 等说话人标注线程收尾的上限
 PRODUCER_DONE_TIMEOUT = 10.0  # stop() 等主循环完成尾部 flush 的上限
 TRANSLATE_DRAIN_TIMEOUT = 20.0  # stop() 等翻译 worker 排空退出的上限
 TRANSLATE_POLL_TIMEOUT = 0.5  # 翻译 worker 队列轮询间隔
+BACKFILL_MAX_CONSECUTIVE_FAILS = 3  # stop() 补译连续失败上限（超过则放弃补译，防无界重试）
 
 
 def map_local_labels(prev_labeled: list[tuple[float, float, str]],
@@ -96,6 +98,8 @@ class Recorder:
         # 「检查 + 记账」必须原子，否则两者都判定「未发过」→ 重复 emit（审查 Minor-1）
         self._emit_lock = threading.Lock()
         self._diarize_audio: list[np.ndarray] = []
+        # 已被 _trim_diarize_buffer 裁掉的样本数：滑动窗口的绝对时间原点
+        self._diarize_base = 0
         self._started_at: datetime | None = None
         self.title = ""
 
@@ -178,6 +182,7 @@ class Recorder:
                 if chunk is None:
                     break        # 结束哨兵：采集已停止
                 self._diarize_audio.append(chunk)
+                self._trim_diarize_buffer()
                 for offset, utterance in buf.push(chunk):
                     self._process_utterance(utterance, offset / 16000)
             for offset, utterance in buf.flush():
@@ -246,6 +251,31 @@ class Recorder:
         finally:
             self._worker_done.set()
 
+    def _trim_diarize_buffer(self) -> None:
+        """裁剪滚动缓冲：只保留最近 DIARIZE_BUFFER_SECONDS 秒音频。
+
+        长会（1 小时 ≈ 0.5G 样本）不裁剪则内存无上限增长，且每轮 diarize 都要
+        np.concatenate 全量音频（O(T²) 拷贝）。裁剪后缓冲恒定，concatenate 也只处理
+        窗口量级；被裁掉的样本数记入 _diarize_base，保证窗口起点仍是绝对时间轴。
+        """
+        total = sum(len(a) for a in self._diarize_audio)
+        limit = int(DIARIZE_BUFFER_SECONDS * 16000)
+        if total <= limit:
+            return
+        excess = total - limit
+        kept: list[np.ndarray] = []
+        for a in self._diarize_audio:
+            if excess <= 0:
+                kept.append(a)
+                continue
+            if len(a) <= excess:
+                excess -= len(a)
+            else:
+                kept.append(a[excess:])
+                excess = 0
+        self._diarize_audio = kept
+        self._diarize_base += total - limit
+
     def _take_diarize_window(self) -> tuple[np.ndarray, float]:
         """取最近 DIARIZE_WINDOW 秒音频，返回 (窗口音频, 窗口起点绝对秒数)。
 
@@ -259,7 +289,8 @@ class Recorder:
         total = len(audio)
         if total > n:
             audio = audio[total - n:]
-        return audio, (total - len(audio)) / 16000.0
+        # 绝对起点 = 已被裁掉的样本 + 本次窗口前的样本（_diarize_base 是裁剪记账）
+        return audio, (self._diarize_base + (total - len(audio))) / 16000.0
 
     def _next_speaker_num(self) -> int:
         """下一个可用的全局说话人编号 = 现有标签最大数字后缀 + 1。"""
@@ -333,13 +364,27 @@ class Recorder:
             # 只等 queue.empty() 不够：worker 可能已取走最后一条却还没 emit。
             self._worker_done.wait(timeout=TRANSLATE_DRAIN_TIMEOUT)
         if self._translator:
+            # 补译免疫（最终审查 Critical-1）：只捕 TranslationError 时，接口返回结构异常
+            # （choices=None 等 → TypeError）会直接逃逸出 stop() → 调用方 export_all 整段
+            # 被跳过 → 整场会议零产物。改捕 Exception 并降级为告警；同时设连续失败上限，
+            # 避免接口全程不可用时逐句重试把收尾 UI 拖到不可预期（无界重试）。
+            backfill_fails = 0
+            backfill_given_up = False
             for seg in self._store.segments():
-                if not seg.translation and seg.lang != "zh":
+                if not backfill_given_up and not seg.translation and seg.lang != "zh":
                     try:
                         seg.translation = self._translator.translate(seg.text, seg.lang)
-                    except TranslationError:
-                        pass
-                # 兜底补发：worker 猝死/超时未 emit 的语句在这里补上（审查 N2）
+                        backfill_fails = 0          # 成功即清零：偶发失败不累计
+                    except Exception as e:
+                        backfill_fails += 1
+                        self._say(f"[警告] 收尾补译失败：{e}")
+                        if backfill_fails >= BACKFILL_MAX_CONSECUTIVE_FAILS:
+                            backfill_given_up = True
+                            self._say("[警告] 收尾补译连续失败 "
+                                      f"{BACKFILL_MAX_CONSECUTIVE_FAILS} 次，放弃本场补译（原文已保留）")
+                # 兜底补发：worker 猝死/超时未 emit 的语句在这里补上（审查 N2）。
+                # 注意：放弃补译只跳过「重试翻译」，本循环仍对每条语句执行补发，
+                # 否则放弃分支会让未 emit 的语句永久丢失（N2 回归）。
                 self._emit_once(seg)
 
         # 尾部：等说话人标注线程收尾（把手上这一轮窗口跑完即退出）。

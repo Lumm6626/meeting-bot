@@ -109,6 +109,28 @@ def test_translate_empty_choices_raises_translation_error(monkeypatch):
     assert isinstance(excinfo.value.__cause__, IndexError)
 
 
+def test_translate_none_choices_raises_translation_error(monkeypatch):
+    """choices=None 必须降级为 TranslationError，不得泄漏 TypeError（Critical-1 的一半）。
+
+    接口字段缺失时 ``resp.choices[0]`` 抛
+    TypeError("'NoneType' object is not subscriptable")。修复前 translator 的异常包裹
+    元组不含 TypeError → 异常直穿 stop() 的 ``except TranslationError`` →
+    export_all 整段被跳过（整场会议零产物）。本用例锁死该包裹。
+    """
+
+    class NoneChoicesResponse:
+        choices = None
+
+    def fake_create(self, **kwargs):
+        return NoneChoicesResponse()
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    with pytest.raises(TranslationError) as excinfo:
+        t.translate("hello", "en")
+    assert isinstance(excinfo.value.__cause__, TypeError)   # 保留 from e 因果链
+
+
 def test_translator_sets_opencode_session_header(monkeypatch):
     """OpenCode Go 缺 x-opencode-session 头会直接 400（MissingSessionID），客户端必须带上。"""
     monkeypatch.delenv("OPENCODE_SESSION_ID", raising=False)

@@ -967,3 +967,117 @@ def test_no_warning_when_capture_healthy():
     joined = "\n".join(logs)
     assert "声音采集中断" not in joined
     assert "丢弃" not in joined
+
+
+# ---------------------------------------------------------------------------
+# 最终审查修复波：补译免疫 + diarize 缓冲裁剪
+# ---------------------------------------------------------------------------
+
+class FakeTranslatorChoicesNone:
+    """translate 全程抛 TypeError（复现 choices=None 的结构异常链）。
+
+    translator._chat 的异常包裹（修复前不含 TypeError）接不住这个异常，它会直穿
+    stop() 的 ``except TranslationError`` —— 这正是 Critical-1 的故障链。
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def translate(self, text, lang=""):
+        self.calls += 1
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+class FakeCaptureNSamples:
+    """喂入 n 块固定样本数的静音后返回结束哨兵（缓冲裁剪用）。"""
+
+    def __init__(self, chunks: int, samples: int):
+        self.chunks = [np.zeros(samples, dtype=np.float32) for _ in range(chunks)]
+        self._i = 0
+
+    def start(self):
+        pass
+
+    def read(self, timeout=1.0):
+        if self._i < len(self.chunks):
+            c = self.chunks[self._i]
+            self._i += 1
+            return c
+        return None
+
+    def stop(self):
+        pass
+
+
+def test_stop_backfill_survives_unexpected_error(monkeypatch, tmp_path):
+    """Critical-1 回归：非 TranslationError 的补译异常不得逃逸出 stop()。
+
+    故障链：接口返回 choices=None → translate 抛 TypeError → stop() 的补译循环只捕
+    TranslationError 接不住 → 异常逃逸到 app 的 finish() → export_all 整段被跳过 →
+    整场会议零产物（无逐字稿、无纪要）。
+
+    修复后：stop() 不抛异常、失败段保持空译文、每条都有告警、连续失败 3 次后放弃补译
+    （有界重试，不再逐句重试拖长收尾），且 export_all 照常产出两份文件。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.1)
+    tr = FakeTranslatorChoicesNone()
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+                 translator=tr, diarizer=None)
+    events = []
+    statuses = []
+    r.on_segment(events.append)
+    r.on_status(statuses.append)
+
+    r.start("补译免疫会议")     # 主循环同步跑完：3 块音频 → 3 条语句
+    r.stop()                  # 变异自查点：改回 except TranslationError，TypeError 逃逸 → 用例失败
+
+    segs = r.store.segments()
+    assert [s.text for s in segs] == ["line 1", "line 2", "line 3"]
+    assert all(s.translation == "" for s in segs)      # 失败段保持空译文，未被伪造成原文
+    assert tr.calls == 6                               # 3 次 worker + 3 次补译（3 次后放弃）
+    assert sum(1 for m in statuses if "收尾补译失败" in m) == 3
+    assert any("放弃本场补译" in m for m in statuses)   # 有界重试：不再逐句重试
+    assert len(events) == 3                            # 放弃补译不影响兜底补发
+
+    # 关键收益：stop() 正常返回 → 调用方 export_all 照常执行 → 两份产物落盘
+    from meeting_bot.config import Settings
+    from meeting_bot.export import export_all
+    settings = Settings("https://x", "sk-test", "m1", "m2", "small", "",
+                        tmp_path / "会议记录", tmp_path)
+    transcript_path, minutes_path = export_all(r.store, settings, "补译免疫会议",
+                                              r.started_at, translator=None)
+    assert transcript_path.exists() and minutes_path.exists()
+
+
+def test_diarize_buffer_is_trimmed(monkeypatch):
+    """I2 回归：_diarize_audio 有上限（不再无界增长），裁剪量记入 _diarize_base。
+
+    DIARIZE_BUFFER_SECONDS=0.05（800 样本），每块 400 样本 × 10 块喂入 → 缓冲只留
+    800 样本，_diarize_base 记下裁剪掉的 3200。不变量：缓冲样本 + 裁剪样本 = 总样本，
+    窗口起点换算回绝对时间轴。变异自查点：去掉 _trim_diarize_buffer 调用 → 缓冲仍是
+    4000 样本 → 本用例失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.DIARIZE_BUFFER_SECONDS", 0.05)
+    chunk_samples, chunks = 400, 10
+    r = Recorder(_settings(),
+                 capture=FakeCaptureNSamples(chunks=chunks, samples=chunk_samples),
+                 asr=FakeASR(), translator=None, diarizer=None)
+    r.on_status(lambda m: None)
+    r.start("缓冲裁剪会议")
+    r.stop()
+
+    total = chunks * chunk_samples                 # 4000
+    limit = int(0.05 * 16000)                      # 800
+    kept = sum(len(a) for a in r._diarize_audio)
+    assert kept <= limit + chunk_samples, f"缓冲未裁剪：{kept} 样本"
+    assert kept + r._diarize_base == total, "缓冲样本 + 裁剪样本必须守恒（时间轴不漂移）"
+    assert r._diarize_base == total - kept
+
+    audio, base = r._take_diarize_window()
+    assert len(audio) == kept                      # 窗口不超过缓冲
+    assert base == r._diarize_base / 16000.0       # 窗口起点 = 裁剪量换算的绝对秒数

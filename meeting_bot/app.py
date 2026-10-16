@@ -24,6 +24,11 @@ class RecorderBridge(QObject):
     segment = pyqtSignal(object)
     status = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
+    # 退出收尾完成（在后台线程里 emit）→ 主线程 _finish_close。
+    # 不能用 QTimer.singleShot(0, ...)：该静态方法的计时器建在「调用线程」的事件循环上，
+    # Python threading.Thread 没有 Qt 事件分发器 → 定时器永不触发，窗口会永久隐藏
+    # 且进程不退出（已用离屏 Qt 实测复现）。信号 + 队列投递才是跨线程回主线程的正路。
+    shutdown_done = pyqtSignal()
 
 
 class MainWindow(QMainWindow):
@@ -37,6 +42,9 @@ class MainWindow(QMainWindow):
         self.bridge.segment.connect(self._on_segment)
         self.bridge.status.connect(self._on_status)
         self.bridge.finished.connect(self._on_finished)
+        self.bridge.shutdown_done.connect(self._finish_close)
+        # 退出收尾状态位：True 时二次 close() 直接放行，避免弹窗递归 / 重复后台收尾
+        self._closing = False
 
         central = QWidget()
         lay = QVBoxLayout(central)
@@ -166,7 +174,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", msg)
 
     def closeEvent(self, e):
-        """关闭窗口：录制 / 收尾中先确认，避免静默丢弃本次记录。"""
+        """关闭窗口：录制 / 收尾中先确认，避免静默丢弃本次记录。
+
+        recorder.stop() 最坏要等 10s（producer）+ 20s（翻译排空）+ 补译 + 180s（标注线程），
+        在 GUI 线程同步调用会把窗口冻结数分钟（最终审查 Critical-2）。改为：确认后隐藏
+        窗口，后台线程做收尾，完成信号回到主线程再真正关闭。
+        """
+        if self._closing:
+            # 已完成一次收尾：直接放行（_finish_close 触发的二次 close）
+            e.accept()
+            return
         if self.recorder is not None and not self.start_btn.isEnabled():
             ret = QMessageBox.question(
                 self, "退出确认",
@@ -175,11 +192,29 @@ class MainWindow(QMainWindow):
             if ret != QMessageBox.StandardButton.Yes:
                 e.ignore()
                 return
-            try:
-                self.recorder.stop()
-            except Exception:
-                pass
+            self._closing = True
+            self.hide()          # 先让窗口消失：收尾期间用户看到的是「已关闭」而非冻结的窗口
+            e.ignore()           # 真正的关闭交给 _finish_close（收尾完成后）
+
+            def _shutdown():
+                try:
+                    self.recorder.stop()
+                except Exception:
+                    pass             # 收尾失败不阻断退出（退出路径不能把用户锁死在窗口里）
+                self.bridge.shutdown_done.emit()
+            threading.Thread(target=_shutdown, daemon=True).start()
+            return
         e.accept()
+
+    def _finish_close(self):
+        """后台收尾完成（GUI 线程槽）：复位状态后真正关闭窗口。
+
+        必须先 setEnabled(True)：否则二次 closeEvent 看到「start 按钮仍禁用」会再次弹确认框、
+        再起一个收尾线程 —— 递归弹窗且窗口关不掉。
+        """
+        self._closing = False
+        self.start_btn.setEnabled(True)
+        self.close()
 
 
 def main():

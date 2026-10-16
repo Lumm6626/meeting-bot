@@ -103,9 +103,12 @@ class Translator:
                 if attempt == 2:
                     raise TranslationError(f"翻译接口不可用：{e}") from e
                 time.sleep(2 ** attempt)
-            except (IndexError, AttributeError, ValueError) as e:
+            except (IndexError, AttributeError, ValueError, TypeError) as e:
                 # 响应结构异常（choices 为空 / message 缺失 / 字段类型不合法）：
-                # 非 APIError，不重试，直接降级为 TranslationError 交调用方处理
+                # 非 APIError，不重试，直接降级为 TranslationError 交调用方处理。
+                # TypeError 必须在内（最终审查 Critical-1）：choices=None 时
+                # resp.choices[0] 抛 TypeError("'NoneType' object is not subscriptable")，
+                # 漏掉它会穿透 stop()/worker 的 TranslationError 处理链。
                 raise TranslationError(f"接口响应结构异常：{e}") from e
         raise TranslationError("翻译接口不可用")
 
