@@ -187,6 +187,12 @@ class Recorder:
             # 必须先 set(producer_done) 再 clear(running)，否则 stop() 可能跳过等待。
             self._producer_done.set()
             self._running.clear()
+            # TOCTOU 闭环（审查 New-1）：start() 的 _stop 守卫通过之后、_capture.start()
+            # 真正打开采集之前，stop() 可能抢先跑完 —— 那一瞬 stream 还没打开，
+            # stop() 里的 _capture.stop() 是空操作，此后无人再关采集（loopback 占用到
+            # 进程退出）。主循环退出即补一次 _capture.stop()（AudioCapture.stop 幂等：
+            # clear + join 已结束的线程，重复调用无副作用）。
+            self._capture.stop()
 
     def _process_utterance(self, audio: np.ndarray, start_offset: float) -> None:
         try:

@@ -842,3 +842,91 @@ def test_start_after_stop_does_not_open_capture(monkeypatch):
     assert r.store.segments() == []          # 无语句入库
     assert r._translate_thread is None       # 翻译 worker 未启动
     assert r._diarize_thread is None
+
+
+# ---------------------------------------------------------------------------
+# Task 12 修复轮 2：守卫窗口的 TOCTOU 闭环（New-1）
+# ---------------------------------------------------------------------------
+
+class FakeCaptureSlowStart:
+    """start() 阻塞到测试放行；start() 返回前 stop() 是空操作（建模真实采集）。
+
+    真实 AudioCapture.start() 只负责起线程、stream 在采集线程里才真正打开，因此
+    「stop() 早于 start() 返回」时它关不掉任何东西（空操作）。本 fake 精确复现这一点：
+    opened 只在 start() 返回时置位，未 opened 时的 stop() 不记账、不关闭。
+    """
+
+    def __init__(self):
+        self.opened = False
+        self.closed = False
+        self.stop_calls = 0
+        self.enter_start = threading.Event()          # start() 已进入（正在打开采集）
+        self.release_start = threading.Event()        # 测试放行：start() 此刻才返回
+        self.stop_seen_unopened = threading.Event()   # stop() 在「采集未打开」时到达
+
+    def start(self):
+        self.enter_start.set()
+        assert self.release_start.wait(timeout=10), "测试未放行 capture.start()"
+        self.opened = True
+
+    def read(self, timeout=1.0):
+        return None          # 结束哨兵：主循环立即退出（本用例只关心「打开/关闭」配对）
+
+    def stop(self):
+        if not self.opened:
+            self.stop_seen_unopened.set()    # 采集还没打开 → 空操作（同真实实现）
+            return
+        self.stop_calls += 1
+        self.closed = True
+        self.opened = False
+
+
+def test_forced_interleave_stop_wins_capture_is_still_closed(monkeypatch):
+    """New-1 回归：_stop 守卫与 _capture.start() 之间的亚毫秒窗口也必须闭环。
+
+    强制交错（不靠 sleep 撞运气）：
+      1. start() 线程通过 _stop 守卫后阻塞在 capture.start() 内（采集尚未打开）；
+      2. 另一线程抢先 stop()：_stop 置位 + capture.stop() 空操作（此刻没得关）；
+      3. 放行 capture.start() → 采集此刻才真正打开，主循环因 _stop 已置位立即退出；
+      4. 主循环 finally 补一次 capture.stop() → 采集被关闭。
+
+    旧实现（只在 stop() 里关采集）第 4 步什么都不做 → stop_calls == 0，
+    loopback 通道一路占用到进程退出。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    capture = FakeCaptureSlowStart()
+    r = Recorder(_settings(), capture=capture, asr=FakeASR(),
+                 translator=FakeTranslator(), diarizer=None)
+    statuses = []
+    r.on_status(statuses.append)
+    errors = []
+
+    def _start():
+        try:
+            r.start("交错会议")
+        except BaseException as e:   # 线程内异常默认只打日志，带回主线程断言
+            errors.append(e)
+
+    starter = threading.Thread(target=_start, name="start-thread", daemon=True)
+    starter.start()
+    assert capture.enter_start.wait(timeout=5), "start() 未进入 capture.start()"
+
+    stopper = threading.Thread(target=r.stop, name="stop-thread", daemon=True)
+    stopper.start()                  # stop() 抢先：此时采集还没打开
+    try:
+        assert capture.stop_seen_unopened.wait(timeout=5), "stop() 未在采集打开前落地"
+        capture.release_start.set()  # 放行：采集在此刻才真正打开
+        starter.join(timeout=10)
+        stopper.join(timeout=10)
+    finally:
+        capture.release_start.set()  # 断言失败也要放行，避免线程卡到 10s 超时
+
+    assert not starter.is_alive() and not stopper.is_alive()
+    assert errors == []
+    assert capture.stop_calls >= 1, "采集被打开后无人关闭（TOCTOU 残留）"
+    assert capture.closed is True and capture.opened is False
+    # 守卫已放行才算真的走进了 TOCTOU 窗口；若守卫提前挡下，本用例就退化成
+    # 上一个用例（start_after_stop），不再覆盖「先开后关」这条路径。
+    assert "录制已取消" not in statuses
+    assert r.store.segments() == []
+    assert r._translate_thread is not None    # start() 确实跑到了主循环之后

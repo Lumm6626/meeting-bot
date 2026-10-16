@@ -138,9 +138,13 @@ class MainWindow(QMainWindow):
         recorder = self.recorder
 
         def finish():
-            recorder.stop()
-            title = title_hint or recorder.title or "未命名会议"
+            # recorder.stop() 也必须在 try 内（审查 New-6）：收尾失败（采集/标注线程
+            # 异常等）若在 try 之外冒出，finished 信号永不发射 —— UI 卡在「正在收尾…」
+            # 且两个按钮全禁用，用户既等不到结果也无法重试。与 export_all 共用兜底：
+            # 任何异常都收敛成 finished(False, …) → 槽内恢复按钮 + 弹失败提示。
             try:
+                recorder.stop()
+                title = title_hint or recorder.title or "未命名会议"
                 transcript_path, minutes_path = export_all(
                     recorder.store, self.settings, title,
                     recorder.started_at or datetime.now(),
