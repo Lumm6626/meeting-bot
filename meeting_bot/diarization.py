@@ -42,6 +42,7 @@ def assign_speakers(segments: list[Segment], spans: list[tuple[float, float, str
             overlap = max(0.0, min(seg.end, end) - max(seg.start, start))
             if overlap > best_overlap:
                 best_label, best_overlap = label, overlap
-        if best_label and best_overlap >= min_overlap * (seg.end - seg.start):
+        # +epsilon：恰好等于阈值时浮点误差会静默漏标（如 7.0-4.9=2.0999999999999996 < 0.3*7.0=2.1）
+        if best_label and best_overlap + 1e-9 >= min_overlap * (seg.end - seg.start):
             seg.speaker = best_label
     return segments

@@ -24,3 +24,15 @@ def test_threshold_blocks_weak_overlap():
     spans = [(3.6, 4.0, "SPEAKER_00")]  # 只覆盖 10% < 30%
     assign_speakers(segs, spans)
     assert segs[0].speaker == ""
+
+
+def test_exact_threshold_is_assigned():
+    segs = [Segment(0.0, 7.0, "hello")]
+    assign_speakers(segs, [(4.9, 7.0, "SPEAKER_00")])
+    assert segs[0].speaker == "SPEAKER_00"
+
+
+def test_span_containing_segment_is_assigned():
+    segs = [Segment(5.0, 9.0, "hello")]
+    assign_speakers(segs, [(0.0, 26.0, "SPEAKER_00")])
+    assert segs[0].speaker == "SPEAKER_00"
