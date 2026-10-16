@@ -1,6 +1,7 @@
 # 语音识别（Windows pip 默认装 CPU 版 torch）
 faster-whisper==1.1.1
 torch==2.5.1
+torchaudio==2.5.1
 # 说话人聚类
 pyannote.audio==3.3.2
 # 音频捕获（WASAPI loopback）
