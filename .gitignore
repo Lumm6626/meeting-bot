@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+会议记录/
+models/

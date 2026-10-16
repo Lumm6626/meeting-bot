@@ -1,0 +1,20 @@
+# 语音识别（Windows pip 默认装 CPU 版 torch）
+faster-whisper==1.1.1
+torch==2.5.1
+# 说话人聚类
+pyannote.audio==3.3.2
+# 音频捕获（WASAPI loopback）
+soundcard==0.4.3
+# 语音活动检测
+silero-vad==5.1.2
+onnxruntime==1.20.1
+# 翻译（OpenAI 兼容接口，连 OpenCode Go）
+openai==1.57.0
+# GUI
+PyQt6==6.7.1
+# 导出
+python-docx==1.1.2
+python-dotenv==1.0.1
+numpy==2.1.3
+soundfile==0.12.1
+pytest==8.3.4
