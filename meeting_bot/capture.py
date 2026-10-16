@@ -35,19 +35,55 @@ class AudioCapture:
 
     def _run(self) -> None:
         frames = int(self.sample_rate * CHUNK_SECONDS)
-        with self._mic.recorder(samplerate=self.sample_rate, channels=1) as rec:
-            while self._running.is_set():
+        try:
+            with self._mic.recorder(samplerate=self.sample_rate, channels=1) as rec:
+                while self._running.is_set():
+                    try:
+                        data = rec.record(frames)
+                    except Exception:
+                        break
+                    chunk = np.asarray(data, dtype=np.float32).reshape(-1)
+                    try:
+                        self._queue.put_nowait(chunk)
+                    except queue.Full:
+                        pass  # 丢弃当前块保实时
+        finally:
+            # 无论录音器打开/读取/运行期出现任何异常，都必须投递结束哨兵，
+            # 否则消费者会永久阻塞在 read() 上。哨兵同样不能阻塞：
+            # 队列满时先腾出一个位置，再非阻塞写入。
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
                 try:
-                    data = rec.record(frames)
-                    self._queue.put(np.asarray(data, dtype=np.float32).reshape(-1))
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._queue.put_nowait(None)
                 except queue.Full:
-                    pass  # 消费不过来时丢弃，保证实时性
-                except Exception:
-                    break
-        self._queue.put(None)  # 结束哨兵
+                    pass
 
     def read(self, timeout: float = 1.0) -> np.ndarray | None:
-        """读取一块音频；捕获结束返回 None。"""
+        """读取一块音频。
+
+        契约：**超时抛 ``queue.Empty``；采集结束返回 ``None``**。
+        二者语义不同，调用方需区分对待：
+
+        - 返回 ``None``：捕获线程已结束（结束哨兵），可以退出读取循环；
+        - 抛 ``queue.Empty``：本次 ``timeout`` 内没有新数据，采集仍在进行，
+          调用方 ``try/except queue.Empty`` 后应继续读取。
+
+        典型用法::
+
+            while True:
+                try:
+                    chunk = cap.read(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    break
+                handle(chunk)
+        """
         return self._queue.get(timeout=timeout)
 
     def stop(self) -> None:
