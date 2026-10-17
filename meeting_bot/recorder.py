@@ -320,21 +320,38 @@ class Recorder:
             self._say(f"[警告] 识别失败（本批 {len(batch)} 条语句已丢弃）：{e}")
             return
 
-        def to_abs(t_rel: float) -> float:
-            """拼接缓冲内的相对秒 → 会议绝对秒（按语句分段映射回填间隙）。"""
+        def to_abs(t_rel: float, is_end: bool = False) -> float:
+            """拼接缓冲内的相对秒 → 会议绝对秒（按语句分段映射回填间隙）。
+
+            区间开闭必须区分起点/终点：语句区间是半开的 [rs, re)，但段终点恰等于某条
+            语句的终点时（re_ == s），用半开判定会「跳」到下一条语句的起点 —— 例：两条
+            语句偏移 0 和 11s，whisper 返回 (0, 1)，终点 1.0 落在语句 1 的终点边界，
+            半开判定把它映射到 11.0 → 该段时长膨胀 11 倍，assign_speakers 的重叠比例
+            随之错乱（说话人漏标/错标）。故终点用 (rs, re] 闭右、起点用 [rs, re) 闭左。
+            """
             s = int(t_rel * 16000)
             for rs, re_, off in spans:
-                if rs <= s < re_:
+                hit = (rs < s <= re_) if is_end else (rs <= s < re_)
+                if hit:
                     return (off + s - rs) / 16000.0
-            if s >= spans[-1][1]:
+            i = spans[-1]
+            if s >= i[1]:
                 # 段落在最后一条语句之后：沿最后一条语句的时间轴等量延伸
-                return (spans[-1][2] + spans[-1][1] - spans[-1][0]
-                        + s - spans[-1][1]) / 16000.0
-            # 段落在首条语句之前（s < 0 或浮点误差）：沿首条语句时间轴回退
-            return (spans[0][2] + s) / 16000.0
+                return (i[2] + i[1] - i[0] + s - i[1]) / 16000.0
+            # 段落在首条语句之前（s < 0 或浮点误差）：沿首条语句时间轴回退；时间轴
+            # 不允许为负（负起点会让 UI 排序/切片异常），夹到 0。
+            return max(0.0, (spans[0][2] + s) / 16000.0)
 
         for s in segments:
-            seg = self._store.add(to_abs(s.start), to_abs(s.end), s.text, lang=s.lang)
+            # 单段入库失败只丢这一段（告警可见），不得杀掉识别线程（审查 N3）：
+            # store.add / to_abs 的任何意外异常若直穿 worker，整场后续批次永不出库。
+            try:
+                start = to_abs(s.start)
+                end = max(start, to_abs(s.end, is_end=True))   # 时间轴单调，防倒挂
+                seg = self._store.add(start, end, s.text, lang=s.lang)
+            except Exception as e:
+                self._say(f"[警告] 语句入库失败：{e}")
+                continue
             if self._translator:
                 self._translate_queue.put(seg)
             else:

@@ -625,13 +625,21 @@ class FakeTranslatorUnexpectedErrorOnce:
 
 
 class FakeDiarizerNoOverlap:
-    """返回与所有语句零重叠的 span（语句都在 0~3s，span 在 10~12s）。"""
+    """返回与所有语句零重叠的 span（语句都在 0~3s，span 在 10~12s）。
 
-    def __init__(self):
+    seg_counts 记录每次 label() 调用那一刻「已入库语句数」：用来证明这一轮 diarize
+    tick 真的看到了语句（否则「没有语句被标注 / 无幽灵说话人」是恒真的空断言，审查 N2）。
+    """
+
+    def __init__(self, seg_count=None):
         self.calls = 0
+        self.seg_count = seg_count          # 可用 Recorder 建好后回填（lambda: len(...)）
+        self.seg_counts: list[int] = []
 
     def label(self, audio, sample_rate=16000):
         self.calls += 1
+        if self.seg_count is not None:
+            self.seg_counts.append(self.seg_count())
         return [(10.0, 12.0, "SPK_GHOST")]
 
 
@@ -689,11 +697,18 @@ def test_no_ghost_speaker(monkeypatch):
     diarizer = FakeDiarizerNoOverlap()
     r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRBatchChunks(),
                  translator=FakeTranslator(), diarizer=diarizer)
+    # Recorder 建好后再回填取数器：label() 在标注线程里调用时才读 store（审查 N2）
+    diarizer.seg_count = lambda: len(r.store.segments())
     statuses = []
     r.on_status(statuses.append)
     r.start("幽灵说话人会议")
     assert _wait_until(lambda: diarizer.calls >= 1), "diarize 一轮都没跑，断言无意义"
+    # 关键断言（N2）：这一轮 tick 必须「已经看到语句」。若 diarize 跑在语句入库之前，
+    # 下面的「无语句被标注 / 无幽灵说话人」是恒真断言（测试退化，审查 M3/N2）。
+    assert _wait_until(lambda: max(diarizer.seg_counts or [0]) >= 1), (
+        f"diarize tick 从未看到语句，断言无意义：seg_counts={diarizer.seg_counts}")
     r.stop()                       # 收尾 join 标注线程，确保这一轮跑完
+    assert max(diarizer.seg_counts) >= 1     # 收尾后再确证一次（防 stop 前竞态）
 
     segs = r.store.segments()
     assert len(segs) == 3
@@ -1453,9 +1468,71 @@ def test_batch_preserves_inter_utterance_gaps(monkeypatch):
     segs = r.store.segments()
     assert [s.text for s in segs] == ["first", "second"]
     assert segs[0].start == 0.0
+    # 关键断言（N1）：第一条的终点恰在语句边界（1.0s），必须留在 1.0 而不是跳到
+    # 第二条语句起点 11.0 —— 半开区间 [rs, re) 用在终点上会让时长膨胀 11 倍，
+    # 说话人重叠比例随之错乱（漏标）。
+    assert segs[0].end == 1.0, f"起点边界开闭错：end={segs[0].end}"
     # 关键断言：第二条必须回到 11.0~12.0，而不是 1.0~2.0
     assert abs(segs[1].start - 11.0) < 1e-6, f"间隙被吃掉：start={segs[1].start}"
     assert abs(segs[1].end - 12.0) < 1e-6, f"间隙被吃掉：end={segs[1].end}"
+
+
+class FakeASRBoundarySegs:
+    """返回终点/起点恰好压在语句边界上的段（(0.5,1.0) / (1.0,1.5)）。"""
+
+    def __init__(self, segs):
+        self.segs = list(segs)
+        self.calls = 0
+        self.batch_lens: list[int] = []
+
+    def transcribe(self, audio, sample_rate=16000):
+        self.calls += 1
+        self.batch_lens.append(len(audio))
+        return [Segment(a, b, t, lang="en") for a, b, t in self.segs]
+
+
+def test_batch_segment_end_on_boundary(monkeypatch):
+    """N1 回归：段终点压在语句边界上时，必须归属「前一条语句的终点」，不得跳到后一句起点。
+
+    配置：两条 1 秒语句，偏移 0 与 11*16000（中间 10 秒静音）。拼接缓冲只有 2 秒，
+    缓冲位置 1.0s 同时是「第 1 条语句的终点」和「第 2 条语句的起点」，但两者的会议
+    绝对时间差 10 秒（1.0 vs 11.0）—— 边界点归属哪一侧直接决定时间戳对错。
+
+    终点（is_end）：按 (rs, re] 闭右 → (0.5, 1.0)，时长 0.5s；
+    旧实现（终点也用半开 [rs, re)）：落到第 2 条语句 → (0.5, 11.0)，时长膨胀 11 倍
+    → assign_speakers 的重叠比例错乱（说话人漏标/错标）。
+
+    三场景：相邻（0/16000，两侧同值，只看形状）、有间隙（0/11*16000，判据）、
+    起点压边界（0/11*16000，起点仍按 [rs, re) 闭左 → 归后一句，与终点相反）。
+
+    变异自查点：删掉 to_abs 的 is_end 分支（终点退回半开判定）→ 场景 B 得到 11.0 → 失败。
+    """
+    def _run(offsets, segs):
+        monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer",
+                            lambda: FakeVADOffsets(offsets, samples=16000))
+        asr = FakeASRBoundarySegs(segs)
+        rec = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=asr,
+                       translator=None, diarizer=None)
+        rec.on_status(lambda m: None)
+        rec.start("边界会议")
+        rec.stop()
+        return asr, rec.store.segments()
+
+    # 场景 A：两语句相邻（偏移 0 / 16000）→ 边界两侧同为 1.0，形状正确且不膨胀
+    asr_a, segs_a = _run([0, 16000], [(0.5, 1.0, "a")])
+    assert asr_a.batch_lens == [2 * 16000]
+    assert [(s.start, s.end) for s in segs_a] == [(0.5, 1.0)], segs_a
+
+    # 场景 B（判据）：中间 10 秒静音 → 终点必须留在 1.0，不能跳到 11.0
+    asr_b, segs_b = _run([0, 11 * 16000], [(0.5, 1.0, "b")])
+    assert asr_b.batch_lens == [2 * 16000]
+    assert (segs_b[0].start, segs_b[0].end) == (0.5, 1.0), (
+        f"终点跳过边界：{segs_b[0].start}~{segs_b[0].end}（续长 {segs_b[0].end - segs_b[0].start:.1f}s）")
+
+    # 场景 C：起点压在边界上 → 起点按 [rs, re) 闭左，归后一条语句（11.0 起）
+    _, segs_c = _run([0, 11 * 16000], [(1.0, 1.5, "c")])
+    assert (segs_c[0].start, segs_c[0].end) == (11.0, 11.5), (
+        f"起点边界归属错：{segs_c[0].start}~{segs_c[0].end}")
 
 
 def test_emit_exception_does_not_kill_asr_worker(monkeypatch):
