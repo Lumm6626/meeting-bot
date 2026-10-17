@@ -26,7 +26,8 @@ class CaptureError(Exception):
 CHUNK_SECONDS = 0.5
 MIX_TIMEOUT = 0.2            # 混合线程等待新音频的上限（秒）：超时即跳过本轮，不阻塞
 MIX_MAX_BUFFERED_CHUNKS = 3  # 单边缓冲上限：超过即丢最旧的数据（时钟漂移防御）
-MIX_IDLE_GRACE = 3.0         # 单路无数据超过此时长 → 降级为另一路直通（防 loopback 卡死）
+MIX_IDLE_GRACE = 3.0         # 单路无数据超过此时长 → 本轮先直通另一路（防 loopback 饿死）
+MIX_IDLE_REPORT = 30.0       # 单路连续无数据超过此时长 → 记一条诊断（真异常才提示）
 
 SOURCE_SPEAKER = "speaker"   # 只录系统扬声器 loopback
 SOURCE_MIC = "mic"           # 只录默认麦克风
@@ -74,6 +75,7 @@ class AudioCapture:
         self._side_alive: list[bool] = []
         self._side_buffers: list[np.ndarray] = []
         self._side_last_data: list[float] = [0.0, 0.0]
+        self._idle_reported: list[bool] = [False, False]
 
         if source == SOURCE_MIC:
             try:
@@ -141,6 +143,7 @@ class AudioCapture:
             self._side_alive[i] = True
             self._side_buffers[i] = np.zeros(0, dtype=np.float32)
             self._side_last_data[i] = time.time()
+            self._idle_reported[i] = False
             self._threads.append(threading.Thread(
                 target=self._run_side, args=(device, self._side_queues[i], name),
                 name=f"audio-capture-{name}", daemon=True))
@@ -248,19 +251,22 @@ class AudioCapture:
     def _emit_ready(self) -> None:
         """攒够一块就输出：两边都活时配对混音，只剩一路时直通。
 
-        闲置降级：某路设备「卡住不出数据」（如无播放时部分驱动的 loopback
-        采集会饿死）会让另一路音频永远等配对 → 字幕归零。该路超过
-        ``MIX_IDLE_GRACE`` 秒无新数据时视为失效，降级为单路直通。
+        闲置旁通（不判死）：某些驱动的 loopback 在没有播放时会「饿死」（record
+        迟迟不返回），死等配对会让麦克风音频永远发不出去（字幕归零）。某路超过
+        ``MIX_IDLE_GRACE`` 秒无新数据时，本轮先把另一路直通输出；该路**不**标记
+        失效——对方后来开口时数据一到就自动恢复双路混音，不会永久丢掉线上声音。
+        连续闲置超过 ``MIX_IDLE_REPORT`` 才记一条诊断，避免每次静场都刷告警。
         """
         frames = self._frames
         while True:
             if all(self._side_alive):
-                for i in (0, 1):
-                    if (self._side_buffers[i].size < frames
-                            and time.time() - self._side_last_data[i] > MIX_IDLE_GRACE):
-                        self._side_alive[i] = False
-                        self._set_error(RuntimeError(
-                            f"{('系统声音' if i == 0 else '麦克风')}路无数据（可能设备被占用/未播放），已降级单路直通"))
+                idle = [i for i in (0, 1)
+                        if self._side_buffers[i].size < frames
+                        and time.time() - self._side_last_data[i] > MIX_IDLE_GRACE]
+                if idle and self._side_buffers[1 - idle[0]].size >= frames:
+                    self._note_idle(idle[0])
+                    self._put(self._queue, self._take(1 - idle[0]))
+                    continue
                 if (self._side_buffers[0].size < frames
                         or self._side_buffers[1].size < frames):
                     return
@@ -275,6 +281,18 @@ class AudioCapture:
             if self._side_buffers[i].size < frames:
                 return
             self._put(self._queue, self._take(i))
+
+    def _note_idle(self, i: int) -> None:
+        """闲置路诊断：只在「长时间」无数据时记一次（短时静场属正常，不告警）。"""
+        if self._idle_reported[i]:
+            return
+        if time.time() - self._side_last_data[i] <= MIX_IDLE_REPORT:
+            return
+        self._idle_reported[i] = True
+        self._set_error(RuntimeError(
+            f"{('系统声音' if i == 0 else '麦克风')}路长时间没有数据"
+            f"（超过 {MIX_IDLE_REPORT:.0f} 秒，可能设备被占用或没有声音输入），"
+            "期间先用另一路继续；该路恢复后会自动重新混合"))
 
     def _take(self, i: int) -> np.ndarray:
         chunk = self._side_buffers[i][:self._frames]

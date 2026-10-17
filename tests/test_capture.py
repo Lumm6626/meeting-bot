@@ -561,11 +561,11 @@ def test_both_requires_both_devices(monkeypatch):
     assert cap.source == "speaker"
 
 
-def test_both_idle_side_degrades_to_passthrough(monkeypatch):
-    """一路卡死不出数据（如无播放时 loopback 饿死）→ 超时后降级单路直通。
+def test_both_idle_side_bypasses_without_killing(monkeypatch):
+    """一路饿死不出数据（如无播放时 loopback）→ 本轮先直通另一路，但不判死。
 
-    白盒驱动混合线程：loopback 路从不喂数据，只持续喂麦克风路；
-    超过 MIX_IDLE_GRACE 后麦克风音频必须直通输出，而不是永远等配对。
+    关键：**不能**把闲置路永久标记失效 —— 线上会议刚开录时对方还没说话，
+    loopback 饿死几秒后对方开口，那一路必须还能接回来，否则整场丢掉对方声音。
     """
     _install_both_devices(
         monkeypatch,
@@ -573,6 +573,7 @@ def test_both_idle_side_degrades_to_passthrough(monkeypatch):
         _FakeDevice(lambda: _ValueRecorder(0.2)),
     )
     monkeypatch.setattr("meeting_bot.capture.MIX_IDLE_GRACE", 0.3)
+    monkeypatch.setattr("meeting_bot.capture.MIX_IDLE_REPORT", 0.3)
     cap = AudioCapture()
     cap._running.set()
     cap._side_last_data[0] = time.time() - 10.0   # loopback 已闲置 10s
@@ -582,9 +583,42 @@ def test_both_idle_side_degrades_to_passthrough(monkeypatch):
     mixer.start()
     try:
         out = cap.read(timeout=3.0)
-        assert out is not None and np.allclose(out, 0.2), "闲置路应被降级，麦克风直通"
-        assert cap._side_alive[0] is False, "loopback 路应被标记失效"
-        assert cap.error is not None, "降级应留诊断记录"
+        assert out is not None and np.allclose(out, 0.2), "闲置路时期另一路应直通"
+        assert cap._side_alive[0] is True, "闲置路不得判死（对方开口后要能接回）"
+        assert cap.error is not None, "长时间无数据应留一条诊断记录"
+        assert "系统声音" in str(cap.error), str(cap.error)
     finally:
+        cap._side_queues[1].put(None)
+        cap._side_queues[0].put(None)
+        mixer.join(timeout=3.0)
+
+
+def test_both_idle_side_rejoins_mixing(monkeypatch):
+    """饿死的那路恢复出数据后，双路混音自动恢复（不永久丢声音）。"""
+    _install_both_devices(
+        monkeypatch,
+        _FakeDevice(lambda: _ValueRecorder(0.1)),
+        _FakeDevice(lambda: _ValueRecorder(0.2)),
+    )
+    monkeypatch.setattr("meeting_bot.capture.MIX_IDLE_GRACE", 0.3)
+    monkeypatch.setattr("meeting_bot.capture.MIX_IDLE_REPORT", 30.0)
+    cap = AudioCapture()
+    cap._running.set()
+    cap._side_last_data[0] = time.time() - 10.0
+    cap._side_last_data[1] = time.time()
+    cap._side_queues[1].put(np.full(FRAMES, 0.2, dtype=np.float32))
+    mixer = threading.Thread(target=cap._mix_run, daemon=True)
+    mixer.start()
+    try:
+        first = cap.read(timeout=3.0)
+        assert first is not None and np.allclose(first, 0.2), "闲置期应直通"
+
+        # loopback 恢复出数据（先喂闲置路，避免竞态）→ 下一块应重新变成 0.1+0.2
+        cap._side_queues[0].put(np.full(FRAMES, 0.1, dtype=np.float32))
+        cap._side_queues[1].put(np.full(FRAMES, 0.2, dtype=np.float32))
+        second = cap.read(timeout=3.0)
+        assert second is not None and np.allclose(second, 0.3), "恢复后应重新双路混音"
+    finally:
+        cap._side_queues[0].put(None)
         cap._side_queues[1].put(None)
         mixer.join(timeout=3.0)
