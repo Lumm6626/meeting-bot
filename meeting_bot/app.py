@@ -23,6 +23,9 @@ from .translator import Translator
 class RecorderBridge(QObject):
     """把工作线程的事件桥接到 Qt 主线程（线程安全）。"""
     segment = pyqtSignal(object)
+    # 译文填充后的原地更新（两阶段显示第二阶段）：与 segment 分开，
+    # 面板按 seg.seq 找到原块替换，不新增块。
+    update = pyqtSignal(object)
     status = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
     # 退出收尾完成（在后台线程里 emit）→ 主线程 _finish_close。
@@ -41,6 +44,7 @@ class MainWindow(QMainWindow):
         self.subtitle = SubtitleWindow()
         self.bridge = RecorderBridge()
         self.bridge.segment.connect(self._on_segment)
+        self.bridge.update.connect(self._on_update)
         self.bridge.status.connect(self._on_status)
         self.bridge.finished.connect(self._on_finished)
         self.bridge.shutdown_done.connect(self._finish_close)
@@ -119,6 +123,7 @@ class MainWindow(QMainWindow):
                                  diarizer=diarizer,
                                  audio_source=getattr(self.settings, "audio_source", "both"))
         self.recorder.on_segment(self.bridge.segment.emit)
+        self.recorder.on_update(self.bridge.update.emit)
         self.recorder.on_status(self.bridge.status.emit)
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -134,6 +139,11 @@ class MainWindow(QMainWindow):
     def _on_segment(self, seg):
         name = self.recorder.store.display_name(seg.speaker)
         self.subtitle.show_segment(seg, name)
+
+    def _on_update(self, seg):
+        """译文到达（第二阶段）：交给面板按 seq 原地替换，不新增块。"""
+        name = self.recorder.store.display_name(seg.speaker)
+        self.subtitle.update_segment(seg, name)
 
     def _on_status(self, msg):
         self.status.setText(msg)

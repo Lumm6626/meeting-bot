@@ -104,6 +104,9 @@ class Recorder:
         self._diarizer = diarizer
         self._store = TranscriptStore()
         self._events: list[SegmentEvent] = []
+        # 译文填充后的「原地更新」通道（两阶段显示）：与 _events 分离，
+        # 因为同一条语句会先发原文（_events 一次），再发译文更新（_updates）。
+        self._updates: list[SegmentEvent] = []
         self._status: list[StatusEvent] = []
         self._stop = threading.Event()
         # producer-done：主循环（生产者）已完成尾部 flush，翻译 worker 方可排空退出。
@@ -131,8 +134,8 @@ class Recorder:
         self._asr_finished = threading.Event()
         # 已 emit 的 seq：stop() 兜底补发时去重（store 跨 start 不重置，seq 全局唯一 → 无需 clear）
         self._emitted: set[int] = set()
-        # _emit_once 的记账锁：worker 与 stop() 会并发对同一 seq 兜底补发，
-        # 「检查 + 记账」必须原子，否则两者都判定「未发过」→ 重复 emit（审查 Minor-1）
+        # _emit_once 的记账锁：识别线程（原文 emit）与 stop()（兜底补发）会并发处理
+        # 同一 seq，「检查 + 记账」必须原子，否则两者都判定「未发过」→ 重复 emit（审查 Minor-1）
         self._emit_lock = threading.Lock()
         self._diarize_audio: list[np.ndarray] = []
         # 已被 _trim_diarize_buffer 裁掉的样本数：滑动窗口的绝对时间原点
@@ -153,6 +156,14 @@ class Recorder:
     def on_segment(self, fn: SegmentEvent) -> None:
         self._events.append(fn)
 
+    def on_update(self, fn: SegmentEvent) -> None:
+        """注册「译文已填充」回调（两阶段显示的第二阶段）。
+
+        与 ``on_segment`` 分开：``on_segment`` 每条语句只发一次（原文上屏），
+        ``on_update`` 在翻译完成（含 zh 直填、收尾补译）后再发一次，供面板原地替换。
+        """
+        self._updates.append(fn)
+
     def on_status(self, fn: StatusEvent) -> None:
         self._status.append(fn)
 
@@ -160,13 +171,22 @@ class Recorder:
         for fn in self._events:
             fn(seg)
 
+    def _notify_update(self, seg: Segment) -> None:
+        """通知译文已填充。回调异常只告警：绝不能杀死翻译 worker / 中断收尾补译。"""
+        for fn in self._updates:
+            try:
+                fn(seg)
+            except Exception as e:
+                self._say(f"[警告] 译文更新回调异常：{e}")
+
     def _emit_once(self, seg: Segment) -> None:
         """发送语句事件并记账（每个 seq 最多一次）。
 
-        回调异常只告警：翻译 worker 与 stop() 都不能因消费者异常而中断（审查 N2）。
-        去重同时兜住「stop() 兜底补发」与「worker 迟到 emit」的竞态。
+        回调异常只告警：识别线程与 stop() 都不能因消费者异常而中断（审查 N2）。
+        去重兜住「原文阶段 emit」与「stop() 兜底补发」的竞态：一条语句必须先出原文
+        事件（两阶段显示的第一阶段），译文只走 :meth:`_notify_update`，两条通道互不重叠。
 
-        先记账再发送（at-most-once）：「检查 + 记账」若不加锁，worker 与 stop() 会并发
+        先记账再发送（at-most-once）：「检查 + 记账」若不加锁，识别线程与 stop() 会并发
         判定「未发过」→ 同一 seq 冒出两条事件（审查 Minor-1）。锁只护记账不包住 _emit：
         用户回调可能很慢甚至反向调用本类，在锁内执行有死锁风险。
         """
@@ -394,12 +414,14 @@ class Recorder:
             except Exception as e:
                 self._say(f"[警告] 语句入库失败：{e}")
                 continue
+            # 两阶段显示（第一阶段）：原文立即上屏 —— 此刻 seg.translation 为空，
+            # 面板主标签落回原文，不必干等翻译接口的 3~6 秒。译文到达后走
+            # _notify_update 原地替换（第二阶段）。
+            # 必须走 _emit_once：回调异常若直穿 worker，识别线程当场死亡且无告警，
+            # 此后所有批次永不出库（无声「字幕停更」）。_emit_once 内部记账 + 兜异常。
+            self._emit_once(seg)
             if self._translator:
                 self._translate_queue.put(seg)
-            else:
-                # 必须走 _emit_once：回调异常若直穿 worker，识别线程当场死亡且无告警，
-                # 此后所有批次永不出库（无声「字幕停更」）。_emit_once 内部记账 + 兜异常。
-                self._emit_once(seg)
 
     def _translate_worker(self) -> None:
         try:
@@ -428,7 +450,11 @@ class Recorder:
                     # 否则后续语句只入库、永不翻译、永不 emit（审查 N2）。
                     seg.translation = ""
                     self._say(f"[警告] 翻译异常（{seg.text[:20]}…）：{e}，已保留原文")
-                self._emit_once(seg)
+                if seg.translation:
+                    # 第二阶段：译文已填充 → 走「原地更新」通道。
+                    # 不再 _emit_once：原文阶段已经发过（会被去重挡掉），语义上也不该
+                    # 再发一次「原文」事件。翻译失败时原文已在屏上，无需通知。
+                    self._notify_update(seg)
         finally:
             self._worker_done.set()
 
@@ -575,6 +601,8 @@ class Recorder:
                     try:
                         seg.translation = self._translator.translate(seg.text, seg.lang)
                         backfill_fails = 0          # 成功即清零：偶发失败不累计
+                        # 补译成功 → 面板要拿到最终译文（原文阶段早已上屏）
+                        self._notify_update(seg)
                     except Exception as e:
                         backfill_fails += 1
                         self._say(f"[警告] 收尾补译失败：{e}")

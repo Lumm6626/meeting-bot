@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import QApplication
 import meeting_bot.app as appmod
 from meeting_bot.app import MainWindow
 from meeting_bot.config import Settings
-from meeting_bot.transcript import TranscriptStore
+from meeting_bot.transcript import Segment, TranscriptStore
 
 WIDGETS = ("title_input", "status", "start_btn", "stop_btn", "speaker_table")
 
@@ -370,9 +370,13 @@ class _FakeStartedRecorder:
         self.title = ""
         self.started_title = None
         self.handlers = []
+        self.update_handlers = []
 
     def on_segment(self, fn):
         self.handlers.append(fn)
+
+    def on_update(self, fn):
+        self.update_handlers.append(fn)
 
     def on_status(self, fn):
         self.handlers.append(fn)
@@ -456,6 +460,7 @@ def test_start_forwards_audio_source_and_reuses_probed_capture(qapp, tmp_path, m
         assert rec.audio_source == "speaker"
         assert rec.capture is made["capture"][0], "探测实例未被复用（会在录制时再开一次设备）"
         assert rec.handlers, "片段/状态回调未挂到 bridge"
+        assert rec.update_handlers, "译文更新回调（on_update）未挂到 bridge"
         assert not w.start_btn.isEnabled()
 
         w._on_finished(True, "已生成")
@@ -482,3 +487,57 @@ def test_probe_capture_reports_failure_without_recording(win, dialogs, monkeypat
     win._start()
     assert win.recorder is None
     assert win.start_btn.isEnabled()
+
+
+# ---------------------------------------------------------------------------
+# e. 两阶段显示：bridge.update 信号 → _on_update → subtitle.update_segment
+# ---------------------------------------------------------------------------
+
+class _FakeSubtitle:
+    """字幕面板替身：记录 show_segment / update_segment 的调用（不建窗口）。"""
+
+    def __init__(self):
+        self.calls: list[tuple[str, int, str, str]] = []
+
+    def show_segment(self, seg, name):
+        self.calls.append(("show", seg.seq, name, seg.translation))
+
+    def update_segment(self, seg, name):
+        self.calls.append(("update", seg.seq, name, seg.translation))
+
+
+def test_bridge_update_signal_forwarded_to_subtitle(win, qapp):
+    """译文到达走独立通道：bridge.update → _on_update → subtitle.update_segment。
+
+    两条通道必须分开：原文事件只能 show_segment（否则重复开块），译文只能
+    update_segment（否则同一句话在面板里出现两行）。这里替换成记录型假面板，
+    用真实信号投递（emit → 槽）验证接管与分工。
+    """
+    fake = _FakeSubtitle()
+    win.subtitle = fake
+    win.recorder = FakeRecorder()          # store 提供 display_name（空标签 → 发言人?）
+
+    seg = Segment(start=0.0, end=1.0, text="hello", lang="en",
+                  translation="", seq=1)
+    assert hasattr(win.bridge, "update"), "RecorderBridge 缺少 update 信号"
+    assert win.bridge.receivers(win.bridge.update) >= 1, "_on_update 未连接到 update 信号"
+
+    # 第一阶段：原文事件
+    win.bridge.segment.emit(seg)
+    assert _pump_until(qapp, lambda: len(fake.calls) == 1)
+    assert fake.calls[-1][:2] == ("show", 1)
+    assert fake.calls[-1][3] == ""          # 原文阶段没有译文
+
+    # 第二阶段：译文更新（同一个 Segment 被填充译文）
+    seg.translation = "你好"
+    win.bridge.update.emit(seg)
+    assert _pump_until(qapp, lambda: len(fake.calls) == 2)
+    assert fake.calls[-1][:2] == ("update", 1)
+    assert fake.calls[-1][2] == "发言人?"     # display_name 走 recorder.store
+    assert fake.calls[-1][3] == "你好"
+    # 译文更新不得触发新增块路径
+    assert [c[0] for c in fake.calls] == ["show", "update"]
+
+    # 直接调槽同样只走 update（两个槽逻辑同源、通道不同）
+    win._on_update(seg)
+    assert [c[0] for c in fake.calls] == ["show", "update", "update"]

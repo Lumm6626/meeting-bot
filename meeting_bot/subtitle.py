@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """字幕浮窗：Teams 会议转录式滚动面板。
 
-设计要点（对外接口只有 ``SubtitleWindow()`` 与 ``show_segment(seg, name)``，
-app.py 依赖这两条，不可变更）：
+设计要点（对外接口只有 ``SubtitleWindow()``、``show_segment(seg, name)`` 与
+``update_segment(seg, name)``——app.py 依赖这三条，不可变更）：
 
+* 两阶段显示：识别完即 ``show_segment``（此时无译文 → 主标签显示原文），
+  翻译到达后 ``update_segment`` 按 seq 找到同一句，**原地**替换并重渲染该块
+  （不新增块、不重复文本；同 seq 重复到达按更新处理 → 幂等）；
 * 回合分块历史（Teams 转录风）：同一说话人连续说的话合成一个「回合块」——
   头行时间+说话人、正文为回合内各句译文逐行拼接、副标签为各句原文+语种；
   换人（声纹标签变化）或停顿超过 ``TURN_GAP_SECONDS`` 才开新块；同回合追加
@@ -36,7 +39,9 @@ COLOR_MAIN = "#FFFFFF"      # 译文（主字号）
 COLOR_SUB = "#B0BEC5"       # 原文 + 语种
 COLOR_ZOOM = "#90A4AE"      # 角落倍率提示
 
-TURN_GAP_SECONDS = 2.0      # 相邻语句起始时间间隔上限，超过即视为新回合（新块）
+TURN_GAP_SECONDS = 4.0      # 相邻语句起始时间间隔上限，超过即视为新回合（新块）
+# 2.0 太小：连续说话时句中稍作停顿（2~4 秒）就被切成新块，字幕一块块跳；
+# 4.0 让一段连续发言基本落在一个回合块里（换人仍然立刻切块，见 _same_turn）。
 MAX_TURNS = 60              # 历史回合块上限（一个回合 = 一个条目块）
 MAX_ENTRIES = MAX_TURNS     # 兼容旧命名（历史上限，现按回合块计数）
 MIN_W, MIN_H = 320, 200     # 最小窗口尺寸
@@ -133,6 +138,22 @@ class SubtitleEntry(QWidget):
             self.meta.setText(f"{fmt_ts(seg.start)}  {self.display_name}")
         self._rebuild()
 
+    def replace_segment(self, seg: Segment) -> bool:
+        """把块内 seq 相同的那一句换成 ``seg`` 并原地重渲染（译文到达时用）。
+
+        返回 False 表示本块不含该 seq（调用方据此判断是不是「新句子」）。
+        位置不变：译文替换原文时块的排版、行数、历史顺序都不动。
+        """
+        for i, old in enumerate(self.segments):
+            if old.seq == seg.seq:
+                self.segments[i] = seg
+                if i == 0:
+                    # 头行时间取回合首句，替换首句时一并刷新（换人/改名同理）
+                    self.meta.setText(f"{fmt_ts(seg.start)}  {self.display_name}")
+                self._rebuild()
+                return True
+        return False
+
     def _rebuild(self) -> None:
         mains: list[str] = []
         subs: list[str] = []
@@ -172,6 +193,9 @@ class SubtitleWindow(QWidget):
         self.setMinimumSize(MIN_W, MIN_H)     # 与拖拽缩放的最小尺寸保持一致
 
         self._entries: list[SubtitleEntry] = []      # 回合块（旧 -> 新）
+        # seq → 所在回合块：译文原地更新按 seq 定位（只含保留窗口内的块，
+        # 块被 MAX_TURNS 淘汰时同步摘除 → 不会指向已删除控件）
+        self._seq_block: dict[int, SubtitleEntry] = {}
         self._current_turn: list[Segment] = []       # 当前未关闭回合的语句
         self._current_block: SubtitleEntry | None = None
         self._current_speaker = ""                   # 当前回合的声纹标签（可能为空）
@@ -253,13 +277,39 @@ class SubtitleWindow(QWidget):
 
     # ------------------------------------------------------------ 对外接口
     def show_segment(self, seg: Segment, display_name: str):
-        """把一条语句并入当前回合（必要时新开一个回合块）并滚到底部。"""
-        self._merge_into_turn(seg, display_name)
+        """把一条语句并入当前回合（必要时新开一个回合块）并滚到底部。
+
+        幂等：同一 seq 再次到达（重发 / 两阶段显示下的竞态）按「原地更新」处理，
+        不追加新块、不重复文本。
+        """
+        if not self.update_segment(seg, display_name):
+            self._merge_into_turn(seg, display_name)
         if not self.isVisible():
             self.show()
         self.raise_()
         self._stick_if_auto()
         self._stick_timer.start()
+
+    def update_segment(self, seg: Segment, display_name: str = "") -> bool:
+        """译文到达后按 seq 找到原块并原地替换该句（不新增块、不搬动顺序）。
+
+        返回 True 表示找到并已重渲染；False 表示该 seq 不在保留窗口内
+        （块已被 MAX_TURNS 淘汰，或本就是新句子）。
+        """
+        block = self._seq_block.get(seg.seq)
+        if block is None or not block.replace_segment(seg):
+            return False
+        if block is self._current_block:
+            # current_turn 只用于分块判定（start/speaker），但保持同一批对象，
+            # 免得「当前回合」里的语句还带着旧译文（调试/测试看到的视图失真）
+            for i, s in enumerate(self._current_turn):
+                if s.seq == seg.seq:
+                    self._current_turn[i] = seg
+                    break
+        # 更新后内容变高/变短 → 仍按「停在底部才跟随」的规则重新贴底
+        self._stick_if_auto()
+        self._stick_timer.start()
+        return True
 
     # ------------------------------------------------------------ 测试辅助
     def entries(self) -> list[SubtitleEntry]:
@@ -301,6 +351,7 @@ class SubtitleWindow(QWidget):
         """同回合 → 原地追加；停顿或换人 → 关闭当前回合、开新块。"""
         if self._current_block is not None and self._same_turn(seg):
             self._current_block.add_segment(seg)
+            self._seq_block[seg.seq] = self._current_block
             self._current_turn.append(seg)
             if not self._current_speaker and seg.speaker:
                 # 说话人标签延迟出现（pyannote 滑窗打标后才有）→ 归入本回合并记住
@@ -336,6 +387,7 @@ class SubtitleWindow(QWidget):
             w.installEventFilter(self)
         self._entries_layout.insertWidget(self._entries_layout.count() - 1, entry)
         self._entries.append(entry)
+        self._seq_block[seg.seq] = entry
         # 当前回合块永远是最新的一块，裁剪只会淘汰更早的块
         while len(self._entries) > MAX_TURNS:
             old = self._entries.pop(0)
@@ -344,6 +396,10 @@ class SubtitleWindow(QWidget):
             old.hide()
             self._entries_layout.removeWidget(old)
             old.deleteLater()
+            # seq 映射同步摘除：否则译文更新会指向已删除的块（Qt 侧已 deleteLater）
+            for s in old.segments:
+                if self._seq_block.get(s.seq) is old:
+                    self._seq_block.pop(s.seq, None)
         return entry
 
     # -------------------------------------------------------------- 字号/滚动

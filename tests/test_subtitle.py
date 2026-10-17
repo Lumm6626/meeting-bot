@@ -41,8 +41,8 @@ def _pump(qapp, rounds: int = 3) -> None:
 
 def _seg(i: int, *, text: str = "原文", lang: str = "en", translation: str | None = None,
          start: float | None = None, speaker: str = "") -> Segment:
-    """造一条语句。默认起点 i*3.0（相邻起点差 3s > TURN_GAP_SECONDS，各自成块）。"""
-    start = i * 3.0 if start is None else start
+    """造一条语句。默认起点 i*5.0（相邻起点差 5s > TURN_GAP_SECONDS=4s，各自成块）。"""
+    start = i * 5.0 if start is None else start
     tr = f"译文{i}" if translation is None else translation
     return Segment(start=start, end=start + 3, text=text, lang=lang,
                    speaker=speaker, translation=tr, seq=i + 1)
@@ -89,7 +89,7 @@ def win(qapp):
 # ---------------------------------------------------------------------------
 
 def test_appends_blocks_and_keeps_cap(qapp, win):
-    """65 个回合（起点间隔 3s > 2s 阈值，互不合并）→ 只留最新 60 块。"""
+    """65 个回合（起点间隔 5s > 4s 阈值，互不合并）→ 只留最新 60 块。"""
     for i in range(65):
         win.show_segment(_seg(i), f"说话人{i}")
     _pump(qapp)
@@ -285,7 +285,7 @@ def test_edge_cursor_and_child_drag(qapp, win):
 # ---------------------------------------------------------------------------
 
 def test_show_segment_content(qapp, win):
-    """间隔都 >2s → 每句各自成块，块内排版与单条记录一致。"""
+    """间隔都 >4s → 每句各自成块，块内排版与单条记录一致。"""
     seg = Segment(start=65.0, end=68.0, text="Good morning everyone", lang="en",
                   speaker="SPEAKER_00", translation="大家早上好", seq=1)
     win.show_segment(seg, "张三")
@@ -320,7 +320,7 @@ def test_show_segment_content(qapp, win):
 # ---------------------------------------------------------------------------
 
 def test_same_turn_merges_into_one_block(qapp, win):
-    """3 条间隔 <2s 且说话人相同/为空的语句 → 1 个块，块内译文/原文各 3 行。"""
+    """3 条间隔 <4s 且说话人相同/为空的语句 → 1 个块，块内译文/原文各 3 行。"""
     for i, t0 in enumerate((0.0, 1.2, 2.4)):
         win.show_segment(_seg(i, start=t0, text=f"line{i}",
                               translation=f"译文{i}"), "发言人?")
@@ -338,7 +338,7 @@ def test_same_turn_merges_into_one_block(qapp, win):
 
 
 def test_gap_creates_new_block(qapp, win):
-    """间隔 5s（> TURN_GAP_SECONDS）→ 两个块。"""
+    """间隔 5s（> TURN_GAP_SECONDS=4s）→ 两个块。"""
     win.show_segment(_seg(0, start=0.0), "甲")
     win.show_segment(_seg(1, start=5.0), "甲")
     _pump(qapp)
@@ -350,11 +350,12 @@ def test_gap_creates_new_block(qapp, win):
     assert blocks[1].meta.text() == "[00:00:05]  甲"
     # 新块开张 → 当前回合只剩新的一句
     assert [s.start for s in win.current_turn] == [5.0]
-    assert TURN_GAP_SECONDS == 2.0
+    # 阈值 2.0 → 4.0：句中稍作停顿（2~4s）不再被切成新块
+    assert TURN_GAP_SECONDS == 4.0
 
 
 def test_speaker_change_creates_new_block(qapp, win):
-    """换人（两边声纹标签都非空且不同）→ 即使间隔 <2s 也新开块。"""
+    """换人（两边声纹标签都非空且不同）→ 即使间隔 <TURN_GAP 也新开块。"""
     win.show_segment(_seg(0, start=0.0, speaker="A"), "甲")
     win.show_segment(_seg(1, start=1.0, speaker="B"), "乙")
     _pump(qapp)
@@ -410,9 +411,9 @@ def test_turn_block_falls_back_to_text(qapp, win):
 
 
 def test_turn_cap_counts_blocks(qapp, win):
-    """65 个回合（间隔 3s）→ 历史只保留 60 个块。"""
+    """65 个回合（间隔 5s > 4s）→ 历史只保留 60 个块。"""
     for i in range(65):
-        win.show_segment(_seg(i, start=i * 3.0), f"说话人{i}")
+        win.show_segment(_seg(i), f"说话人{i}")
     _pump(qapp)
 
     blocks = win.entries()
@@ -420,5 +421,92 @@ def test_turn_cap_counts_blocks(qapp, win):
     assert len(blocks) == 60
     assert blocks[0].main.text() == "译文5"
     assert blocks[-1].main.text() == "译文64"
-    # 每块只有一句（间隔都 > 2s）
+    # 每块只有一句（间隔都 > 4s）
     assert all(len(b.segments) == 1 for b in blocks)
+
+
+# ---------------------------------------------------------------------------
+# h. 两阶段显示：原文即时上屏 + 译文原地更新（update_segment / seq 幂等）
+# ---------------------------------------------------------------------------
+
+def test_update_segment_replaces_in_place(qapp, win):
+    """译文到达 → 原地替换同一句：块数不变、块对象不变、主标签从原文变译文。
+
+    两阶段显示的判据：识别完先 show_segment（translation 为空 → 主标签是原文），
+    翻译完成后 update_segment 只重渲染那一块，不新增块、不搬动历史顺序。
+    """
+    seg = _seg(0, start=0.0, text="Good morning", translation="")
+    win.show_segment(seg, "张三")
+    _pump(qapp)
+
+    block = win.entries()[-1]
+    assert len(win.entries()) == 1
+    assert block.main.text() == "Good morning"      # 第一阶段：原文顶到主标签
+    assert block.sub.text() == ""                    # 没有译文 → 副标签为空
+
+    # 第二阶段：同一个 seq 的语句对象已带上译文（真实流程里是同一个 Segment 被填充）
+    done = _seg(0, start=0.0, text="Good morning", translation="早上好")
+    assert win.update_segment(done, "张三") is True
+    _pump(qapp)
+
+    assert len(win.entries()) == 1                   # 不新增块
+    assert win.entries()[-1] is block                # 仍是同一个控件（原地更新）
+    assert block.main.text() == "早上好"              # 主标签变译文
+    assert block.sub.text() == "(en) Good morning"    # 原文降为副标签
+    assert block.sub.isVisibleTo(block)
+    assert [s.translation for s in block.segments] == ["早上好"]
+    # 当前回合视图也拿到新对象（同一批语句，不留旧译文）
+    assert [s.translation for s in win.current_turn] == ["早上好"]
+
+    # 未知 seq（不属于任何保留块）→ 返回 False 且不新建块（不会凭空冒出一行）
+    ghost = _seg(77, start=999.0, text="ghost", translation="幽灵")
+    assert win.update_segment(ghost, "无人") is False
+    _pump(qapp)
+    assert len(win.entries()) == 1
+
+
+def test_show_segment_dedupes_by_seq(qapp, win):
+    """同 seq 重复 show_segment → 不追加新块、文本不重复（幂等，不是 append）。
+
+    真实场景：原文事件与译文更新可能乱序/重发（跨线程队列投递），面板必须按 seq
+    去重，否则同一句话会在块里冒出两行、或者额外开一个块。
+    """
+    first = _seg(0, start=0.0, text="line", translation="")
+    win.show_segment(first, "甲")
+    _pump(qapp)
+    assert len(win.entries()) == 1
+    assert win.entries()[0].main.text() == "line"
+
+    # 同 seq 再发一次（带译文）→ 更新同一块，不追加
+    win.show_segment(_seg(0, start=0.0, text="line", translation="译文"), "甲")
+    _pump(qapp)
+    assert len(win.entries()) == 1
+    block = win.entries()[0]
+    assert block.main.text() == "译文"
+    assert block.main.text().count("\n") == 0        # 没有重复行
+    assert len(block.segments) == 1
+
+    # 完全相同的重复投递（原文、无变化）也不得追加
+    win.show_segment(_seg(0, start=0.0, text="line", translation="译文"), "甲")
+    _pump(qapp)
+    assert len(win.entries()) == 1
+    assert [s.seq for s in win.entries()[0].segments] == [first.seq]
+
+    # 新 seq 照常合并进同一回合（去重只针对同一 seq）
+    win.show_segment(_seg(1, start=1.0, text="next", translation="下一句"), "甲")
+    _pump(qapp)
+    assert len(win.entries()) == 1
+    assert win.entries()[0].main.text().split("\n") == ["译文", "下一句"]
+
+
+def test_update_segment_after_block_evicted_is_noop(qapp, win):
+    """块被 MAX_TURNS 淘汰后，迟到译文不得复活旧块 / 抛异常（seq 映射同步摘除）。"""
+    for i in range(MAX_TURNS + 3):
+        win.show_segment(_seg(i), f"说话人{i}")
+    _pump(qapp)
+    assert len(win.entries()) == MAX_TURNS
+
+    stale = _seg(0, translation="迟到的译文")          # 最老的块已被淘汰
+    assert win.update_segment(stale, "说话人0") is False
+    _pump(qapp)
+    assert len(win.entries()) == MAX_TURNS             # 没有多出块

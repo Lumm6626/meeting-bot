@@ -226,7 +226,9 @@ def test_full_pipeline(monkeypatch):
     r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASR(),
                  translator=FakeTranslator(), diarizer=FakeDiarizer())
     events = []
+    updates = []
     r.on_segment(events.append)
+    r.on_update(updates.append)
     r.on_status(lambda m: None)
     r.start("测试会议")
     time.sleep(0.6)  # 等 diarize worker 跑一轮
@@ -240,6 +242,10 @@ def test_full_pipeline(monkeypatch):
     assert seg.translation == "你好世界"
     assert seg.speaker == "SPEAKER_00"
     assert len(events) >= 1
+    # 两阶段显示：原文事件每 seq 一次（去重），译文经 on_update 送达并带译文
+    assert [s.seq for s in events] == [seg.seq]
+    assert [s.seq for s in updates] == [seg.seq]
+    assert updates[0].translation == "你好世界"
     # 时间戳：VAD 偏移 16000 样本（1s）+ ASR 段 0.5~2.5 → 1.5 ~ 3.5
     assert seg.start == 1.5
     assert seg.end == 3.5
@@ -369,7 +375,9 @@ def test_zh_segment_skips_translation(monkeypatch):
     r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASRZh(),
                  translator=tr, diarizer=None)
     events = []
+    updates = []
     r.on_segment(events.append)
+    r.on_update(updates.append)
     r.on_status(lambda m: None)
     r.start("中文会议")
     r.stop()
@@ -380,6 +388,9 @@ def test_zh_segment_skips_translation(monkeypatch):
     assert segs[0].translation == segs[0].text == "你好世界"
     assert tr.calls == 0
     assert len(events) == 1
+    # zh 直填同样走「原地更新」通道（第二阶段），否则面板上中文行不会刷新副标签状态
+    assert [s.seq for s in updates] == [segs[0].seq]
+    assert updates[0].translation == "你好世界"
 
 
 # ---------------------------------------------------------------------------
@@ -667,9 +678,12 @@ def test_worker_survives_unexpected_error(monkeypatch):
     r.start("意外异常会议")        # 主循环同步跑完：3 块音频 → 3 条语句
     try:
         # 关键断言（变异自查点）：第 1 段抛异常后 worker 必须继续干完剩下 2 段。
-        # 去掉 worker 里「except Exception」保护时 worker 猝死 → events 恒为 0 → 此处超时失败。
-        assert _wait_until(lambda: len(events) == 3), (
-            f"worker 未在意外异常后继续处理：events={[s.text for s in events]}")
+        # 两阶段显示下「原文事件」由识别线程发出（不再由 worker 发），所以存活证据
+        # 改用 worker 侧的 translate 调用次数：去掉「except Exception」保护时 worker
+        # 在第 1 段猝死 → tr.calls 恒为 1 → 此处超时失败。
+        assert _wait_until(lambda: tr.calls >= 3), (
+            f"worker 未在意外异常后继续处理：tr.calls={tr.calls}")
+        assert len(events) == 3                  # 原文阶段：3 条都已上屏
     finally:
         r.stop()                   # 不得向外抛异常
 
@@ -757,14 +771,19 @@ class FakeDiarizerAssignBoom:
 
 
 def test_stop_backfill_does_not_duplicate_events(monkeypatch):
-    """Minor-1 回归：stop() 兜底补发与 worker 并发时，同一 seq 不得 emit 两次。
+    """Minor-1 回归：stop() 兜底补发与识别线程并发时，同一 seq 不得 emit 两次。
 
     构造：翻译接口每次阻塞 0.3s + TRANSLATE_DRAIN_TIMEOUT=0.05 → stop() 必然等不到
-    worker 排空，于是走补译 / 兜底补发循环，与 worker 并发对同一 seq 做「检查 → 发送」。
+    worker 排空，于是走补译 / 兜底补发循环，与识别线程并发对同一批 seq 做
+    「检查 → 发送」。
 
     on_segment 回调故意 sleep 0.25s，把「检查 → 记账」窗口拉宽，让 stop() 的并发检查
     必然落在窗口内：旧实现 check-then-act 非原子 → 同一 seq 两条事件（本用例失败）；
     修复后先把 seq 记入 _emitted 再发送 → 至多一次。
+
+    两阶段改造后两条通道各自去重：原文事件每 seq 一次（识别完即发），译文只走
+    on_update（每条语句都拿到一次通知、且都带译文）。update 允许重复投递（补译与
+    worker 迟到译文可能各通告一次，面板 update_segment 按 seq 幂等），故只断言覆盖。
     """
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.05)
@@ -775,12 +794,14 @@ def test_stop_backfill_does_not_duplicate_events(monkeypatch):
     r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRBatchChunks(),
                  translator=tr, diarizer=None)
     events = []
+    updates = []
 
     def _slow_append(seg):
         time.sleep(0.25)          # 拉宽「检查 → 记账」窗口（见 docstring）
         events.append(seg)
 
     r.on_segment(_slow_append)
+    r.on_update(updates.append)
     r.on_status(lambda m: None)
 
     thread = threading.Thread(target=r.start, args=("兜底补发会议",), daemon=True)
@@ -802,15 +823,20 @@ def test_stop_backfill_does_not_duplicate_events(monkeypatch):
     assert len(seqs) == 3, f"事件数应为 3（每 seq 一次），实际 {[s.text for s in events]}"
     assert len(set(seqs)) == 3, f"同一 seq 被重复 emit：{seqs}"
     assert set(seqs) == {s.seq for s in segs}
+    # 译文通道：每条语句都收到过更新通知，且通知里带译文（否则面板停在原文）
+    up_seqs = [s.seq for s in updates]
+    assert set(up_seqs) == {s.seq for s in segs}, f"有语句的译文未通知面板：{up_seqs}"
+    assert all(s.translation for s in updates), "update 通知里不得缺译文"
 
 
 def test_segment_callback_exception_does_not_kill_worker(monkeypatch):
     """Minor-1/2 回归：on_segment 回调抛 RuntimeError 时线程不死、异常不外冒。
 
     正常回调注册在前、抛异常回调注册在后（_emit 按注册顺序投递：抛异常回调会中断其后的
-    回调，但不得杀死翻译 worker、不得中断后续语句的翻译与投递）。
-    关键在 stop() 之前等满 3 条事件：若 _emit_once 不捕回调异常，worker 处理第 1 段时
-    就猝死，第 2、3 段永远不会 emit → 此处超时失败。
+    回调，但不得杀死识别线程、不得中断后续语句的识别与投递）。
+    关键在 stop() 之前等满 3 条事件：原文事件在识别线程里发出（两阶段第一阶段），
+    若 _emit_once 不捕回调异常，识别线程处理第 1 段时就猝死，第 2、3 段永远不会
+    emit → 此处超时失败。
     """
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.1)
@@ -1855,3 +1881,108 @@ def test_local_asr_transcribe_not_given_should_stop():
 
     segs = r._transcribe(np.zeros(16000, dtype=np.float32))
     assert [s.text for s in segs] == ["local ok"]
+
+
+# ---------------------------------------------------------------------------
+# 两阶段字幕显示：原文即时上屏（emit）+ 译文原地更新（on_update）
+# ---------------------------------------------------------------------------
+
+class FakeTranslatorGated:
+    """translate 阻塞到测试放行（把「原文已上屏 / 译文还没到」的时刻固定住）。"""
+
+    def __init__(self):
+        self.calls = 0
+        self.started = threading.Event()      # 已进入第一次 translate
+        self.release = threading.Event()      # 测试放行：translate 此刻才返回
+
+    def translate(self, text, lang=""):
+        self.calls += 1
+        self.started.set()
+        assert self.release.wait(timeout=10), "测试未放行翻译"
+        return "你好世界"
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+def test_original_emitted_before_translation(monkeypatch):
+    """两阶段显示：原文事件先到（translation 为空），放行后才收到带译文的 update。
+
+    用户反馈的「字幕延迟明显」= 旧实现把 emit 压在翻译之后（同一条语句要等接口
+    3~6 秒才出现在面板上）。修复后 store.add 之后立即 emit 原文，译文完成再走
+    on_update 原地替换。
+
+    变异自查点：把 ``_transcribe_batch`` 里的立即 emit 去掉（回到「翻译后再 emit」）
+    → 翻译被卡住时 events 恒为空 → 本用例超时失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)   # 有语句就出批
+    tr = FakeTranslatorGated()
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASR(),
+                 translator=tr, diarizer=None)
+    events, updates = [], []
+    r.on_segment(events.append)
+    r.on_update(updates.append)
+    r.on_status(lambda m: None)
+
+    thread = threading.Thread(target=r.start, args=("两阶段会议",), daemon=True)
+    thread.start()
+    try:
+        assert tr.started.wait(timeout=5), "翻译 worker 未开始翻译（用例前提不成立）"
+        # 翻译还卡在接口里：原文必须已经上屏
+        assert _wait_until(lambda: len(events) == 1), "翻译返回前原文事件就应已投递"
+        assert events[0].text == "hello world"
+        assert events[0].translation == ""        # 第一阶段：无译文 → 面板显示原文
+        assert updates == [], "译文尚未产生，不得提前通知 update"
+        assert r._stop.is_set() is False          # 确实发生在录制中途（不是 stop 兜底）
+
+        tr.release.set()                          # 放行翻译
+        assert _wait_until(lambda: len(updates) == 1), "译文填充后未通知 update"
+        assert updates[0].seq == events[0].seq
+        assert updates[0].translation == "你好世界"
+    finally:
+        tr.release.set()
+        r.stop()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    # 原文事件只发一次（译文到达不得再 emit 一遍原文）
+    assert [s.seq for s in events] == [updates[0].seq]
+    assert len({s.seq for s in events}) == 1
+    assert r.store.segments()[0].translation == "你好世界"
+
+
+def test_stop_backfill_notifies_update(monkeypatch):
+    """翻译失败段在 stop() 补译成功后必须补一次 update（面板才拿到最终译文）。
+
+    失败时原文已在屏上（第一阶段）→ 不通知；补译成功后必须通知，否则字幕永远停在
+    原文、而逐字稿里已是译文（用户看到的两份产物不一致）。
+
+    变异自查点：删掉 stop() 补译分支里的 ``_notify_update`` → updates 恒为空 → 失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    # 门槛压到「有语句就出批」：失败必须发生在 stop() 之前（否则失败与补译挤在同一次
+    # stop() 里，「失败阶段不通知」就没被真正验证）
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    tr = FakeTranslatorFailOnce()        # 第 1 次（worker）抛 TranslationError，第 2 次成功
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASR(),
+                 translator=tr, diarizer=None)
+    events, updates, statuses = [], [], []
+    r.on_segment(events.append)
+    r.on_update(updates.append)
+    r.on_status(statuses.append)
+
+    r.start("补译通知会议")
+    # worker 失败阶段：原文已上屏，且不得有 update（等「翻译失败」告警落地再断言，避免竞态）
+    assert _wait_until(lambda: len(events) == 1), "原文事件未投递"
+    assert events[0].translation == ""
+    assert _wait_until(lambda: any("翻译失败" in m for m in statuses)), "worker 未走到失败分支"
+    assert updates == [], "翻译失败不得通知 update（原文已在屏上）"
+
+    r.stop()                             # 补译成功 → 通知 update
+    segs = r.store.segments()
+    assert segs[0].translation == "你好世界"
+    assert tr.calls == 2                 # 1 次失败 + 1 次补译成功
+    assert [s.seq for s in updates] == [segs[0].seq], f"补译成功未通知面板：{updates}"
+    assert updates[0].translation == "你好世界"
+    assert len(events) == 1              # 补译不重复发原文事件
