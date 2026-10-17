@@ -451,7 +451,7 @@ def test_probe_capture_reports_failure_without_recording(win, dialogs, monkeypat
 
     assert win._probe_capture() is None
     assert recorded[-1][0] == "crit"
-    assert "无法打开麦克风/扬声器捕获设备" in recorded[-1][2]
+    assert "音频源不可用" in recorded[-1][2]
 
     # _start 走同一探测：失败即返回，不留半启动状态
     win._start()
