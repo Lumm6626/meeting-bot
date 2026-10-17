@@ -140,7 +140,7 @@ def test_diarize_enabled_flag(tmp_path, monkeypatch):
     _clean_env(monkeypatch)
     env = tmp_path / ".env"
     env.write_text("OPENCODE_API_KEY=sk-test123\nDIARIZE_ENABLED=false\n", encoding="utf-8")
-    s = load_settings(env)
-    assert s.diarize_enabled is False
+    assert load_settings(env).diarize_enabled is False
+    monkeypatch.delenv("DIARIZE_ENABLED", raising=False)  # load_dotenv 不覆盖已存在变量
     env.write_text("OPENCODE_API_KEY=sk-test123\n", encoding="utf-8")
     assert load_settings(env).diarize_enabled is True
