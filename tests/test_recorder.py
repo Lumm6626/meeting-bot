@@ -683,6 +683,9 @@ def test_no_ghost_speaker(monkeypatch):
     """
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.05)
+    # 批处理改造后必须压小批量阈值：默认 30s/35s 下 diarize tick 会跑在语句入库之前，
+    # 「没有语句被标注 / 无幽灵说话人」就变成恒真断言（测试退化，审查 M3）。
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
     diarizer = FakeDiarizerNoOverlap()
     r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRBatchChunks(),
                  translator=FakeTranslator(), diarizer=diarizer)
@@ -1402,3 +1405,102 @@ def test_offsets_preserved_in_batch(monkeypatch):
     asr_b, segs_b = _run([16000, 32000])
     assert asr_b.batch_lens == [2 * 16000]
     assert [(s.start, s.end) for s in segs_b] == [(1.5, 2.5), (2.5, 3.5)]
+
+
+# ---------------------------------------------------------------------------
+# 修复轮 1：批内时间轴回填（保语句间隙）+ emit 异常免疫
+# ---------------------------------------------------------------------------
+
+class FakeASRGapTwoSegs:
+    """模拟 whisper 对「拼接缓冲」分段：段相对时间按拼接缓冲连续 1 秒切。
+
+    输入是两条各 1 秒、中间隔 10 秒静音的语句，拼接后缓冲仍只有 2 秒 →
+    返回 (0,1)/(1,2)。正确实现必须把它们回填到 0~1s 与 11~12s。
+    """
+
+    def __init__(self):
+        self.calls = 0
+        self.batch_lens: list[int] = []
+
+    def transcribe(self, audio, sample_rate=16000):
+        self.calls += 1
+        self.batch_lens.append(len(audio))
+        return [Segment(0.0, 1.0, "first", lang="en"),
+                Segment(1.0, 2.0, "second", lang="en")]
+
+
+def test_batch_preserves_inter_utterance_gaps(monkeypatch):
+    """M1 回归：批内语句之间的静音不得被吃掉（时间轴压缩会让后续语句系统性偏早）。
+
+    VAD 产出两条语句：偏移 0 与 11*16000（中间 10 秒静音）。拼接后缓冲只有 2 秒，
+    whisper 返回 (0,1)/(1,2)。旧实现 base=0 直接加相对时间 → 第二条落在 1.0~2.0s
+    （比真实时间早 10 秒），逐字稿时间戳错误 + 与 pyannote 时间轴错位（说话人漏标/错标）。
+
+    变异自查点：去掉 to_abs()/spans 映射（改回 base + s.start）→ 本用例断言失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer",
+                        lambda: FakeVADOffsets([0, 11 * 16000]))
+    asr = FakeASRGapTwoSegs()
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=asr,
+                 translator=None, diarizer=None)
+    r.on_status(lambda m: None)
+    r.start("间隙会议")
+    r.stop()
+
+    # 两条语句拼成一批（2 秒音频），间距 10s 不出现在拼接音频里
+    assert asr.calls == 1
+    assert asr.batch_lens == [2 * 16000]
+    segs = r.store.segments()
+    assert [s.text for s in segs] == ["first", "second"]
+    assert segs[0].start == 0.0
+    # 关键断言：第二条必须回到 11.0~12.0，而不是 1.0~2.0
+    assert abs(segs[1].start - 11.0) < 1e-6, f"间隙被吃掉：start={segs[1].start}"
+    assert abs(segs[1].end - 12.0) < 1e-6, f"间隙被吃掉：end={segs[1].end}"
+
+
+def test_emit_exception_does_not_kill_asr_worker(monkeypatch):
+    """M2 回归：on_segment 回调抛异常不得杀死识别线程（否则此后全场无字幕）。
+
+    translator=None 路径旧实现直接 _emit(seg)：回调异常直穿 _transcribe_batch →
+    _asr_worker 当场死亡、无告警，后续批次永久不出库。改为 _emit_once 后每个 seq
+    照常记账、异常只降级为状态栏告警。
+
+    变异自查点：把 _emit_once 改回 _emit → 识别线程在第一条语句后死亡 →
+    store 只有 1 条、is_alive() 为 False → 本用例失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)   # 有语句就出批
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_MAX_WAIT", 999.0)
+    capture = FakeCaptureHeld([np.zeros(16000, dtype=np.float32)] * 3)
+    # FakeASRBatchChunks 跨批连续编号：批如何切分都不影响 "line 1..3" 的文本序列
+    r = Recorder(_settings(), capture=capture, asr=FakeASRBatchChunks(),
+                 translator=None, diarizer=None)      # translator=None → 走 _emit_once 路径
+    statuses: list[str] = []
+    emitted: list[Segment] = []
+
+    def boom(seg):
+        emitted.append(seg)
+        raise RuntimeError("模拟 UI 回调崩溃")
+
+    r.on_segment(boom)
+    r.on_status(statuses.append)
+
+    thread = threading.Thread(target=r.start, args=("回调崩溃会议",), daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: len(r.store.segments()) == 3), (
+            f"识别线程疑似猝死：store={[s.text for s in r.store.segments()]}")
+        # 入库早于 emit（store.add 先于 _emit_once）→ 必须再等告警落地，否则竞态
+        assert _wait_until(
+            lambda: sum("语句事件回调异常" in m for m in statuses) == 3), (
+            f"回调异常未被逐条告警：statuses={statuses}")
+        # 线程仍存活：还能继续处理后续批次（此处验证未因异常退出）
+        assert r._asr_thread is not None and r._asr_thread.is_alive()
+        assert [s.text for s in r.store.segments()] == ["line 1", "line 2", "line 3"]
+        assert len(emitted) == 3                        # 每条都尝试发送（不因异常跳过）
+        assert not any("识别失败" in m for m in statuses)   # 不是「整批丢弃」
+    finally:
+        r.stop()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert len(r.store.segments()) == 3                 # 收尾未丢语句

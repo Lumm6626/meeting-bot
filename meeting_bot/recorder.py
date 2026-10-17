@@ -294,8 +294,20 @@ class Recorder:
     def _transcribe_batch(self, batch: list[tuple[int, np.ndarray]]) -> None:
         if not batch:
             return
-        # 绝对时间原点 = 批内最早语句的样本偏移（VAD 给的是录制起点的绝对偏移）
-        base_samples = min(offset for offset, _ in batch)
+        # 按绝对样本偏移排序（顺带修 m2）：拼接顺序、段映射表、批起点三者的
+        # 前提都是「批内有序」，乱序会让映射表与音频错位。
+        batch = sorted(batch, key=lambda it: it[0])
+        # 拼接会抹掉语句之间的静音（10s 静音 = 0 样本），whisper 返回的段起点/终点
+        # 因此是「拼接缓冲内的相对时间」；直接拿 min(offset) 当统一 base 会让批内
+        # 第 2 条及以后语句的时间系统性偏早（最多提前全部间隙之和）→ 逐字稿时间戳
+        # 错误，且 assign_speakers 与 pyannote 的真实时间轴错位（漏标/错标说话人）。
+        # 解：记录每条语句在拼接缓冲里的 (起, 止) 与它的绝对样本偏移，
+        # 段的相对时间按样本落点回填到所属语句的绝对时间轴上。
+        spans: list[tuple[int, int, int]] = []   # (拼接内起, 拼接内止, 语句绝对样本偏移)
+        acc = 0
+        for off, a in batch:
+            spans.append((acc, acc + len(a), off))
+            acc += len(a)
         audio = (batch[0][1] if len(batch) == 1
                  else np.concatenate([u for _, u in batch]))
         try:
@@ -307,14 +319,28 @@ class Recorder:
             # 单批失败只丢这一批（告警可见），不得杀掉识别线程 —— 否则整场再无字幕
             self._say(f"[警告] 识别失败（本批 {len(batch)} 条语句已丢弃）：{e}")
             return
-        base = base_samples / 16000.0
+
+        def to_abs(t_rel: float) -> float:
+            """拼接缓冲内的相对秒 → 会议绝对秒（按语句分段映射回填间隙）。"""
+            s = int(t_rel * 16000)
+            for rs, re_, off in spans:
+                if rs <= s < re_:
+                    return (off + s - rs) / 16000.0
+            if s >= spans[-1][1]:
+                # 段落在最后一条语句之后：沿最后一条语句的时间轴等量延伸
+                return (spans[-1][2] + spans[-1][1] - spans[-1][0]
+                        + s - spans[-1][1]) / 16000.0
+            # 段落在首条语句之前（s < 0 或浮点误差）：沿首条语句时间轴回退
+            return (spans[0][2] + s) / 16000.0
+
         for s in segments:
-            # whisper 返回的是批内相对时间 → 加批起点才是会议绝对时间轴
-            seg = self._store.add(base + s.start, base + s.end, s.text, lang=s.lang)
+            seg = self._store.add(to_abs(s.start), to_abs(s.end), s.text, lang=s.lang)
             if self._translator:
                 self._translate_queue.put(seg)
             else:
-                self._emit(seg)
+                # 必须走 _emit_once：回调异常若直穿 worker，识别线程当场死亡且无告警，
+                # 此后所有批次永不出库（无声「字幕停更」）。_emit_once 内部记账 + 兜异常。
+                self._emit_once(seg)
 
     def _translate_worker(self) -> None:
         try:
