@@ -5,12 +5,14 @@ from __future__ import annotations
 import sys
 import threading
 from datetime import datetime
+from string import Template
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-                             QMenu, QMessageBox, QPushButton, QSystemTrayIcon,
-                             QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QIcon, QPixmap
+from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
+                             QMainWindow, QMenu, QMessageBox, QPushButton, QSizePolicy,
+                             QSystemTrayIcon, QTableWidget, QTableWidgetItem,
+                             QVBoxLayout, QWidget)
 
 from .capture import AudioCapture, CaptureError
 from .config import PROJECT_ROOT, ConfigError, Settings, load_settings
@@ -24,6 +26,228 @@ from .translator import Translator
 def app_icon() -> QIcon:
     """应用图标：窗口 / 托盘 / 桌面快捷方式共用 assets/app.ico。"""
     return QIcon(str(PROJECT_ROOT / "assets" / "app.ico"))
+
+
+# ---------------------------------------------------------------------------
+# 暗色主题（与 assets/app.ico 的蓝青渐变呼应）
+# ---------------------------------------------------------------------------
+BG = "#1B1E2B"             # 主背景：深蓝黑
+SURFACE = "#232839"        # 卡片 / 输入框 / 表格底
+BORDER = "#343B4F"         # 常规描边
+BORDER_STRONG = "#5A6478"  # 次按钮描边
+TEXT = "#E8EAF2"           # 正文
+MUTED = "#8B93A7"          # 次要文字
+ACCENT_A = "#2A7DE1"       # 主色（渐变起点 / 选中色）
+ACCENT_B = "#1FB6B8"       # 主色（渐变终点）
+DISABLED = "#3A4052"       # 禁用灰化
+PILL_BG = "#2A2F42"        # 配置胶囊底
+PILL_FG = "#A8C7F0"        # 配置胶囊字
+FONT_FAMILY = "Microsoft YaHei UI"
+
+_AUDIO_PILL = {
+    "both": "音频 · 自动双路",
+    "speaker": "音频 · 仅系统声音",
+    "mic": "音频 · 仅麦克风",
+}
+
+DARK_QSS = Template("""
+QMainWindow, QWidget#central {
+    background-color: $BG;
+}
+QWidget {
+    color: $TEXT;
+    font-family: "$FONT";
+    font-size: 10.5pt;
+}
+QLabel {
+    background: transparent;
+    color: $TEXT;
+}
+QLabel#brand_title {
+    font-size: 16pt;
+    font-weight: bold;
+}
+QLabel#brand_sub {
+    font-size: 9pt;
+    color: $MUTED;
+}
+QLabel[role="pill"] {
+    background-color: $PILL_BG;
+    color: $PILL_FG;
+    border-radius: 10px;
+    padding: 4px 10px;
+    font-size: 9pt;
+}
+QLabel#status {
+    font-weight: bold;
+    color: #FFFFFF;
+}
+QLabel#elapsed {
+    font-size: 9pt;
+    color: $MUTED;
+}
+QLabel#footer_hint {
+    font-size: 8.5pt;
+    color: $MUTED;
+}
+QFrame#card {
+    background-color: $SURFACE;
+    border: 1px solid $BORDER;
+    border-radius: 8px;
+}
+QLineEdit {
+    background-color: $SURFACE;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+    padding: 10px 12px;
+    color: $TEXT;
+    selection-background-color: $ACCENT_A;
+    selection-color: #FFFFFF;
+}
+QLineEdit:focus {
+    border: 1px solid $ACCENT_A;
+}
+QPushButton[role="primary"] {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 $ACCENT_A, stop:1 $ACCENT_B);
+    border: none;
+    border-radius: 8px;
+    padding: 12px;
+    color: #FFFFFF;
+    font-weight: bold;
+}
+QPushButton[role="primary"]:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3B8DEE, stop:1 #2FC9CB);
+}
+QPushButton[role="primary"]:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2368BC, stop:1 #18999B);
+}
+QPushButton[role="primary"]:disabled {
+    background: $DISABLED;
+    color: #79819A;
+}
+QPushButton[role="secondary"] {
+    background: transparent;
+    border: 1px solid $BORDER_STRONG;
+    border-radius: 8px;
+    padding: 12px;
+    color: $TEXT;
+}
+QPushButton[role="secondary"]:hover {
+    border: 1px solid $ACCENT_B;
+    color: #FFFFFF;
+}
+QPushButton[role="secondary"]:pressed {
+    border: 1px solid $ACCENT_A;
+    background-color: rgba(42, 125, 225, 0.14);
+}
+QPushButton[role="secondary"]:disabled {
+    border: 1px solid $DISABLED;
+    color: #6C7488;
+}
+QTableWidget {
+    background-color: $SURFACE;
+    alternate-background-color: #262C3D;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+    gridline-color: $BORDER;
+    color: $TEXT;
+    selection-background-color: $ACCENT_A;
+    selection-color: #FFFFFF;
+}
+QTableWidget::item {
+    padding: 4px 8px;
+}
+QTableWidget::item:selected {
+    background-color: $ACCENT_A;
+    color: #FFFFFF;
+}
+QHeaderView::section {
+    background-color: #1F2433;
+    border: none;
+    border-bottom: 1px solid $BORDER;
+    color: $MUTED;
+    padding: 6px 8px;
+    font-weight: bold;
+}
+QTableCornerButton::section {
+    background-color: #1F2433;
+    border: none;
+}
+QMenu {
+    background-color: $SURFACE;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 6px 18px;
+    border-radius: 4px;
+}
+QMenu::item:selected {
+    background-color: $ACCENT_A;
+    color: #FFFFFF;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical {
+    background: $BORDER_STRONG;
+    border-radius: 5px;
+    min-height: 24px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+""").substitute(BG=BG, SURFACE=SURFACE, BORDER=BORDER, BORDER_STRONG=BORDER_STRONG,
+                TEXT=TEXT, MUTED=MUTED, ACCENT_A=ACCENT_A, ACCENT_B=ACCENT_B,
+                DISABLED=DISABLED, PILL_BG=PILL_BG, PILL_FG=PILL_FG, FONT=FONT_FAMILY)
+
+
+def asr_pill_text(settings: Settings) -> str:
+    """识别徽章：groq → 云端；其余（local）→ 本地 + whisper 模型名。"""
+    provider = (getattr(settings, "asr_provider", "local") or "local").strip().lower()
+    if provider == "groq":
+        return "识别 · Groq 云端"
+    model = (getattr(settings, "whisper_model", "") or "small").strip()
+    return f"识别 · 本地 {model}"
+
+
+def audio_pill_text(settings: Settings) -> str:
+    """音频徽章：both / speaker / mic → 中文可读文案（未知值原样透出）。"""
+    source = (getattr(settings, "audio_source", "both") or "both").strip().lower()
+    return _AUDIO_PILL.get(source, f"音频 · {source}")
+
+
+def translate_pill_text(settings: Settings) -> str:
+    """翻译徽章：展示模型名，去掉 deepseek- 前缀（胶囊空间有限）。"""
+    model = (getattr(settings, "translate_model", "") or "未配置").strip()
+    if model.lower().startswith("deepseek-"):
+        model = model[len("deepseek-"):]
+    return f"翻译 · {model}"
+
+
+def _pill(text: str) -> QLabel:
+    """配置胶囊：只读小徽章（样式见 DARK_QSS 的 QLabel[role="pill"]）。"""
+    lab = QLabel(text)
+    lab.setProperty("role", "pill")
+    lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    lab.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+    return lab
+
+
+def brand_pixmap(size: int = 48) -> QPixmap:
+    """品牌行图标：assets/app.ico 的 48px 缩略（按屏幕 DPR 取图，HiDPI 下不糊）。"""
+    dpr = 1.0
+    app = QApplication.instance()
+    screen = app.primaryScreen() if app is not None else None
+    if screen is not None:
+        dpr = float(screen.devicePixelRatio() or 1.0)
+    pm = app_icon().pixmap(int(round(size * dpr)), int(round(size * dpr)))
+    if not pm.isNull():
+        pm.setDevicePixelRatio(dpr)
+    return pm
 
 
 class RecorderBridge(QObject):
@@ -60,29 +284,97 @@ class MainWindow(QMainWindow):
         self._quit_after_stop = False
 
         central = QWidget()
+        central.setObjectName("central")
         lay = QVBoxLayout(central)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(12)
+
+        # ---- 品牌行：48px 图标 + 「会议翻译助手」标题 / 副标题 ----
+        brand = QHBoxLayout()
+        brand.setSpacing(12)
+        self.icon_label = QLabel()
+        self.icon_label.setObjectName("brand_icon")
+        self.icon_label.setFixedSize(48, 48)
+        pix = brand_pixmap(48)
+        if not pix.isNull():
+            self.icon_label.setPixmap(pix)
+        brand.addWidget(self.icon_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        head = QVBoxLayout()
+        head.setSpacing(2)
+        self.brand_title = QLabel("会议翻译助手")
+        self.brand_title.setObjectName("brand_title")
+        self.brand_sub = QLabel("实时翻译字幕 · 会后自动纪要")
+        self.brand_sub.setObjectName("brand_sub")
+        head.addWidget(self.brand_title)
+        head.addWidget(self.brand_sub)
+        brand.addLayout(head, 0)
+        brand.addStretch(1)
+        lay.addLayout(brand)
+
+        # ---- 配置胶囊：三个只读徽章（识别 / 音频 / 翻译），随 .env 变化 ----
+        pills = QHBoxLayout()
+        pills.setSpacing(8)
+        self.pill_asr = _pill(asr_pill_text(self.settings))
+        self.pill_audio = _pill(audio_pill_text(self.settings))
+        self.pill_translate = _pill(translate_pill_text(self.settings))
+        for pill in (self.pill_asr, self.pill_audio, self.pill_translate):
+            pills.addWidget(pill)
+        pills.addStretch(1)
+        lay.addLayout(pills)
 
         self.title_input = QLineEdit()
         self.title_input.setPlaceholderText("会议名称（用于文件命名，可留空）")
         lay.addWidget(self.title_input)
 
+        # ---- 按钮行：主（渐变）/ 次（描边），等高 44px ----
         row = QHBoxLayout()
+        row.setSpacing(10)
         self.start_btn = QPushButton("开始记录")
+        self.start_btn.setProperty("role", "primary")
+        self.start_btn.setFixedHeight(44)
+        self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_btn = QPushButton("结束并生成纪要")
+        self.stop_btn.setProperty("role", "secondary")
+        self.stop_btn.setFixedHeight(44)
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_btn.setEnabled(False)
-        row.addWidget(self.start_btn)
-        row.addWidget(self.stop_btn)
+        row.addWidget(self.start_btn, 1)
+        row.addWidget(self.stop_btn, 1)
         lay.addLayout(row)
 
+        # ---- 状态卡片：状态文本（加粗白）+ 录制计时 ----
+        card = QFrame()
+        card.setObjectName("card")
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(14, 12, 14, 12)
+        card_lay.setSpacing(6)
         self.status = QLabel("就绪")
-        lay.addWidget(self.status)
+        self.status.setObjectName("status")
+        self.status.setWordWrap(True)
+        self.elapsed_label = QLabel("就绪")
+        self.elapsed_label.setObjectName("elapsed")
+        card_lay.addWidget(self.status)
+        card_lay.addWidget(self.elapsed_label)
+        lay.addWidget(card)
 
         self.speaker_table = QTableWidget(0, 2)
         self.speaker_table.setHorizontalHeaderLabels(["声纹标签", "名字"])
-        lay.addWidget(self.speaker_table)
+        self.speaker_table.setAlternatingRowColors(True)
+        self.speaker_table.setShowGrid(False)
+        self.speaker_table.verticalHeader().setVisible(False)
+        self.speaker_table.horizontalHeader().setStretchLastSection(True)
+        self.speaker_table.setMinimumHeight(140)
+        lay.addWidget(self.speaker_table, 1)
+
+        self.footer_hint = QLabel("录制中关闭窗口将收进托盘继续工作 · 托盘图标可随时结束")
+        self.footer_hint.setObjectName("footer_hint")
+        self.footer_hint.setWordWrap(True)
+        lay.addWidget(self.footer_hint)
 
         self.setCentralWidget(central)
-        self.resize(520, 420)
+        self.setStyleSheet(DARK_QSS)
+        self.resize(560, 600)
 
         self.start_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
@@ -91,6 +383,12 @@ class MainWindow(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_speakers)
         self._timer.start(5000)
+
+        # 录制计时：每秒刷新「已录制 mm:ss · 语句 N 条」（仅录制中刷新，空闲显示「就绪」）
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._refresh_elapsed)
+        self._elapsed_timer.start(1000)
+        self._refresh_elapsed()
 
         # 托盘放在最后：菜单槽会读写 start_btn / stop_btn / subtitle，必须等它们就绪
         self.setWindowIcon(app_icon())
@@ -139,6 +437,27 @@ class MainWindow(QMainWindow):
     def _is_recording(self) -> bool:
         """录制 / 收尾中：start 按钮禁用（_start 置位、_on_finished 复位）。"""
         return self.recorder is not None and not self.start_btn.isEnabled()
+
+    def _refresh_elapsed(self) -> str:
+        """录制计时行：录制中 → 「已录制 12:34 · 语句 23 条」，空闲 → 「就绪」。
+
+        时间从 ``recorder.started_at`` 算（不是窗口创建时间），语句数取
+        ``recorder.store.segments()`` 的长度。只由 QTimer 在 GUI 线程调用。
+        """
+        label = getattr(self, "elapsed_label", None)
+        recorder = self.recorder
+        if recorder is None or self.start_btn.isEnabled():
+            text = "就绪"
+        else:
+            started = getattr(recorder, "started_at", None)
+            seconds = 0 if started is None else max(
+                0, int((datetime.now() - started).total_seconds()))
+            store = getattr(recorder, "store", None)
+            count = len(store.segments()) if store is not None else 0
+            text = f"已录制 {seconds // 60:02d}:{seconds % 60:02d} · 语句 {count} 条"
+        if label is not None:
+            label.setText(text)
+        return text
 
     def _tray_stop(self) -> None:
         """托盘「结束并生成纪要」：录制中复用 _stop() 的后台收尾；空闲时无事可做。
@@ -293,6 +612,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status.setText("完成" if ok else "导出失败")
+        self._refresh_elapsed()          # 计时行立刻回到「就绪」（不必等下一秒的定时器）
         if ok:
             QMessageBox.information(self, "完成", msg)
         else:
@@ -334,6 +654,9 @@ class MainWindow(QMainWindow):
             e.ignore()
             return
         self._hide_tray()        # 非录制中：正常关闭，顺手收掉托盘图标
+        # 字幕浮窗是独立顶层窗口：hide 掉才会「最后一个窗口关完 → 进程退出」；
+        # 否则主窗口关了、托盘也收了，只剩一个无边框浮窗把进程吊住，用户无从退出
+        self.subtitle.hide()
         e.accept()
 
     def _shutdown_in_background(self, *, quit_after: bool) -> None:

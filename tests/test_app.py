@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 必须在 import PyQt6
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -116,7 +116,11 @@ def fake_tray(monkeypatch):
 @pytest.fixture
 def win(qapp, tmp_path):
     w = MainWindow(_settings(tmp_path))
-    w._timer.stop()      # 关掉 5 秒定时刷新：避免其读写控件干扰「零控件访问」断言
+    # 关掉定时刷新（说话人 5s / 录制计时 1s）：避免其读写控件干扰「零控件访问」断言
+    for timer_name in ("_timer", "_elapsed_timer"):
+        timer = getattr(w, timer_name, None)
+        if timer is not None:
+            timer.stop()
     try:
         yield w
     finally:
@@ -323,12 +327,14 @@ def test_close_event_idle_accepts_and_hides_tray(win, dialogs):
     win.recorder = None
     win.start_btn.setEnabled(True)
     win.show()
+    win.subtitle.show()                 # 上次会议的浮窗还开着
     tray = win.tray
     assert tray.visible
 
     assert win.close() is True          # e.accept()：真关闭
     assert not win.isVisible()
     assert not tray.visible             # 退出前 hide() 托盘
+    assert not win.subtitle.isVisible()  # 浮窗一并收起，否则进程被吊住退不掉
     assert [d for d in recorded if d[0] == "question"] == []
 
 
@@ -676,7 +682,10 @@ def test_no_audio_source_combo(win):
 
 def _make_win(qapp, tmp_path, audio_source):
     w = MainWindow(_settings(tmp_path, audio_source=audio_source))
-    w._timer.stop()
+    for timer_name in ("_timer", "_elapsed_timer"):
+        timer = getattr(w, timer_name, None)
+        if timer is not None:
+            timer.stop()
     return w
 
 
@@ -802,3 +811,105 @@ def test_bridge_update_signal_forwarded_to_subtitle(win, qapp):
     # 直接调槽同样只走 update（两个槽逻辑同源、通道不同）
     win._on_update(seg)
     assert [c[0] for c in fake.calls] == ["show", "update", "update"]
+
+
+# ---------------------------------------------------------------------------
+# g. 暗色主题重设计：品牌行 / 配置胶囊 / 状态卡片 / 录制计时
+# ---------------------------------------------------------------------------
+
+def _themed_settings(tmp_path, **kwargs) -> Settings:
+    """带主题相关字段的 Settings（默认取 .env.example 的值）。"""
+    kw = dict(asr_provider="local", audio_source="both",
+              translate_model="deepseek-v4-flash", whisper_model="small")
+    kw.update(kwargs)
+    return Settings("https://example.invalid/v1", "sk-fake", kw["translate_model"],
+                    "deepseek-v4-pro", kw["whisper_model"], "",
+                    tmp_path / "会议记录", tmp_path,
+                    asr_provider=kw["asr_provider"], audio_source=kw["audio_source"])
+
+
+def _stop_timers(w):
+    for timer_name in ("_timer", "_elapsed_timer"):
+        timer = getattr(w, timer_name, None)
+        if timer is not None:
+            timer.stop()
+
+
+def test_config_badges_reflect_settings(qapp, tmp_path):
+    """三个只读胶囊徽章反映 .env 配置：识别源 / 音频源 / 翻译模型（去 deepseek- 前缀）。"""
+    cases = [
+        (dict(asr_provider="groq", audio_source="both",
+              translate_model="deepseek-v4-flash"),
+         ("识别 · Groq 云端", "音频 · 自动双路", "翻译 · v4-flash")),
+        (dict(asr_provider="local", audio_source="speaker",
+              translate_model="deepseek-v4-pro"),
+         ("识别 · 本地 small", "音频 · 仅系统声音", "翻译 · v4-pro")),
+        (dict(asr_provider="local", audio_source="mic",
+              translate_model="gpt-4o-mini"),
+         ("识别 · 本地 small", "音频 · 仅麦克风", "翻译 · gpt-4o-mini")),
+    ]
+    for kwargs, expected in cases:
+        w = MainWindow(_themed_settings(tmp_path, **kwargs))
+        try:
+            got = (w.pill_asr.text(), w.pill_audio.text(), w.pill_translate.text())
+            assert got == expected, f"{kwargs} → {got}"
+            for pill in (w.pill_asr, w.pill_audio, w.pill_translate):
+                assert pill.property("role") == "pill"      # 走 QSS 的胶囊样式
+        finally:
+            _stop_timers(w)
+            w.recorder = None
+            w.start_btn.setEnabled(True)
+            w.hide()
+
+
+def test_brand_row_status_card_and_equal_height_buttons(win):
+    """品牌行（48px 图标 + 标题/副标题）、状态卡片、底部提示在位，主次按钮等高 44px。"""
+    for name in WIDGETS:
+        assert hasattr(win, name), f"控件 {name} 缺失（控件名必须保持不变）"
+    assert win.brand_title.text() == "会议翻译助手"
+    assert win.brand_sub.text() == "实时翻译字幕 · 会后自动纪要"
+    assert not win.icon_label.pixmap().isNull(), "品牌行未加载 assets/app.ico"
+    assert win.icon_label.width() == win.icon_label.height() == 48
+    for btn in (win.start_btn, win.stop_btn):
+        assert btn.minimumHeight() == btn.maximumHeight() == 44      # 固定等高
+    assert win.start_btn.property("role") == "primary"               # 主按钮（渐变）
+    assert win.stop_btn.property("role") == "secondary"              # 次按钮（描边）
+    assert win.footer_hint.text().startswith("录制中关闭窗口将收进托盘")
+    assert win.elapsed_label.text() == "就绪"
+
+
+def _elapsed_recorder(seconds_ago: int = 65, segments: int = 2) -> FakeRecorder:
+    """录制中的 fake recorder：started_at 回溯 N 秒、store 里预置 M 条语句。"""
+    rec = FakeRecorder(title="计时会议")
+    rec.started_at = datetime.now() - timedelta(seconds=seconds_ago)
+    for i in range(segments):
+        rec.store.add(start=float(i), end=float(i) + 1.0, text=f"句子{i}")
+    return rec
+
+
+def test_elapsed_label_updates_while_recording(win):
+    """录制中 elapsed_label 显示「已录制 mm:ss · 语句 N 条」；空闲 / 未开始显示「就绪」。"""
+    assert win.elapsed_label.text() == "就绪"
+    assert win._elapsed_timer.interval() == 1000          # 每秒刷新一次
+
+    rec = _elapsed_recorder(seconds_ago=65, segments=2)
+    _prepare_recording(win, rec)
+
+    text = win._refresh_elapsed()
+    assert "01:05" in text, text
+    assert "语句 2 条" in text, text
+    assert win.elapsed_label.text() == text
+
+    # 语句继续增长 → 计数跟着走（计时起点不变）
+    rec.store.add(start=9.0, end=10.0, text="句子3")
+    assert "语句 3 条" in win._refresh_elapsed()
+    assert "01:05" in win.elapsed_label.text()
+
+    # 收尾完成 / 空闲（start 按钮恢复）→ 回到「就绪」
+    win.start_btn.setEnabled(True)
+    win._refresh_elapsed()
+    assert win.elapsed_label.text() == "就绪"
+
+    # 从未开始录制（recorder 为 None）也不能崩
+    win.recorder = None
+    assert win._refresh_elapsed() == "就绪"
