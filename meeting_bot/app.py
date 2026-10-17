@@ -101,8 +101,7 @@ class MainWindow(QMainWindow):
         try:
             return AudioCapture(source=source)
         except CaptureError as e:
-            QMessageBox.critical(self, "启动失败",
-                                 f"无法打开麦克风/扬声器捕获设备：{e}")
+            QMessageBox.critical(self, "启动失败", f"音频源不可用：{e}")
             return None
 
     def _start(self):
