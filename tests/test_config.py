@@ -134,3 +134,13 @@ def test_asr_batch_threshold_bad_value_raises(tmp_path, monkeypatch):
     with pytest.raises(ConfigError) as ei:
         load_settings(env)
     assert "ASR_BATCH_SECONDS" in str(ei.value)
+
+
+def test_diarize_enabled_flag(tmp_path, monkeypatch):
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123\nDIARIZE_ENABLED=false\n", encoding="utf-8")
+    s = load_settings(env)
+    assert s.diarize_enabled is False
+    env.write_text("OPENCODE_API_KEY=sk-test123\n", encoding="utf-8")
+    assert load_settings(env).diarize_enabled is True

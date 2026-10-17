@@ -35,6 +35,9 @@ class Settings:
     # 本地模式攒批阈值：None = 用 recorder.py 里的模块默认值（30.0 / 35.0）
     asr_batch_seconds: float | None = None
     asr_batch_max_wait: float | None = None
+    # 说话人标注开关：默认 true；本机 CPU 标注慢于实时 1.3~1.8 倍（标签迟到数分钟），
+    # 关掉可省下会议期间的 CPU 占用（.env 设 DIARIZE_ENABLED=false）
+    diarize_enabled: bool = True
 
 
 def _clean_hf_token(raw: str) -> str:
@@ -99,4 +102,5 @@ def load_settings(env_path: Path | None = None) -> Settings:
         audio_source=(os.getenv("AUDIO_SOURCE") or "both").strip().lower(),
         asr_batch_seconds=_float_env("ASR_BATCH_SECONDS"),
         asr_batch_max_wait=_float_env("ASR_BATCH_MAX_WAIT"),
+        diarize_enabled=(os.getenv("DIARIZE_ENABLED") or "true").strip().lower() not in ("false", "0", "no", "off"),
     )

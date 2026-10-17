@@ -104,17 +104,17 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "启动失败", f"翻译接口初始化失败：{e}")
             return
-        try:
-            diarizer = Diarizer(self.settings)
-        except DiarizationError as e:
-            # 预期内：未配置 HF_TOKEN / 模型不可用等
-            self._warn_diarizer_unavailable(e)
-            diarizer = None
-        except Exception as e:
-            # 非预期：Pipeline.from_pretrained 的网络异常（HTTPError/ConnectionError）等。
-            # Qt 槽内异常若外冒会直接终止进程（qFatal），故与预期内一样降级为「无说话人」继续记录。
-            self._warn_diarizer_unavailable(e)
-            diarizer = None
+        diarizer = None
+        if self.settings.diarize_enabled:
+            try:
+                diarizer = Diarizer(self.settings)
+            except DiarizationError as e:
+                # 预期内：未配置 HF_TOKEN / 模型不可用等
+                self._warn_diarizer_unavailable(e)
+            except Exception as e:
+                # 非预期：Pipeline.from_pretrained 的网络异常（HTTPError/ConnectionError）等。
+                # Qt 槽内异常若外冒会直接终止进程（qFatal），故与预期内一样降级为「无说话人」继续记录。
+                self._warn_diarizer_unavailable(e)
         self.recorder = Recorder(self.settings, capture=capture, translator=translator,
                                  diarizer=diarizer,
                                  audio_source=getattr(self.settings, "audio_source", "both"))
