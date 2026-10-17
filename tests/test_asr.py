@@ -48,7 +48,8 @@ import httpx
 import openai
 import pytest
 
-from meeting_bot.asr import CloudASREngine, CloudASRError
+from meeting_bot.asr import (CLOUD_RETRY_BACKOFF, CLOUD_STOP_POLL, CLOUD_TIMEOUT,
+                            CloudASREngine, CloudASRError, CloudASRConfigError)
 from meeting_bot.config import ConfigError
 
 
@@ -100,6 +101,22 @@ def _api_error() -> openai.APIError:
                            body=None)
 
 
+_GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+
+def _response(status: int) -> httpx.Response:
+    return httpx.Response(status, request=httpx.Request("POST", _GROQ_URL))
+
+
+def _status_error(status: int, cls=openai.APIStatusError) -> openai.APIStatusError:
+    """构造带 HTTP 状态码的 SDK 异常（真实 SDK 按 status_code 选子类）。"""
+    return cls(f"http {status}", response=_response(status), body=None)
+
+
+def _connection_error() -> openai.APIConnectionError:
+    return openai.APIConnectionError(request=httpx.Request("POST", _GROQ_URL))
+
+
 def test_cloud_engine_requires_key(monkeypatch):
     """a. 没有 GROQ_API_KEY（环境变量与 settings 都空）→ ConfigError，不得构造 client。"""
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
@@ -117,7 +134,8 @@ def test_cloud_engine_reads_env_key(monkeypatch):
     assert created[0]["api_key"] == "gsk_from_env"
     assert created[0]["base_url"] == "https://api.groq.com/openai/v1"
     assert created[0]["max_retries"] == 0
-    assert created[0]["timeout"] == 30.0
+    # 超时必须贴着延迟目标（5-10s）：30s 会让一句卡满半分钟才重试，字幕形同停更
+    assert created[0]["timeout"] == CLOUD_TIMEOUT == 10.0
 
 
 def test_cloud_transcribe_maps_segments(monkeypatch):
@@ -191,6 +209,8 @@ def test_cloud_transcribe_wraps_bad_structure(monkeypatch, bad):
     _install_fake_openai(monkeypatch, tr)
     with pytest.raises(CloudASRError):
         CloudASREngine(_cloud_settings()).transcribe(np.zeros(16000, dtype=np.float32))
+    # 结构异常是确定性错误：重试 3 次只是白等 3 秒 + 白耗 3 次配额
+    assert len(tr.calls) == 1, tr.calls
 
 
 def test_cloud_writes_16k_wav(monkeypatch):
@@ -254,3 +274,138 @@ def test_cloud_transcribe_real_sdk_shapes(monkeypatch):
     assert b"verbose_json" in body and b"whisper-large-v3-turbo" in body
     assert b"RIFF" in body                     # 上传的确实是 wav
     assert [(s.start, s.end, s.text, s.lang) for s in segs] == [(0.0, 1.25, "Hello", "en")]
+
+
+def test_cloud_transcribe_auth_error_fails_fast(monkeypatch):
+    """M1. key 无效/无权限（401/403）→ CloudASRConfigError，且只请求 1 次。
+
+    原实现对 4xx 也走 3 次退避重试：key 错了重试 3 次既白耗免费配额（20 req/min），
+    又把告警推迟 3 秒；且错误被降级成「本批丢弃」的 CloudASRError，用户看不出
+    根因是配置。现在升格为 CloudASRConfigError（ConfigError 子类）→ Recorder
+    走「识别引擎不可用，本场不再有字幕」的一次性告警。
+    """
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr("meeting_bot.asr.time.sleep", lambda s: None)
+    tr = FakeTranscriptions(error=openai.AuthenticationError(
+        "invalid api key", response=_response(401), body=None))
+    _install_fake_openai(monkeypatch, tr)
+
+    with pytest.raises(CloudASRConfigError) as ei:
+        CloudASREngine(_cloud_settings()).transcribe(np.zeros(16000, dtype=np.float32))
+
+    assert len(tr.calls) == 1, tr.calls
+    assert "GROQ_API_KEY" in str(ei.value) and "401" in str(ei.value)
+
+
+def test_cloud_transcribe_permission_denied_fails_fast(monkeypatch):
+    """403（key 无权限）与 401 同处置：ConfigurationError 而非重试。"""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr("meeting_bot.asr.time.sleep", lambda s: None)
+    tr = FakeTranscriptions(error=_status_error(403, openai.PermissionDeniedError))
+    _install_fake_openai(monkeypatch, tr)
+
+    with pytest.raises(CloudASRConfigError):
+        CloudASREngine(_cloud_settings()).transcribe(np.zeros(16000, dtype=np.float32))
+    assert len(tr.calls) == 1, tr.calls
+
+
+@pytest.mark.parametrize("status", [400, 404, 413, 422])
+def test_cloud_transcribe_client_errors_fail_fast(monkeypatch, status):
+    """M1. 其余确定性 4xx（参数错/模型不存在/音频过大/不可处理）不重试。
+
+    这批错误是「请求本身有问题」，重试 3 次必然同样失败：白耗 3 次配额 + 3 秒。
+    """
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr("meeting_bot.asr.time.sleep", lambda s: None)
+    tr = FakeTranscriptions(error=_status_error(status))
+    _install_fake_openai(monkeypatch, tr)
+
+    with pytest.raises(CloudASRError) as ei:
+        CloudASREngine(_cloud_settings()).transcribe(np.zeros(16000, dtype=np.float32))
+
+    assert len(tr.calls) == 1, tr.calls
+    assert not isinstance(ei.value, ConfigError), "4xx 非 key 类错误不应升格为配置错误"
+    assert f"（HTTP {status}）" in str(ei.value)
+
+
+@pytest.mark.parametrize("status", [408, 409, 429, 500, 502, 503])
+def test_cloud_transcribe_retryable_status_retries(monkeypatch, status):
+    """限速/冲突/请求超时/5xx 仍然退避重试（不能被 M1 的快速失败误伤）。"""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr("meeting_bot.asr.time.sleep", lambda s: None)
+    tr = FakeTranscriptions(error=_status_error(status))
+    _install_fake_openai(monkeypatch, tr)
+
+    with pytest.raises(CloudASRError) as ei:
+        CloudASREngine(_cloud_settings()).transcribe(np.zeros(16000, dtype=np.float32))
+    assert len(tr.calls) == 3, tr.calls
+    assert "云端识别不可用" in str(ei.value)
+
+
+def test_cloud_transcribe_retries_connection_errors(monkeypatch):
+    """连接失败/超时必须继续重试（M2 重新排序 except 分支后的回归护栏）。"""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr("meeting_bot.asr.time.sleep", lambda s: None)
+    tr = FakeTranscriptions(error=_connection_error())
+    _install_fake_openai(monkeypatch, tr)
+
+    with pytest.raises(CloudASRError):
+        CloudASREngine(_cloud_settings()).transcribe(np.zeros(16000, dtype=np.float32))
+    assert len(tr.calls) == 3, tr.calls
+
+
+def test_cloud_transcribe_backoff_interruptible(monkeypatch):
+    """M2. 退避睡眠可被 should_stop 打断：停止后立刻放弃重试，不再空转等 1s+2s。
+
+    变异自查：_sleep_backoff 改回裸 time.sleep(backoff) → 本用例会真的睡满
+    CLOUD_RETRY_BACKOFF[0] 秒并安静返回 3 次调用（calls==1 断言失败）。
+    """
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    slept: list[float] = []
+    monkeypatch.setattr("meeting_bot.asr.time.sleep", lambda s: slept.append(s))
+    tr = FakeTranscriptions(error=_api_error())
+    _install_fake_openai(monkeypatch, tr)
+
+    with pytest.raises(CloudASRError) as ei:
+        CloudASREngine(_cloud_settings()).transcribe(
+            np.zeros(16000, dtype=np.float32), should_stop=lambda: True)
+
+    assert "识别被停止" in str(ei.value)
+    assert len(tr.calls) == 1, "停止后不得再发请求"
+    assert slept == [], "停止信号在首轮轮询就该生效，不应真的睡"
+    assert CLOUD_RETRY_BACKOFF[0] > 0
+
+
+def test_cloud_transcribe_backoff_not_interrupted_when_running(monkeypatch):
+    """没有停止信号时退避照旧，且总时长仍是 1s + 2s（切片轮询不改变总等待）。
+
+    用假 time 模块驱动虚拟时钟：既不真睡（秒级测试），又能验证轮询确实按
+    deadline 退出（真死循环会由 MAX_SLICES 守卫变成可读失败而不是挂住）。
+    """
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    clock = {"t": 0.0}
+    slept: list[float] = []
+    MAX_SLICES = 100
+
+    def fake_sleep(s):
+        assert len(slept) < MAX_SLICES, f"退避轮询未按 deadline 退出：{slept[:5]}…"
+        slept.append(s)
+        clock["t"] += s
+
+    fake_time = types.SimpleNamespace(sleep=fake_sleep,
+                                      monotonic=lambda: clock["t"],
+                                      time=lambda: clock["t"])
+    monkeypatch.setattr("meeting_bot.asr.time", fake_time)
+    tr = FakeTranscriptions(error=_api_error())
+    _install_fake_openai(monkeypatch, tr)
+
+    with pytest.raises(CloudASRError):
+        CloudASREngine(_cloud_settings()).transcribe(
+            np.zeros(16000, dtype=np.float32), should_stop=lambda: False)
+
+    assert len(tr.calls) == 3
+    planned = sum(CLOUD_RETRY_BACKOFF)
+    # 总等待不短于计划（不偷工减料），且最多超出一个轮询切片（浮点累积 + 跨界那一片）
+    assert planned <= sum(slept) <= planned + CLOUD_STOP_POLL + 1e-9, slept
+    # 每片都不超过轮询粒度：否则停止信号最多要等一整个 backoff（3s）才生效
+    assert max(slept) <= CLOUD_STOP_POLL + 1e-9

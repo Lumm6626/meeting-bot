@@ -306,6 +306,18 @@ class Recorder:
             # 不论正常退出还是异常，都要放行翻译 worker 的排空条件
             self._asr_finished.set()
 
+    def _transcribe(self, audio: np.ndarray) -> list[Segment]:
+        """调识别引擎。
+
+        云端引擎多收一个 should_stop：它的失败退避 sleep 会切片轮询停止信号，
+        录制结束时不必干等 1s+2s（本地引擎没有这个参数，用 isinstance 区分，
+        不用 try/except TypeError 兜 —— 那会把 transcribe 内部真出现的
+        TypeError 一起吞掉，掩盖 bug）。
+        """
+        if isinstance(self._asr, CloudASREngine):
+            return self._asr.transcribe(audio, should_stop=self._stop.is_set)
+        return self._asr.transcribe(audio)
+
     def _transcribe_batch(self, batch: list[tuple[int, np.ndarray]]) -> None:
         if not batch:
             return
@@ -331,11 +343,13 @@ class Recorder:
                 # groq 模式走云端 client：没有 500MB 模型下载，也不用等首句识别预热。
                 self._asr = (CloudASREngine(self._settings)
                              if self._asr_provider == "groq" else ASREngine(self._settings))
-            segments = self._asr.transcribe(audio)
+            segments = self._transcribe(audio)
         except Exception as e:
             # 单批失败只丢这一批（告警可见），不得杀掉识别线程 —— 否则整场再无字幕。
-            # 云端模式的 CloudASRError（重试后仍失败/结构异常）与本地异常同路处理；
+            # 云端模式的 CloudASRError（重试后仍失败/结构异常/被停止）与本地异常同路处理；
             # 缺 key 时 CloudASREngine 构造抛 ConfigError 也落在这里（告警里带原因）。
+            # CloudASRConfigError 是 ConfigError 的子类（key 无效/无权限），
+            # 所以下面这一个分支同时覆盖「缺 key」与「key 无效」两种配置类错误。
             if isinstance(e, ConfigError):
                 # 配置错误是持续性的：首次失败后每句都会再失败，只报一次即可，
                 # 否则状态栏被同一句警告刷满、字幕反而看不见。

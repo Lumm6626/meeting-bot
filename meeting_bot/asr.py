@@ -3,7 +3,8 @@
 
 本地模式攒批识别（ASR_BATCH_SECONDS/ASR_BATCH_MAX_WAIT），字幕成批出现；
 云端模式（ASR_PROVIDER=groq）每条语句到达即识别，字幕延迟约 5~10 秒，
-代价是音频会上传 Groq 云端，且免费额度有限速（约 20 req/min）。
+代价是音频会上传 Groq 云端，且免费额度有限速（约 20 req/min）；
+单次请求超时 10s，失败按 1s/2s 退避重试（可被停止信号打断）。
 """
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ import io
 import os
 import time
 import wave
+from typing import Callable
 
 import numpy as np
 import openai
@@ -21,12 +23,23 @@ from .transcript import Segment
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "whisper-large-v3-turbo"
+CLOUD_TIMEOUT = 10.0                    # 单次请求超时（秒）：目标字幕延迟 5~10s
 CLOUD_MAX_ATTEMPTS = 3                  # 首次 + 2 次重试
 CLOUD_RETRY_BACKOFF = (1.0, 2.0)        # 第 n 次失败后等几秒再试
+CLOUD_RETRYABLE_STATUS = (408, 409, 429)  # 超时/冲突/限速：4xx 里唯三值得重试的
+CLOUD_STOP_POLL = 0.1                   # 可中断退避的轮询粒度（秒）
 
 
 class CloudASRError(Exception):
     """云端识别不可用（重试后仍失败）或响应结构异常。"""
+
+
+class CloudASRConfigError(ConfigError):
+    """云端识别的配置错误（key 无效/无权限）：重试无益，需用户改配置。
+
+    继承 ConfigError：Recorder 侧对「配置类错误」已有「只告警一次」的处理路径
+    （缺 key 与本类错误的处置完全相同），无需再分叉。
+    """
 
 
 class ASREngine:
@@ -103,13 +116,17 @@ class CloudASREngine:
             raise ConfigError("缺少 GROQ_API_KEY：请到 https://console.groq.com 免费注册"
                               "取 key，填入 .env 的 GROQ_API_KEY")
         self._client = openai.OpenAI(base_url=GROQ_BASE_URL, api_key=key,
-                                     timeout=30.0, max_retries=0)
+                                     timeout=CLOUD_TIMEOUT, max_retries=0)
         self._model = GROQ_MODEL
 
-    def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> list[Segment]:
+    def transcribe(self, audio: np.ndarray, sample_rate: int = 16000,
+                   should_stop: Callable[[], bool] | None = None) -> list[Segment]:
         """音频 → Segment 列表（语种自动检测、带时间戳）。
 
         重试 2 次后仍失败则抛 CloudASRError（Recorder 侧丢弃该批并告警）。
+        确定性错误不重试：key 无效/无权限 → CloudASRConfigError（一次性告警），
+        其余 4xx（400/404/413/422…）→ CloudASRError（重试只会白耗配额与延迟）。
+        should_stop 给出时，退避睡眠切片轮询，停止信号能立刻打断重试。
         """
         wav = encode_wav(audio, sample_rate)
         last_error: Exception | None = None
@@ -120,12 +137,35 @@ class CloudASREngine:
                     file=("utterance.wav", wav, "audio/wav"),
                     response_format="verbose_json",   # 只有 verbose_json 带 segments/language
                 )
-            except openai.APIError as e:
-                # APIError 覆盖限速/5xx/连接失败 → 退避重试
+            except (openai.AuthenticationError, openai.PermissionDeniedError) as e:
+                # 401/403：key 无效或无权限。确定性错误，重试 3 次只是白耗配额
+                # 与 3 倍延迟，用户必须改配置才能恢复 → 交给 ConfigError 路径一次性告警。
+                raise CloudASRConfigError(
+                    f"GROQ_API_KEY 无效或无权限（HTTP {e.status_code}）：请到 "
+                    "https://console.groq.com 重新生成 key 并更新 .env"
+                ) from e
+            except openai.APIStatusError as e:
+                # 限速/请求超时/冲突值得退避；其余 4xx（400 参数错、404 模型不存在、
+                # 413 音频过大、422 不可处理）都是确定性错误，重试 3 次纯属浪费。
+                if e.status_code not in CLOUD_RETRYABLE_STATUS and e.status_code < 500:
+                    raise CloudASRError(
+                        f"云端识别请求被拒绝（HTTP {e.status_code}）：{e}"
+                    ) from e
                 last_error = e
                 if attempt + 1 < CLOUD_MAX_ATTEMPTS:
-                    time.sleep(CLOUD_RETRY_BACKOFF[min(attempt,
-                                                       len(CLOUD_RETRY_BACKOFF) - 1)])
+                    self._sleep_backoff(attempt, should_stop)
+                continue
+            except openai.APIConnectionError as e:
+                # 连接失败/超时（APITimeoutError 是它的子类）→ 瞬时故障，退避重试
+                last_error = e
+                if attempt + 1 < CLOUD_MAX_ATTEMPTS:
+                    self._sleep_backoff(attempt, should_stop)
+                continue
+            except openai.APIError as e:
+                # 兜底：无法分类的 APIError（如响应校验失败）按瞬时故障处理
+                last_error = e
+                if attempt + 1 < CLOUD_MAX_ATTEMPTS:
+                    self._sleep_backoff(attempt, should_stop)
                 continue
             except Exception as e:
                 # 非 APIError（SDK 边界异常：参数/编码/连接池）→ 不重试，直接包装。
@@ -141,3 +181,20 @@ class CloudASREngine:
         raise CloudASRError(
             f"云端识别不可用（重试 {CLOUD_MAX_ATTEMPTS - 1} 次仍失败）：{last_error}"
         ) from last_error
+
+    @staticmethod
+    def _sleep_backoff(attempt: int, should_stop: Callable[[], bool] | None = None) -> None:
+        """退避睡眠；给了 should_stop 就切片轮询，停止信号可立刻打断。
+
+        原实现 time.sleep(1) + time.sleep(2) 无法打断：录制结束时识别线程卡在退避里，
+        stop() 只能干等 join，用户感知是「停不下来」。切成 0.1s 一轮后最多多等 0.1s。
+        """
+        backoff = CLOUD_RETRY_BACKOFF[min(attempt, len(CLOUD_RETRY_BACKOFF) - 1)]
+        if should_stop is None:
+            time.sleep(backoff)
+            return
+        deadline = time.monotonic() + backoff
+        while time.monotonic() < deadline:
+            if should_stop():
+                raise CloudASRError("识别被停止")
+            time.sleep(CLOUD_STOP_POLL)

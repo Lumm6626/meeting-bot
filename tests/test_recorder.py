@@ -1673,6 +1673,10 @@ def test_groq_provider_processes_each_utterance(monkeypatch):
         assert [s.text for s in r.store.segments()] == ["line 1", "line 2", "line 3"]
         assert r._asr_provider == "groq"
         assert r._stop.is_set() is False          # 逐句出字幕发生在录制中途
+        # 缺口补测：FakeCloudASR 每批返回批内相对 (0.1, 0.9)，to_abs 必须按该语句的
+        # 绝对样本偏移回填（第 i 条语句偏移 i*16000）→ 0.1/1.1/2.1…，不是三条都在 0.1。
+        spans = [(round(s.start, 3), round(s.end, 3)) for s in r.store.segments()]
+        assert spans == [(0.1, 0.9), (1.1, 1.9), (2.1, 2.9)], spans
     finally:
         r.stop()
         thread.join(timeout=10)
@@ -1689,7 +1693,7 @@ def test_groq_provider_lazy_init_uses_cloud_engine(monkeypatch):
         def __init__(self, settings):
             built.append("cloud")
 
-        def transcribe(self, audio, sample_rate=16000):
+        def transcribe(self, audio, sample_rate=16000, should_stop=None):
             n = max(1, len(audio) // 16000)
             return [Segment(i + 0.5, i + 0.9, "cloud ok", lang="en") for i in range(n)]
 
@@ -1773,3 +1777,81 @@ def test_asr_config_error_reported_once(monkeypatch):
     assert sum("识别引擎不可用" in m for m in statuses) == 1
     assert sum("缺少 GROQ_API_KEY" in m for m in statuses) == 1
     assert r.store.segments() == []
+
+
+def test_asr_cloud_config_error_reported_once(monkeypatch):
+    """M1. key 无效/无权限（CloudASRConfigError）与缺 key 同待遇：只告警一次。
+
+    这类错误每次识别都必然复现（key 不会自己变好），逐句告警会把状态栏刷满、
+    把真正的字幕挤掉 —— 所以必须走 ConfigError 的一次性告警路径。
+    """
+    from meeting_bot.asr import CloudASRConfigError
+
+    class _BadKeyCloud:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            raise CloudASRConfigError("GROQ_API_KEY 无效或无权限（HTTP 401）")
+
+    asr = _BadKeyCloud()
+    r = Recorder(_groq_settings(), capture=FakeCapture(chunks=0),
+                 asr=asr, translator=None, diarizer=None)
+    statuses: list[str] = []
+    r.on_status(statuses.append)
+
+    for _ in range(3):    # 三条语句各自一批（云端模式逐句识别）
+        r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
+
+    assert asr.calls == 3, "批次仍要尝试（不得因已告警就跳过调用）"
+    assert sum("识别引擎不可用" in m for m in statuses) == 1, statuses
+    assert sum("HTTP 401" in m for m in statuses) == 1, statuses
+    assert sum("识别失败" in m for m in statuses) == 0, "配置错误不该报成普通批次失败"
+    assert r.store.segments() == []
+
+
+def test_groq_transcribe_receives_should_stop(monkeypatch):
+    """M2. 云端引擎拿到 should_stop（= _stop.is_set 的实时读数），退避才可被打断。
+
+    直接驱动 _transcribe_batch（不经线程），避免「首批在 stop 之后才出批」的时序
+    竞态把断言变成偶然；两次调用分别对应录制中（False）与停止后（True）。
+    """
+    seen: list[bool | None] = []
+
+    class _Engine:
+        def __init__(self, settings):
+            pass
+
+        def transcribe(self, audio, sample_rate=16000, should_stop=None):
+            seen.append(should_stop() if should_stop else None)
+            return [Segment(0.0, 0.5, "ok", lang="en")]
+
+    monkeypatch.setattr("meeting_bot.recorder.CloudASREngine", _Engine)
+    r = Recorder(_groq_settings(), capture=FakeCapture(chunks=0),
+                 translator=None, diarizer=None)
+    r.on_status(lambda m: None)
+
+    r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
+    r._stop.set()                                   # 模拟 stop() 置位
+    r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
+
+    assert seen == [False, True],         f"should_stop 必须是 _stop.is_set 的实时读数，实际={seen}"
+
+
+def test_local_asr_transcribe_not_given_should_stop():
+    """本地 ASREngine 的 transcribe 没有 should_stop 参数：绝不能多传（会 TypeError）。
+
+    引擎签名故意写成严格两参：多传一个参数就抛 TypeError，从而证明 Recorder
+    是按引擎类型分支传参，而不是无脑透传。
+    """
+    class _StrictLocal:
+        def transcribe(self, audio, sample_rate=16000):
+            return [Segment(0.0, 0.5, "local ok", lang="en")]
+
+    r = Recorder(_settings(), capture=FakeCapture(chunks=0),
+                 asr=_StrictLocal(), translator=None, diarizer=None)
+    r.on_status(lambda m: None)
+
+    segs = r._transcribe(np.zeros(16000, dtype=np.float32))
+    assert [s.text for s in segs] == ["local ok"]
