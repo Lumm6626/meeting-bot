@@ -121,9 +121,20 @@ class FakeASRSlowBatch:
                 for i in range(n)]
 
 
+def _stream_via_translate(self, text, lang=""):
+    """把「非流式」fake 适配成流式：一次 yield 完整译文（等于「译完才上屏」）。
+
+    生产实现按 delta 累积逐字 yield；对 worker 而言两者只差通知次数，
+    翻译结果 / 异常 / 调用计数完全一致，故既有用例只需这一行适配。
+    """
+    yield self.translate(text, lang)
+
+
 class FakeTranslator:
     def __init__(self):
         self.calls = 0
+
+    translate_stream = _stream_via_translate
 
     def translate(self, text, lang=""):
         self.calls += 1
@@ -150,6 +161,8 @@ class FakeTranslatorFailOnce:
 
     def __init__(self):
         self.calls = 0
+
+    translate_stream = _stream_via_translate
 
     def translate(self, text, lang=""):
         self.calls += 1
@@ -394,6 +407,146 @@ def test_zh_segment_skips_translation(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 流式翻译：逐字上屏 + 重绘节流 + 流中断回退
+# ---------------------------------------------------------------------------
+
+class FakeTranslatorStreamChunks:
+    """流式 fake：逐块吐字符，块间可插延时（节流用例的核心道具）。
+
+    ``delay=0`` → 10 块在毫秒级吐完（必然落在同一节流窗口内）；
+    ``delay=0.3`` → 每块间隔均 > STREAM_RERENDER_INTERVAL（每块都该通知）。
+    """
+
+    def __init__(self, chunks="0123456789", delay: float = 0.0):
+        self.chunks = chunks
+        self.delay = delay
+        self.stream_calls = 0
+        self.translate_calls = 0
+
+    def translate_stream(self, text, lang=""):
+        self.stream_calls += 1
+        acc = ""
+        for ch in self.chunks:
+            if self.delay:
+                time.sleep(self.delay)
+            acc += ch
+            yield acc
+
+    def translate(self, text, lang=""):
+        """stop() 收尾补译走非流式（收尾阶段无人看实时性）。"""
+        self.translate_calls += 1
+        return "".join(self.chunks)
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+class FakeTranslatorStreamBreaks:
+    """先正常吐 2 块译文，随后流中断（连接断开）；补译走非流式。"""
+
+    def __init__(self):
+        self.stream_calls = 0
+        self.translate_calls = 0
+
+    def translate_stream(self, text, lang=""):
+        self.stream_calls += 1
+        yield "你"
+        yield "你好"
+        raise TranslationError("模拟流中断")
+
+    def translate(self, text, lang=""):
+        self.translate_calls += 1
+        return "你好世界"
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+def test_streaming_updates_throttled(monkeypatch):
+    """快流：10 块在 0.25s 内吐完 → 通知被节流（不是每块都推 Qt），且末次必刷。
+
+    变异自查点：去掉 _stream_translate 的节流判断 → 通知次数变成 10，断言失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    tr = FakeTranslatorStreamChunks(chunks="0123456789", delay=0.0)
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASR(),
+                 translator=tr, diarizer=None)
+    updates = []          # 回调里立刻快照译文：Segment 是原地改写的同一对象
+    r.on_update(lambda s: updates.append(s.translation))
+    r.on_status(lambda m: None)
+
+    r.start("快流会议")
+    try:
+        assert _wait_until(lambda: r.store.segments()
+                           and r.store.segments()[0].translation == "0123456789"), "译文未完成"
+        # 首块必刷 + 尾块必刷 → 至少 2 次；10 块全发说明没节流
+        assert 2 <= len(updates) < 10, f"节流失效：{len(updates)} 次通知 / 10 块"
+        # 末次必刷：面板拿到的是完整译文（不是被节流挡住的倒数第二块）
+        assert updates[-1] == "0123456789"
+        assert r.store.segments()[0].translation == "0123456789"
+        assert tr.stream_calls == 1                 # worker 只流一次，没退回非流式
+        assert tr.translate_calls == 0
+    finally:
+        r.stop()
+
+
+def test_streaming_updates_every_chunk_when_slow(monkeypatch):
+    """慢流：块间隔 > 0.25s → 每块都通知（字幕看起来就是逐字冒出）。"""
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    tr = FakeTranslatorStreamChunks(chunks="0123", delay=0.3)
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASR(),
+                 translator=tr, diarizer=None)
+    updates = []          # 回调里立刻快照译文（同一 Segment 对象会被原地改写）
+    r.on_update(lambda s: updates.append(s.translation))
+    r.on_status(lambda m: None)
+
+    r.start("慢流会议")
+    try:
+        assert _wait_until(lambda: r.store.segments()
+                           and r.store.segments()[0].translation == "0123",
+                           timeout=10), "译文未完成"
+        # 每块间隔 0.3s > 0.25s 节流阈值 → 每块都通知，逐字上屏逐字可见
+        assert updates == ["0", "01", "012", "0123"]
+    finally:
+        r.stop()
+
+
+def test_stream_failure_reverts_to_original_then_backfill(monkeypatch):
+    """流中断 → 译文清空（面板退回原文）+ 既有告警；stop() 补译补上最终译文。
+
+    变异自查点：去掉 _stream_translate 的「回退时清空」→ seg.translation 停在半句
+    「你好」，stop() 会认为「已有译文」跳过补译 → 断言失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    tr = FakeTranslatorStreamBreaks()
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASR(),
+                 translator=tr, diarizer=None)
+    updates = []          # 回调里立刻快照译文（同一 Segment 对象会被原地改写）
+    statuses = []
+    r.on_update(lambda s: updates.append(s.translation))
+    r.on_status(statuses.append)
+
+    r.start("流中断会议")
+    try:
+        assert _wait_until(lambda: any("翻译失败" in m for m in statuses),
+                           timeout=10), "未观察到流中断告警"
+        seg = r.store.segments()[0]
+        assert seg.translation == "", "流中断后译文必须清空（否则字幕停在残句）"
+        # 半句确实上过屏（流式正常路径），随后被回退通知覆盖为空。
+        # 只断言首块：第 2 块「你好」落在节流窗口内（未通知），回退通知已把它抹掉。
+        assert updates[0] == "你"
+        assert updates[-1] == ""
+    finally:
+        r.stop()                                    # 收尾补译（非流式）
+    assert r.store.segments()[0].translation == "你好世界"
+    assert updates[-1] == "你好世界"                  # 面板拿到最终译文
+    assert tr.translate_calls == 1
+
+
+# ---------------------------------------------------------------------------
 # 修复轮 2：diarize 滑动窗口 + 重叠区标签映射（消除 O(T²) 全量重算）
 # ---------------------------------------------------------------------------
 
@@ -627,6 +780,8 @@ class FakeTranslatorUnexpectedErrorOnce:
     def __init__(self):
         self.calls = 0
 
+    translate_stream = _stream_via_translate
+
     def translate(self, text, lang=""):
         self.calls += 1
         if self.calls == 1:
@@ -745,6 +900,8 @@ class FakeTranslatorBlocking:
         self.calls = 0
         self.first_started = threading.Event()
         self._lock = threading.Lock()
+
+    translate_stream = _stream_via_translate
 
     def translate(self, text, lang=""):
         with self._lock:
@@ -1078,6 +1235,8 @@ class FakeTranslatorChoicesNone:
 
     def __init__(self):
         self.calls = 0
+
+    translate_stream = _stream_via_translate
 
     def translate(self, text, lang=""):
         self.calls += 1
@@ -1894,6 +2053,8 @@ class FakeTranslatorGated:
         self.calls = 0
         self.started = threading.Event()      # 已进入第一次 translate
         self.release = threading.Event()      # 测试放行：translate 此刻才返回
+
+    translate_stream = _stream_via_translate
 
     def translate(self, text, lang=""):
         self.calls += 1

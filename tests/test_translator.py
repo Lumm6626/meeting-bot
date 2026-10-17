@@ -76,6 +76,151 @@ def test_thinking_disable_falls_back_on_400(monkeypatch):
     assert "extra_body" not in calls[1]
 
 
+# ---------------------------------------------------------------------------
+# 流式翻译（translate_stream）
+# ---------------------------------------------------------------------------
+
+class FakeDelta:
+    """流式 delta：content 与 reasoning_content 是两条独立通道。"""
+
+    def __init__(self, content=None, reasoning=None):
+        self.content = content
+        if reasoning is not None:
+            self.reasoning_content = reasoning
+
+
+class FakeStreamChoice:
+    def __init__(self, delta):
+        self.delta = delta
+
+
+class FakeStreamChunk:
+    def __init__(self, delta):
+        self.choices = [FakeStreamChoice(delta)]
+
+
+def _content_chunk(text):
+    return FakeStreamChunk(FakeDelta(content=text))
+
+
+def _reasoning_chunk(text):
+    """thinking 未禁用时接口先流的 reasoning 块（实测 144 块）。"""
+    return FakeStreamChunk(FakeDelta(content=None, reasoning=text))
+
+
+def test_translate_stream_accumulates(monkeypatch):
+    """每次 yield 的是**累积**译文（不是增量）→ 面板可以拿它原地替换同一句。"""
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+        return [_content_chunk("沙特"), _content_chunk("阿拉伯"), _content_chunk("市场")]
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    t._thinking_disabled_ok = None
+    assert list(t.translate_stream("Saudi Arabia market", "en")) == [
+        "沙特", "沙特阿拉伯", "沙特阿拉伯市场"]
+    # 流式请求必须显式 stream=True，且首次就带 thinking 禁用（否则白等 144 块推理）
+    assert calls[0]["stream"] is True
+    assert calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert calls[0]["max_tokens"] == 512
+
+
+def test_translate_stream_skips_reasoning(monkeypatch):
+    """delta.reasoning_content 一律跳过：思考过程绝不能混进译文。"""
+
+    def fake_create(self, **kwargs):
+        return [_reasoning_chunk("让我先想想"),
+                _reasoning_chunk("地名要保持原文"),
+                _content_chunk("沙特"),
+                _content_chunk("市场")]
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    t._thinking_disabled_ok = None
+    parts = list(t.translate_stream("Saudi market", "en"))
+    assert parts == ["沙特", "沙特市场"]          # 只有 content 触发了 yield
+    assert "想想" not in "".join(parts)
+    assert "地名" not in "".join(parts)
+
+
+def test_translate_stream_empty_raises(monkeypatch):
+    """流正常结束但 content 全空（只有 reasoning / 空串）→ TranslationError。"""
+
+    def fake_create(self, **kwargs):
+        return [_reasoning_chunk("只有思考没有答案"), _content_chunk(""), _content_chunk(None)]
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    t._thinking_disabled_ok = None
+    with pytest.raises(TranslationError) as excinfo:
+        list(t.translate_stream("hello", "en"))
+    assert "空内容" in str(excinfo.value)
+
+
+def test_translate_stream_connection_error_retries(monkeypatch):
+    """create 调用抛 APIError（接口不认 thinking）→ 降级重试一次并成功。"""
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+        if "extra_body" in kwargs:
+            raise openai.APIError("unsupported parameter", request=None, body=None)
+        return [_content_chunk("沙特"), _content_chunk("市场")]
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    t._thinking_disabled_ok = None
+    assert list(t.translate_stream("Saudi market", "en")) == ["沙特", "沙特市场"]
+    assert len(calls) == 2
+    assert "extra_body" not in calls[1]          # 第二次降级为普通请求
+    assert calls[1]["stream"] is True
+    assert t._thinking_disabled_ok is False      # 状态位复用：后续请求不再带 thinking
+
+
+def test_translate_stream_midstream_error_no_retry(monkeypatch):
+    """流中途断开不重试（半句已上屏，重试会重放前缀）→ 抛 TranslationError。"""
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+
+        def _broken_stream():
+            yield _content_chunk("沙特")
+            raise openai.APIError("connection reset", request=None, body=None)
+
+        return _broken_stream()
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    t._thinking_disabled_ok = False              # 跳过降级路径，只看流中断语义
+    got = []
+    with pytest.raises(TranslationError) as excinfo:
+        for part in t.translate_stream("Saudi market", "en"):
+            got.append(part)
+    assert got == ["沙特"]                        # 已产出的部分由调用方决定去留
+    assert len(calls) == 1                        # 未重试
+    assert "流中断" in str(excinfo.value)
+
+
+def test_system_translate_prompt_covers_meeting_context(monkeypatch):
+    """提示词升级：会议语境 + 识别错字/医学术语/数字/品牌名四条要求必须在系统提示里。"""
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse("ok")
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    t.translate("hello", "en")
+    system = calls[0]["messages"][0]["content"]
+    assert "只输出译文" in system                 # 核心要求不得退化
+    for keyword in ("医疗", "识别错字", "医学术语", "数字、比例、金额、日期", "品牌名"):
+        assert keyword in system, keyword
+
+
 def test_parse_minutes_valid_json():
     raw = ('{"title": "周会", "summary": "讨论了产品发布", "key_points": ["定价"],'
     '"decisions": ["下月发布"], "action_items": [{"task": "写方案", "owner": "张三", "due": "10/20"}],'

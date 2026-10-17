@@ -31,6 +31,7 @@ PRODUCER_DONE_TIMEOUT = 10.0  # stop() 等主循环完成尾部 flush 的上限
 TRANSLATE_DRAIN_TIMEOUT = 20.0  # stop() 等翻译 worker 排空退出的上限
 TRANSLATE_POLL_TIMEOUT = 0.5  # 翻译 worker 队列轮询间隔
 BACKFILL_MAX_CONSECUTIVE_FAILS = 3  # stop() 补译连续失败上限（超过则放弃补译，防无界重试）
+STREAM_RERENDER_INTERVAL = 0.25  # 流式译文重绘节流（秒）：太密会淹没 Qt 事件循环，太疏则看不出「逐字」
 ASR_BATCH_SECONDS = 30.0      # 攒够 30 秒音频触发一批识别
 ASR_BATCH_MAX_WAIT = 35.0     # 静默会议兜底：最老语句积压 35 秒墙钟也强制识别
 ASR_POLL_TIMEOUT = 0.5        # 识别 worker 轮询间隔（无新语句也要醒来查 max-wait）
@@ -423,6 +424,42 @@ class Recorder:
             if self._translator:
                 self._translate_queue.put(seg)
 
+    def _stream_translate(self, seg: Segment) -> None:
+        """流式翻译一条语句：译文逐字上屏，节流刷新，末次必刷。
+
+        为什么要节流：deepseek-v4-pro 流式约 20~60 块/句，每块都推一次 Qt 重绘
+        会把事件循环刷满（面板卡顿、丢字），而 0.25s 一次人眼已看不出停顿。
+
+        为什么「末次必刷」：最后一块往往落在节流窗口内被跳过，不补一次的话面板
+        会停在倒数第二块 —— 字幕缺尾巴，且 store 里是全量译文、屏幕上是残句。
+
+        流中断（TranslationError 等）：半句译文可能已经上屏，必须清空并再通知一次，
+        让面板退回原文；否则屏幕上留着一段永远补不上的残句（会议纪要里是空译文，
+        两边不一致）。
+
+        已知取舍：若流卡死到 stop() 等满 TRANSLATE_DRAIN_TIMEOUT，store 里可能留下
+        半句译文（面板看到的也是半句 —— 两边一致）。此时不再补译：补译会对同一个
+        已卡住的接口再发一次请求，且有第二个写者覆盖 seg.translation。原文始终在
+        store 里，纪要上下文不缺。
+        """
+        last_at = 0.0
+        last_text = ""
+        try:
+            for partial in self._translator.translate_stream(seg.text, seg.lang):
+                seg.translation = partial
+                now = time.monotonic()
+                if now - last_at >= STREAM_RERENDER_INTERVAL:
+                    last_at = now
+                    last_text = partial
+                    self._notify_update(seg)
+        except Exception:
+            if seg.translation:
+                seg.translation = ""
+                self._notify_update(seg)   # 回退：面板回到原文显示
+            raise
+        if seg.translation and seg.translation != last_text:
+            self._notify_update(seg)       # 末次必刷（尾块被节流挡掉时）
+
     def _translate_worker(self) -> None:
         try:
             # producer-done 模式：只认「生产者完结 + 队列排空」才退出。
@@ -440,8 +477,13 @@ class Recorder:
                 try:
                     if seg.lang == "zh":
                         seg.translation = seg.text
+                        # 中文段无需翻译：一次通知即完成第二阶段（没有流可节流）
+                        if seg.translation:
+                            self._notify_update(seg)
                     else:
-                        seg.translation = self._translator.translate(seg.text, seg.lang)
+                        # 非中文段走流式：译文逐字上屏（_stream_translate 内部负责
+                        # 节流刷新、末次必刷、流中断时把半句回退成原文）
+                        self._stream_translate(seg)
                 except TranslationError:
                     seg.translation = ""   # 会议结束后统一补译
                     self._say(f"[警告] 翻译失败（{seg.text[:20]}…），已保留原文")
@@ -450,11 +492,6 @@ class Recorder:
                     # 否则后续语句只入库、永不翻译、永不 emit（审查 N2）。
                     seg.translation = ""
                     self._say(f"[警告] 翻译异常（{seg.text[:20]}…）：{e}，已保留原文")
-                if seg.translation:
-                    # 第二阶段：译文已填充 → 走「原地更新」通道。
-                    # 不再 _emit_once：原文阶段已经发过（会被去重挡掉），语义上也不该
-                    # 再发一次「原文」事件。翻译失败时原文已在屏上，无需通知。
-                    self._notify_update(seg)
         finally:
             self._worker_done.set()
 
