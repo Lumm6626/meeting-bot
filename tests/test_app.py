@@ -34,9 +34,9 @@ WIDGETS = ("title_input", "status", "start_btn", "stop_btn", "speaker_table")
 # 基础设施
 # ---------------------------------------------------------------------------
 
-def _settings(tmp_path) -> Settings:
+def _settings(tmp_path, audio_source: str = "both") -> Settings:
     return Settings("https://example.invalid/v1", "sk-fake", "m1", "m2", "medium",
-                    "", tmp_path / "会议记录", tmp_path)
+                    "", tmp_path / "会议记录", tmp_path, audio_source=audio_source)
 
 
 @pytest.fixture(scope="module")
@@ -337,7 +337,7 @@ def test_close_event_does_not_block_gui_thread(win, qapp, dialogs):
 
 
 # ---------------------------------------------------------------------------
-# d. 音频源下拉：默认/禁用恢复 + 设备探测（离屏，无真实设备）
+# d. 音频源自动模式：无 UI 选择，_probe_capture/_start 统一取 settings.audio_source
 # ---------------------------------------------------------------------------
 
 class _FakeProbeCapture:
@@ -385,7 +385,7 @@ def _install_fake_stack(monkeypatch):
     """把 _start 的重型依赖全部换成离屏替身，返回记录容器。"""
     made = {"capture": [], "recorder": []}
 
-    def _capture_factory(source="speaker", sample_rate=16000):
+    def _capture_factory(source="both", sample_rate=16000):
         cap = _FakeProbeCapture(source=source, sample_rate=sample_rate)
         made["capture"].append(cap)
         return cap
@@ -403,40 +403,66 @@ def _install_fake_stack(monkeypatch):
     return made
 
 
-def test_source_combo_defaults_to_speaker(win):
-    """默认扬声器（线上会议）：老用户点开就能用，不必先改下拉。"""
-    assert win.source_combo.count() == 2
-    assert win.source_combo.itemText(0) == "扬声器（线上会议）"
-    assert win.source_combo.itemText(1) == "麦克风（现场对话）"
-    assert win.source_combo.currentData() == "speaker"
-    assert win.source_combo.itemData(1) == "mic"
-    assert win.source_combo.isEnabled()
+def test_no_audio_source_combo(win):
+    """开箱即用：窗口里不再有音频源下拉（自动模式，线上/线下不用手动切换）。"""
+    assert not hasattr(win, "source_combo"), "音频源下拉应已删除"
+    assert win.title_input is not None
 
 
-def test_source_combo_disables_during_recording(win, dialogs, monkeypatch):
-    """选「麦克风」→ _start 把它传给 Recorder（复用探测实例）并锁住下拉，收尾后恢复。"""
+def _make_win(qapp, tmp_path, audio_source):
+    w = MainWindow(_settings(tmp_path, audio_source=audio_source))
+    w._timer.stop()
+    return w
+
+
+def test_probe_capture_uses_settings_audio_source(qapp, tmp_path, monkeypatch):
+    """_probe_capture 按 settings.audio_source（.env 的 AUDIO_SOURCE）探测设备。"""
     made = _install_fake_stack(monkeypatch)
+    w = _make_win(qapp, tmp_path, "mic")
+    try:
+        cap = w._probe_capture()
+        assert cap is not None
+        assert made["capture"][0].source == "mic", "探测用的不是 .env 配置的音频源"
+    finally:
+        w.recorder = None
+        w.hide()
 
-    win.source_combo.setCurrentIndex(1)
-    assert win.source_combo.currentData() == "mic"
 
-    win._start()
+def test_probe_capture_defaults_to_both(qapp, tmp_path, monkeypatch):
+    """默认值 both：老 .env 没写 AUDIO_SOURCE 时走自动双路。"""
+    made = _install_fake_stack(monkeypatch)
+    w = _make_win(qapp, tmp_path, "both")
+    try:
+        w._probe_capture()
+        assert made["capture"][0].source == "both"
+    finally:
+        w.recorder = None
+        w.hide()
 
-    assert made["capture"], "未做设备探测（构造 AudioCapture）"
-    assert made["capture"][0].source == "mic", "探测用的不是下拉选中的音频源"
-    rec = made["recorder"][0]
-    assert rec.audio_source == "mic"
-    assert rec.capture is made["capture"][0], "探测实例未被复用（会在录制时再开一次设备）"
-    assert rec.handlers, "片段/状态回调未挂到 bridge"
 
-    # 录制中：下拉锁定，避免用户以为中途切换能生效
-    assert not win.source_combo.isEnabled()
-    assert not win.start_btn.isEnabled()
+def test_start_forwards_audio_source_and_reuses_probed_capture(qapp, tmp_path, monkeypatch):
+    """_start 把同一 audio_source 传给 Recorder，并复用探测实例（不再开第二次设备）。"""
+    made = _install_fake_stack(monkeypatch)
+    # _on_finished(True) 会弹模态框，离屏环境必须静音弹窗
+    monkeypatch.setattr(appmod.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(appmod.QMessageBox, "critical", lambda *a, **k: None)
+    w = _make_win(qapp, tmp_path, "speaker")
+    try:
+        w._start()
 
-    # 收尾：恢复可编辑（否则下一次录制只能继续用上次的源）
-    win._on_finished(True, "已生成")
-    assert win.source_combo.isEnabled()
-    assert win.start_btn.isEnabled()
+        assert made["capture"], "未做设备探测（构造 AudioCapture）"
+        assert made["capture"][0].source == "speaker"
+        rec = made["recorder"][0]
+        assert rec.audio_source == "speaker"
+        assert rec.capture is made["capture"][0], "探测实例未被复用（会在录制时再开一次设备）"
+        assert rec.handlers, "片段/状态回调未挂到 bridge"
+        assert not w.start_btn.isEnabled()
+
+        w._on_finished(True, "已生成")
+        assert w.start_btn.isEnabled()
+    finally:
+        w.recorder = None
+        w.hide()
 
 
 def test_probe_capture_reports_failure_without_recording(win, dialogs, monkeypatch):
@@ -447,7 +473,6 @@ def test_probe_capture_reports_failure_without_recording(win, dialogs, monkeypat
         raise appmod.CaptureError("no such device")
 
     monkeypatch.setattr(appmod, "AudioCapture", _boom)
-    win.source_combo.setCurrentIndex(1)
 
     assert win._probe_capture() is None
     assert recorded[-1][0] == "crit"
@@ -457,4 +482,3 @@ def test_probe_capture_reports_failure_without_recording(win, dialogs, monkeypat
     win._start()
     assert win.recorder is None
     assert win.start_btn.isEnabled()
-    assert win.source_combo.isEnabled()

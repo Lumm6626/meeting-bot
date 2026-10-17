@@ -30,6 +30,8 @@ class Settings:
     # 以下两项带默认值，必须排在最后：既有代码用位置参数构造 Settings
     groq_api_key: str = ""
     asr_provider: str = "local"      # local（本地 faster-whisper）| groq（云端，低延迟）
+    # 音频源：both（默认，扬声器+麦克风混合）| speaker | mic；非法值由 capture 报错
+    audio_source: str = "both"
     # 本地模式攒批阈值：None = 用 recorder.py 里的模块默认值（30.0 / 35.0）
     asr_batch_seconds: float | None = None
     asr_batch_max_wait: float | None = None
@@ -94,6 +96,7 @@ def load_settings(env_path: Path | None = None) -> Settings:
         root=PROJECT_ROOT,
         groq_api_key=(os.getenv("GROQ_API_KEY") or "").strip(),
         asr_provider=provider,
+        audio_source=(os.getenv("AUDIO_SOURCE") or "both").strip().lower(),
         asr_batch_seconds=_float_env("ASR_BATCH_SECONDS"),
         asr_batch_max_wait=_float_env("ASR_BATCH_MAX_WAIT"),
     )

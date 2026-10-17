@@ -7,11 +7,11 @@ import threading
 from datetime import datetime
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit,
-                             QMainWindow, QMessageBox, QPushButton, QTableWidget,
-                             QTableWidgetItem, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+                             QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+                             QVBoxLayout, QWidget)
 
-from .capture import SOURCE_MIC, SOURCE_SPEAKER, AudioCapture, CaptureError
+from .capture import AudioCapture, CaptureError
 from .config import ConfigError, Settings, load_settings
 from .diarization import Diarizer, DiarizationError
 from .export import export_all
@@ -50,16 +50,6 @@ class MainWindow(QMainWindow):
         central = QWidget()
         lay = QVBoxLayout(central)
 
-        # 音频源：线上会议截扬声器（loopback），面对面用麦克风。
-        # itemData 存 AudioCapture 的 source 取值，UI 文案与协议值解耦。
-        self.source_combo = QComboBox()
-        self.source_combo.addItem("扬声器（线上会议）", SOURCE_SPEAKER)
-        self.source_combo.addItem("麦克风（现场对话）", SOURCE_MIC)
-        self.source_combo.setToolTip(
-            "扬声器：截取系统播放的声音（Teams 等线上会议）\n"
-            "麦克风：采集现场对话（会录到你自己的声音）")
-        lay.addWidget(self.source_combo)
-
         self.title_input = QLineEdit()
         self.title_input.setPlaceholderText("会议名称（用于文件命名，可留空）")
         lay.addWidget(self.title_input)
@@ -91,13 +81,13 @@ class MainWindow(QMainWindow):
         self._timer.start(5000)
 
     def _probe_capture(self) -> AudioCapture | None:
-        """按当前下拉选中的音频源探测一次设备，成功返回可复用的捕获实例。
+        """按 .env 的 AUDIO_SOURCE（默认 both）探测一次设备，成功返回可复用的实例。
 
         构造 ``AudioCapture`` 只解析设备、不打开音频流，因此探测不会占住设备；
         实例直接交给 ``Recorder`` 复用，避免「录到一半才发现设备不可用」。
         设备不可用（被占用 / 无麦克风 / 无 WASAPI）→ 弹框并返回 ``None``。
         """
-        source = self.source_combo.currentData() or SOURCE_SPEAKER
+        source = getattr(self.settings, "audio_source", "both") or "both"
         try:
             return AudioCapture(source=source)
         except CaptureError as e:
@@ -127,13 +117,11 @@ class MainWindow(QMainWindow):
             diarizer = None
         self.recorder = Recorder(self.settings, capture=capture, translator=translator,
                                  diarizer=diarizer,
-                                 audio_source=self.source_combo.currentData())
+                                 audio_source=getattr(self.settings, "audio_source", "both"))
         self.recorder.on_segment(self.bridge.segment.emit)
         self.recorder.on_status(self.bridge.status.emit)
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        # 录制中锁住音频源：中途换设备没有意义（捕获已在跑），却会误导用户以为生效
-        self.source_combo.setEnabled(False)
         threading.Thread(
             target=self.recorder.start,
             args=(self.title_input.text().strip(),),
@@ -200,7 +188,6 @@ class MainWindow(QMainWindow):
     def _on_finished(self, ok: bool, msg: str):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.source_combo.setEnabled(True)
         self.status.setText("完成" if ok else "导出失败")
         if ok:
             QMessageBox.information(self, "完成", msg)
@@ -248,7 +235,6 @@ class MainWindow(QMainWindow):
         """
         self._closing = False
         self.start_btn.setEnabled(True)
-        self.source_combo.setEnabled(True)
         self.close()
 
 
