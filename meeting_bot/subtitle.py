@@ -4,8 +4,10 @@
 设计要点（对外接口只有 ``SubtitleWindow()`` 与 ``show_segment(seg, name)``，
 app.py 依赖这两条，不可变更）：
 
-* 追加式历史：每条语音一条记录（时间+说话人 / 译文 / 原文+语种），
-  最多保留 ``MAX_ENTRIES`` 条，超出丢弃最旧；
+* 回合分块历史（Teams 转录风）：同一说话人连续说的话合成一个「回合块」——
+  头行时间+说话人、正文为回合内各句译文逐行拼接、副标签为各句原文+语种；
+  换人（声纹标签变化）或停顿超过 ``TURN_GAP_SECONDS`` 才开新块；同回合追加
+  语句时原地更新该块（不新增条目）；最多保留 ``MAX_TURNS`` 个块，丢弃最旧；
 * 自动跟随：停在底部时新记录自动滚到底；用户向上翻看时暂停，滚回底部恢复；
 * 自由拉伸：无边框窗口自绘圆角黑底，8px 边缘/四角命中即改光标拖拽缩放；
   非边缘区域按住左键移动窗口（沿用原实现）；
@@ -34,7 +36,9 @@ COLOR_MAIN = "#FFFFFF"      # 译文（主字号）
 COLOR_SUB = "#B0BEC5"       # 原文 + 语种
 COLOR_ZOOM = "#90A4AE"      # 角落倍率提示
 
-MAX_ENTRIES = 60            # 历史条数上限
+TURN_GAP_SECONDS = 2.0      # 相邻语句起始时间间隔上限，超过即视为新回合（新块）
+MAX_TURNS = 60              # 历史回合块上限（一个回合 = 一个条目块）
+MAX_ENTRIES = MAX_TURNS     # 兼容旧命名（历史上限，现按回合块计数）
 MIN_W, MIN_H = 320, 200     # 最小窗口尺寸
 EDGE = 8                    # 边缘拖拽判定宽度（px）
 ZOOM_MIN, ZOOM_MAX = 0.6, 2.2
@@ -67,26 +71,27 @@ _CURSORS = {
 
 
 class SubtitleEntry(QWidget):
-    """一条转录记录：时间+说话人（小号蓝）/ 正文（主字号白）/ 原文+语种（小号灰）。"""
+    """一个「说话回合」块。
+
+    头行（小号蓝）：回合首句时间 + 说话人；
+    主标签（主字号白）：回合内各句译文逐行拼接，译文缺失的句子用原文顶上；
+    副标签（小号灰）：回合内各句原文（带 (语种) 前缀）逐行拼接——某句译文与
+    原文完全一致（或该句无译文）时，原文已在主标签可见，不再重复进副标签；
+    副标签整体为空时整行隐藏。
+
+    同回合追加语句走 :meth:`add_segment`，原地重建标签文本，控件数量不变。
+    """
 
     def __init__(self, seg: Segment, display_name: str, parent: QWidget | None = None):
         super().__init__(parent)
-        # 整条记录不吃鼠标：点击穿透给容器，由窗口统一做移动/缩放
+        # 整块不吃鼠标：点击穿透给容器，由窗口统一做移动/缩放
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.meta = QLabel(f"{fmt_ts(seg.start)}  {display_name}")
+        self.display_name = display_name
+        self.segments: list[Segment] = []
 
-        main_text = seg.translation or seg.text
-        self.main = QLabel(main_text)
-
-        # 译文与原文相同（或没有译文）时，第三行没有信息量，省略
-        show_sub = bool(seg.translation) and seg.translation.strip() != seg.text.strip()
-        if show_sub:
-            lang_part = f"({seg.lang}) " if seg.lang else ""
-            self.sub = QLabel(f"{lang_part}{seg.text}")
-        else:
-            self.sub = QLabel("")
-        self.sub.setVisible(show_sub)
-
+        self.meta = QLabel("")
+        self.main = QLabel("")
+        self.sub = QLabel("")
         for w in (self.meta, self.main, self.sub):
             w.setWordWrap(True)
             w.setTextFormat(Qt.TextFormat.PlainText)
@@ -102,11 +107,45 @@ class SubtitleEntry(QWidget):
         lay.setSpacing(2)
         lay.addWidget(self.meta)
         lay.addWidget(self.main)
-        if show_sub:
-            # 只有需要时才进布局：布局会把子控件 show() 出来，藏在布局里不保险
-            lay.addWidget(self.sub)
-        else:
-            self.sub.hide()
+        lay.addWidget(self.sub)
+        # 副标签常驻布局、按内容显隐：回合内句子增加后可能需要重新显示
+        self.sub.hide()
+        self.add_segment(seg)
+
+    # ------------------------------------------------------------------ 内容
+    @property
+    def first(self) -> Segment:
+        """回合首句（头行时间取它）。"""
+        return self.segments[0]
+
+    @property
+    def speaker(self) -> str:
+        """回合内首个非空声纹标签，没有则空串。"""
+        for s in self.segments:
+            if s.speaker:
+                return s.speaker
+        return ""
+
+    def add_segment(self, seg: Segment) -> None:
+        """把一条语句并入本回合（顺序追加），原地刷新三个标签。"""
+        self.segments.append(seg)
+        if len(self.segments) == 1:
+            self.meta.setText(f"{fmt_ts(seg.start)}  {self.display_name}")
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        mains: list[str] = []
+        subs: list[str] = []
+        for s in self.segments:
+            tr = (s.translation or "").strip()
+            txt = (s.text or "").strip()
+            mains.append(tr or txt)             # 译文缺失 → 原文顶上主标签
+            if tr and tr != txt:                # 译文==原文时原文已在主标签，不重复
+                lang_part = f"({s.lang}) " if s.lang else ""
+                subs.append(f"{lang_part}{s.text}")
+        self.main.setText("\n".join(mains))
+        self.sub.setText("\n".join(subs))
+        self.sub.setVisible(bool(subs))
 
     def set_sizes(self, main_pt: int) -> None:
         """主字号 ``main_pt``；小号行取 0.72 倍（下限 9pt）。"""
@@ -132,7 +171,10 @@ class SubtitleWindow(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(MIN_W, MIN_H)     # 与拖拽缩放的最小尺寸保持一致
 
-        self._entries: list[SubtitleEntry] = []
+        self._entries: list[SubtitleEntry] = []      # 回合块（旧 -> 新）
+        self._current_turn: list[Segment] = []       # 当前未关闭回合的语句
+        self._current_block: SubtitleEntry | None = None
+        self._current_speaker = ""                   # 当前回合的声纹标签（可能为空）
         self._zoom = 1.0
         self._auto_scroll = True          # 停在底部 → True，用户向上翻看 → False
         self._op: str | None = None       # "move" / "resize"
@@ -211,8 +253,8 @@ class SubtitleWindow(QWidget):
 
     # ------------------------------------------------------------ 对外接口
     def show_segment(self, seg: Segment, display_name: str):
-        """追加一条记录并（在自动跟随模式下）滚到底部。"""
-        self._append(seg, display_name)
+        """把一条语句并入当前回合（必要时新开一个回合块）并滚到底部。"""
+        self._merge_into_turn(seg, display_name)
         if not self.isVisible():
             self.show()
         self.raise_()
@@ -221,8 +263,13 @@ class SubtitleWindow(QWidget):
 
     # ------------------------------------------------------------ 测试辅助
     def entries(self) -> list[SubtitleEntry]:
-        """按时间顺序（旧 → 新）返回当前保留的记录。"""
+        """按时间顺序（旧 → 新）返回当前保留的回合块。"""
         return list(self._entries)
+
+    @property
+    def current_turn(self) -> list[Segment]:
+        """当前未关闭回合里的语句（副本）。"""
+        return list(self._current_turn)
 
     def scroll_bar(self):
         return self.scroll.verticalScrollBar()
@@ -249,21 +296,55 @@ class SubtitleWindow(QWidget):
             self._apply_fonts()
         self._show_zoom_badge()
 
-    # ------------------------------------------------------------ 记录管理
-    def _append(self, seg: Segment, display_name: str) -> None:
+    # -------------------------------------------------------- 回合归并/分块
+    def _merge_into_turn(self, seg: Segment, display_name: str) -> None:
+        """同回合 → 原地追加；停顿或换人 → 关闭当前回合、开新块。"""
+        if self._current_block is not None and self._same_turn(seg):
+            self._current_block.add_segment(seg)
+            self._current_turn.append(seg)
+            if not self._current_speaker and seg.speaker:
+                # 说话人标签延迟出现（pyannote 滑窗打标后才有）→ 归入本回合并记住
+                self._current_speaker = seg.speaker
+            return
+        self._start_turn(seg, display_name)
+
+    def _same_turn(self, seg: Segment) -> bool:
+        """新语句是否属于当前回合。"""
+        if not self._current_turn:
+            return False
+        last = self._current_turn[-1]
+        # 间隔按「起始时间差」判定：VAD/声纹切出的语句常首尾相接甚至重叠，
+        # 用上一句 end 到本句 start 的空隙判定会永远合并，识别不出停顿。
+        if abs(seg.start - last.start) > TURN_GAP_SECONDS:
+            return False
+        # 只有两边都有声纹标签且不同才算换人；标签为空（未配 HF token 的现状）
+        # 时只按时间间隔分块。
+        if seg.speaker and self._current_speaker and seg.speaker != self._current_speaker:
+            return False
+        return True
+
+    def _start_turn(self, seg: Segment, display_name: str) -> None:
+        self._current_turn = [seg]
+        self._current_speaker = seg.speaker
+        self._current_block = self._add_block(seg, display_name)
+
+    # -------------------------------------------------------------- 块管理
+    def _add_block(self, seg: Segment, display_name: str) -> SubtitleEntry:
         entry = SubtitleEntry(seg, display_name, self._container)
         entry.set_sizes(self.current_font_size())
         for w in (entry, entry.meta, entry.main, entry.sub):
             w.installEventFilter(self)
         self._entries_layout.insertWidget(self._entries_layout.count() - 1, entry)
         self._entries.append(entry)
-        while len(self._entries) > MAX_ENTRIES:
+        # 当前回合块永远是最新的一块，裁剪只会淘汰更早的块
+        while len(self._entries) > MAX_TURNS:
             old = self._entries.pop(0)
             # 先 hide 再 deleteLater：removeWidget 后它在下一个事件循环前仍是可见子控件
             # （会闪一下）；不 setParent(None)，避免瞬时冒出一个顶层窗口
             old.hide()
             self._entries_layout.removeWidget(old)
             old.deleteLater()
+        return entry
 
     # -------------------------------------------------------------- 字号/滚动
     def _apply_fonts(self) -> None:
