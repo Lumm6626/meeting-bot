@@ -1132,3 +1132,39 @@ def test_diarize_keeps_running_after_trim(monkeypatch):
         r.stop()
         thread.join(timeout=5)
     assert not thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# 音频源：audio_source 只在「未注入 capture」时转发给 AudioCapture
+# ---------------------------------------------------------------------------
+
+def test_audio_source_forwarded_to_capture(monkeypatch):
+    """Recorder(settings, audio_source="mic") → AudioCapture(source="mic")。
+
+    默认值必须是 speaker（线上会议既有行为不变）；显式注入 capture 时不得
+    再构造 AudioCapture —— 上层已探测可用设备并复用它，重复构造会白打开一次设备。
+    """
+    created: list[dict] = []
+
+    class _SpyAudioCapture:
+        def __init__(self, *args, **kwargs):
+            created.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr("meeting_bot.recorder.AudioCapture", _SpyAudioCapture)
+
+    # 1) 显式 mic
+    Recorder(_settings(), audio_source="mic")
+    assert created[-1]["kwargs"] == {"source": "mic"}
+    assert created[-1]["args"] == ()
+
+    # 2) 不传：默认走扬声器 loopback
+    Recorder(_settings())
+    assert created[-1]["kwargs"] == {"source": "speaker"}
+
+    # 3) 显式注入 capture：audio_source 被忽略，不再构造新捕获
+    before = len(created)
+    injected = FakeCapture()
+    r = Recorder(_settings(), capture=injected, audio_source="mic")
+    assert len(created) == before, "注入 capture 时不应构造 AudioCapture"
+    assert r._capture is injected
+    assert r._audio_source == "mic"      # 参数仍记录（便于诊断），但不生效

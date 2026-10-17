@@ -219,3 +219,107 @@ def test_dropped_chunks_counted_when_queue_full(monkeypatch):
 
     assert cap._queue.qsize() <= 100
     assert dropped > 0, "队列满丢块未被计数"
+
+
+# ---------------------------------------------------------------------------
+# 音频源选择：speaker（loopback）/ mic（默认麦克风）
+# ---------------------------------------------------------------------------
+
+def _install_source_spies(monkeypatch, device):
+    """把 sc 的三个设备入口换成记录调用的桩，返回 calls 列表。"""
+    calls: list[tuple[str, dict]] = []
+
+    def _speaker():
+        calls.append(("default_speaker", {}))
+        return _FakeSpeaker()
+
+    def _mic():
+        calls.append(("default_microphone", {}))
+        return device
+
+    def _get_mic(id=None, include_loopback=False):
+        calls.append(("get_microphone", {"id": id, "include_loopback": include_loopback}))
+        return device
+
+    monkeypatch.setattr(capture_mod.sc, "default_speaker", _speaker)
+    monkeypatch.setattr(capture_mod.sc, "default_microphone", _mic)
+    monkeypatch.setattr(capture_mod.sc, "get_microphone", _get_mic)
+    return calls
+
+
+class _FakeDevice:
+    """带 recorder() 的假设备（麦克风分支走 default_microphone 直接返回）。"""
+
+    def __init__(self, recorder_factory):
+        self._factory = recorder_factory
+
+    def recorder(self, samplerate=16000, channels=1):
+        return self._factory()
+
+
+def test_mic_source_uses_default_microphone(monkeypatch):
+    """source="mic" 只走 default_microphone：不带 loopback，不碰 get_microphone。
+
+    变异自查点：把 mic 分支写回 default_speaker + include_loopback=True →
+    default_microphone 不被调用、get_microphone 被调用 → 本用例失败。
+    """
+    calls = _install_source_spies(monkeypatch, _FakeDevice(lambda: _FastRecorder()))
+    cap = AudioCapture(source="mic")
+
+    names = [c[0] for c in calls]
+    assert names == ["default_microphone"], f"麦克风模式设备调用序列异常：{names}"
+    assert cap.source == "mic"
+    assert cap.sample_rate == 16000
+
+
+def test_mic_source_actually_records_from_microphone(monkeypatch):
+    """麦克风模式同样跑通「启动 → 读块 → 停止」链路（复用同一队列/哨兵逻辑）。"""
+    rec = _FastRecorder()
+    _install_source_spies(monkeypatch, _FakeDevice(lambda: rec))
+    cap = AudioCapture(source="mic")
+    cap.start()
+    chunks = []
+    try:
+        for _ in range(2):
+            chunk = cap.read(timeout=2.0)
+            assert chunk is not None
+            chunks.append(chunk)
+    finally:
+        cap.stop()
+
+    assert rec.calls >= 2, "麦克风假设备未被 record()，采集线程没走 _device"
+    assert all(c.shape == (FRAMES,) and c.dtype == np.float32 for c in chunks)
+
+
+def test_speaker_source_keeps_loopback_path(monkeypatch):
+    """source="speaker"（默认）仍然：default_speaker → get_microphone(loopback=True)。"""
+    calls = _install_source_spies(monkeypatch, _FakeDevice(lambda: _FastRecorder()))
+    cap = AudioCapture()          # 不传 source：默认值必须是 speaker
+    assert cap.source == "speaker"
+
+    names = [c[0] for c in calls]
+    assert names == ["default_speaker", "get_microphone"], f"扬声器模式调用序列异常：{names}"
+    kwargs = calls[1][1]
+    assert kwargs["include_loopback"] is True
+    assert kwargs["id"] == "fake-speaker"
+
+
+@pytest.mark.parametrize("bad", ["microphone", "MIC", "", "loopback"])
+def test_invalid_source_raises_capture_error(monkeypatch, bad):
+    """非法 source 在碰设备之前就抛 CaptureError（早失败、无副作用）。"""
+    calls = _install_source_spies(monkeypatch, _FakeDevice(lambda: _FastRecorder()))
+    with pytest.raises(capture_mod.CaptureError, match="未知音频源"):
+        AudioCapture(source=bad)
+    assert calls == [], f"非法 source 不应探测设备，却发生了调用：{calls}"
+
+
+def test_device_resolution_failure_wrapped_as_capture_error(monkeypatch):
+    """设备解析抛异常（无麦克风 / 无 WASAPI）统一包成 CaptureError，供 UI 弹框。"""
+    _install_source_spies(monkeypatch, _FakeDevice(lambda: _FastRecorder()))
+
+    def _boom():
+        raise RuntimeError("no such device")
+
+    monkeypatch.setattr(capture_mod.sc, "default_microphone", _boom)
+    with pytest.raises(capture_mod.CaptureError, match="麦克风"):
+        AudioCapture(source="mic")

@@ -13,7 +13,7 @@ from typing import Callable
 import numpy as np
 
 from .asr import ASREngine
-from .capture import AudioCapture
+from .capture import SOURCE_SPEAKER, AudioCapture
 from .config import Settings
 from .diarization import Diarizer, assign_speakers
 from .transcript import Segment, TranscriptStore
@@ -74,9 +74,19 @@ class Recorder:
                  capture: AudioCapture | None = None,
                  asr: ASREngine | None = None,
                  translator: Translator | None = None,
-                 diarizer: Diarizer | None = None):
+                 diarizer: Diarizer | None = None,
+                 audio_source: str = SOURCE_SPEAKER):
+        """audio_source 只在 capture 为 None（自行建捕获）时生效：
+
+        - ``"speaker"``：系统扬声器 loopback（线上会议，默认）
+        - ``"mic"``：默认麦克风（现场对话）
+
+        显式注入 capture 时该参数被忽略 —— 上层（app.py）会先构造探测过的实例
+        再传进来，此处不再重复打开设备。
+        """
         self._settings = settings
-        self._capture = capture or AudioCapture()
+        self._audio_source = audio_source
+        self._capture = capture or AudioCapture(source=audio_source)
         self._asr = asr
         self._translator = translator
         self._diarizer = diarizer

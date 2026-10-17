@@ -334,3 +334,127 @@ def test_close_event_does_not_block_gui_thread(win, qapp, dialogs):
     released.set()
     assert _pump_until(qapp, lambda: recorder.stop_calls == 1 and not win._closing)
     assert win.close() is True
+
+
+# ---------------------------------------------------------------------------
+# d. 音频源下拉：默认/禁用恢复 + 设备探测（离屏，无真实设备）
+# ---------------------------------------------------------------------------
+
+class _FakeProbeCapture:
+    """AudioCapture 替身：只记录 source，不碰声卡。"""
+
+    def __init__(self, source="speaker", sample_rate=16000):
+        self.source = source
+        self.sample_rate = sample_rate
+        self.started = 0
+        self.stopped = 0
+
+    def start(self):
+        self.started += 1
+
+    def stop(self):
+        self.stopped += 1
+
+    def read(self, timeout=1.0):
+        return None
+
+
+class _FakeStartedRecorder:
+    """_start() 用的 Recorder 替身：记录构造参数，start() 立即返回（不起线程）。"""
+
+    def __init__(self, settings, capture=None, audio_source=None):
+        self.settings = settings
+        self.capture = capture
+        self.audio_source = audio_source
+        self.store = TranscriptStore()
+        self.title = ""
+        self.started_title = None
+        self.handlers = []
+
+    def on_segment(self, fn):
+        self.handlers.append(fn)
+
+    def on_status(self, fn):
+        self.handlers.append(fn)
+
+    def start(self, title=""):
+        self.started_title = title
+
+
+def _install_fake_stack(monkeypatch):
+    """把 _start 的重型依赖全部换成离屏替身，返回记录容器。"""
+    made = {"capture": [], "recorder": []}
+
+    def _capture_factory(source="speaker", sample_rate=16000):
+        cap = _FakeProbeCapture(source=source, sample_rate=sample_rate)
+        made["capture"].append(cap)
+        return cap
+
+    def _recorder_factory(settings, capture=None, asr=None, translator=None,
+                          diarizer=None, audio_source=None):
+        rec = _FakeStartedRecorder(settings, capture=capture, audio_source=audio_source)
+        made["recorder"].append(rec)
+        return rec
+
+    monkeypatch.setattr(appmod, "AudioCapture", _capture_factory)
+    monkeypatch.setattr(appmod, "Recorder", _recorder_factory)
+    monkeypatch.setattr(appmod, "Translator", lambda settings: object())
+    monkeypatch.setattr(appmod, "Diarizer", lambda settings: None)   # 无说话人，不影响录制
+    return made
+
+
+def test_source_combo_defaults_to_speaker(win):
+    """默认扬声器（线上会议）：老用户点开就能用，不必先改下拉。"""
+    assert win.source_combo.count() == 2
+    assert win.source_combo.itemText(0) == "扬声器（线上会议）"
+    assert win.source_combo.itemText(1) == "麦克风（现场对话）"
+    assert win.source_combo.currentData() == "speaker"
+    assert win.source_combo.itemData(1) == "mic"
+    assert win.source_combo.isEnabled()
+
+
+def test_source_combo_disables_during_recording(win, dialogs, monkeypatch):
+    """选「麦克风」→ _start 把它传给 Recorder（复用探测实例）并锁住下拉，收尾后恢复。"""
+    made = _install_fake_stack(monkeypatch)
+
+    win.source_combo.setCurrentIndex(1)
+    assert win.source_combo.currentData() == "mic"
+
+    win._start()
+
+    assert made["capture"], "未做设备探测（构造 AudioCapture）"
+    assert made["capture"][0].source == "mic", "探测用的不是下拉选中的音频源"
+    rec = made["recorder"][0]
+    assert rec.audio_source == "mic"
+    assert rec.capture is made["capture"][0], "探测实例未被复用（会在录制时再开一次设备）"
+    assert rec.handlers, "片段/状态回调未挂到 bridge"
+
+    # 录制中：下拉锁定，避免用户以为中途切换能生效
+    assert not win.source_combo.isEnabled()
+    assert not win.start_btn.isEnabled()
+
+    # 收尾：恢复可编辑（否则下一次录制只能继续用上次的源）
+    win._on_finished(True, "已生成")
+    assert win.source_combo.isEnabled()
+    assert win.start_btn.isEnabled()
+
+
+def test_probe_capture_reports_failure_without_recording(win, dialogs, monkeypatch):
+    """设备不可用：critical 弹框说明、返回 None、_start 直接放弃（recorder 保持 None）。"""
+    recorded, _ = dialogs
+
+    def _boom(source="speaker", sample_rate=16000):
+        raise appmod.CaptureError("no such device")
+
+    monkeypatch.setattr(appmod, "AudioCapture", _boom)
+    win.source_combo.setCurrentIndex(1)
+
+    assert win._probe_capture() is None
+    assert recorded[-1][0] == "crit"
+    assert "无法打开麦克风/扬声器捕获设备" in recorded[-1][2]
+
+    # _start 走同一探测：失败即返回，不留半启动状态
+    win._start()
+    assert win.recorder is None
+    assert win.start_btn.isEnabled()
+    assert win.source_combo.isEnabled()

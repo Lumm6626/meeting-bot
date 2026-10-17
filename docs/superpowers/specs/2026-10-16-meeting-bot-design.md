@@ -65,7 +65,7 @@
 | 翻译/纪要 | `meeting_bot/translator.py` | 调 OpenCode Go；实时翻译 + 纪要生成 | `Translator.translate()`, `.minutes()` |
 | 语音识别 | `meeting_bot/asr.py` | whisper 转写 + 语种检测 | `ASREngine.transcribe(audio) -> list[Segment]` |
 | 说话人 | `meeting_bot/diarization.py` | 声纹聚类 + 标注归属 | `Diarizer.label()`, `assign_speakers()` |
-| 音频捕获 | `meeting_bot/capture.py` | 系统声音 loopback 采集 | `AudioCapture`（后台线程，产出 16k 单声道块） |
+| 音频捕获 | `meeting_bot/capture.py` | 系统声音 loopback / 默认麦克风采集 | `AudioCapture(source="speaker"\|"mic")`（后台线程，产出 16k 单声道块） |
 | 语句切分 | `meeting_bot/vad.py` | VAD 边界切完整语句 | `UtteranceBuffer.push(chunk) -> list[np.ndarray]` |
 | 编排 | `meeting_bot/recorder.py` | 串起各模块的线程/队列/事件 | `Recorder(start/stop, on_segment, on_status)` |
 | 字幕浮窗 | `meeting_bot/subtitle.py` | 置顶浮窗显示 | `SubtitleWindow.show_segment(seg)` |
@@ -76,6 +76,7 @@
 ## 关键设计决策
 
 1. **音频来源**：WASAPI loopback 捕获系统扬声器输出（Teams 语音），无需虚拟声卡、无需会议改动。用户自己的发言不会被捕获（不影响，本人不需要看自己的翻译）。前提：Teams 扬声器输出走系统默认设备（README 说明）。
+   1.1 **音频源可切换**：扬声器 loopback（线上会议）/ 默认麦克风（现场对话），UI 下拉选择（`AudioCapture(source="speaker"|"mic")`，默认 speaker）。麦克风模式用于面对面场景，会录到用户本人声音（中文直接显示原文）；两种模式互斥，不开混音。Teams 会议必须用扬声器模式，否则扬声器声音回声进麦克风会被重复记录（README 警告）。设备在点「开始记录」时先探测一次，失败即弹框并放弃启动，避免录到一半才发现设备不可用。
 2. **语句切分**：silero-vad（onnx）在 16kHz 流上检测语音边界，按完整语句送识别，避免句子被切断。
 3. **说话人**：pyannote 3.1 在后台对最近 300 秒音频每 60 秒跑一次滑动窗口聚类，结果按时间重叠映射到语句；语句先以“发言人?”上屏，标注后更新。标注刷新周期约 1 分钟（首次标注约在录制 1 分钟后出现）。用户在说话人表格里给每个声纹改名，同一次会议内自动沿用。跨会议的声纹记忆（speakers.json）列为后续迭代（YAGNI）。
 4. **翻译延迟**：语句结束 → 识别（1~3s）→ 翻译（1~3s），字幕总延迟约 3~8 秒。可接受（本人旁听用途）。

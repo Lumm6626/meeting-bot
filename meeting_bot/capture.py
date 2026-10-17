@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""系统声音捕获：WASAPI loopback（截取扬声器输出，无需虚拟声卡）。"""
+"""音频捕获：扬声器 loopback（线上会议）/ 默认麦克风（现场对话）。"""
 from __future__ import annotations
 
 import queue
@@ -10,20 +10,46 @@ import soundcard as sc
 
 
 class CaptureError(Exception):
-    """找不到系统扬声器/loopback 设备。"""
+    """找不到可用的捕获设备（扬声器 loopback / 麦克风）。"""
 
 
 CHUNK_SECONDS = 0.5
 
+SOURCE_SPEAKER = "speaker"   # 系统扬声器 loopback：线上会议（只录对方声音）
+SOURCE_MIC = "mic"           # 默认麦克风：现场面对面（含自己的声音）
+SOURCES = (SOURCE_SPEAKER, SOURCE_MIC)
+
 
 class AudioCapture:
-    def __init__(self, sample_rate: int = 16000):
+    """音频捕获：统一产出 16kHz 单声道块，走队列交给消费者。
+
+    ``source`` 决定打开哪个设备：
+
+    - ``"speaker"``（默认）：默认扬声器的 loopback，截取系统正在播放的声音
+      （线上会议），不需要虚拟声卡；
+    - ``"mic"``：系统默认麦克风，采集现场对话（面对面），会录到自己的声音。
+
+    两种模式除设备选择外行为完全一致（同样大小 / 队列 / 哨兵 / 错误与丢块计数）。
+    """
+
+    def __init__(self, sample_rate: int = 16000, source: str = SOURCE_SPEAKER):
+        if source not in SOURCES:
+            raise CaptureError(f"未知音频源：{source!r}（可选：{' / '.join(SOURCES)}）")
         self.sample_rate = sample_rate
+        self.source = source
         try:
-            default_speaker = sc.default_speaker()
-            self._mic = sc.get_microphone(id=str(default_speaker.name), include_loopback=True)
+            if source == SOURCE_MIC:
+                # 麦克风不带 loopback：要的就是现场的声音，不是系统播放的声音
+                self._device = sc.default_microphone()
+            else:
+                default_speaker = sc.default_speaker()
+                self._device = sc.get_microphone(
+                    id=str(default_speaker.name), include_loopback=True)
+            if self._device is None:
+                raise RuntimeError("系统未返回默认设备")
         except Exception as e:
-            raise CaptureError(f"无法打开系统声音捕获（请确认声卡支持 WASAPI）：{e}") from e
+            label = "麦克风" if source == SOURCE_MIC else "系统声音"
+            raise CaptureError(f"无法打开{label}捕获（请确认设备可用）：{e}") from e
         self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=100)
         self._thread: threading.Thread | None = None
         self._running = threading.Event()
@@ -42,7 +68,7 @@ class AudioCapture:
     def _run(self) -> None:
         frames = int(self.sample_rate * CHUNK_SECONDS)
         try:
-            with self._mic.recorder(samplerate=self.sample_rate, channels=1) as rec:
+            with self._device.recorder(samplerate=self.sample_rate, channels=1) as rec:
                 while self._running.is_set():
                     try:
                         data = rec.record(frames)
