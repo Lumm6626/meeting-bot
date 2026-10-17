@@ -88,9 +88,21 @@ def _field(obj, name: str, default=None):
     return getattr(obj, name, default)
 
 
+def _normalize_lang(lang: str) -> str:
+    """Groq 返回全称（English/Spanish/Chinese），统一为 ISO 码。
+
+    下游用 ``lang == "zh"`` 跳过中文翻译，不一致会导致中文白多走一次翻译请求。
+    """
+    table = {"chinese": "zh", "english": "en", "spanish": "es",
+             "french": "fr", "german": "de", "japanese": "ja",
+             "korean": "ko", "russian": "ru", "portuguese": "pt",
+             "italian": "it", "arabic": "ar"}
+    return table.get(str(lang).strip().lower(), str(lang).strip()[:2].lower() or "")
+
+
 def _segments_from_response(resp) -> list[Segment]:
     """verbose_json 响应 → Segment 列表；结构异常一律 CloudASRError。"""
-    lang = _field(resp, "language", "") or ""
+    lang = _normalize_lang(_field(resp, "language", "") or "")
     raw = _field(resp, "segments", None)
     if not raw:
         # 没有 segments 就无从生成字幕：视为接口异常（重试无益，由调用方丢弃该批）

@@ -409,3 +409,11 @@ def test_cloud_transcribe_backoff_not_interrupted_when_running(monkeypatch):
     assert planned <= sum(slept) <= planned + CLOUD_STOP_POLL + 1e-9, slept
     # 每片都不超过轮询粒度：否则停止信号最多要等一整个 backoff（3s）才生效
     assert max(slept) <= CLOUD_STOP_POLL + 1e-9
+
+
+def test_normalize_lang_full_names():
+    from meeting_bot.asr import _normalize_lang
+    assert _normalize_lang("Chinese") == "zh"
+    assert _normalize_lang("English") == "en"
+    assert _normalize_lang("Spanish") == "es"
+    assert _normalize_lang("") == ""
