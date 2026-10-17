@@ -204,6 +204,48 @@ def test_translate_stream_midstream_error_no_retry(monkeypatch):
     assert "流中断" in str(excinfo.value)
 
 
+def test_translate_stream_with_context(monkeypatch):
+    """带会议上下文：user 消息用【上文参考】/【待翻译】分节，且上下文原样可见。
+
+    分节标记是两个需求的落点：
+    * 上文参考给模型做术语 / 人名统一 + 口音错字的上下文纠错；
+    * 【待翻译】把待译文本明确隔开，避免模型把上文一起翻出来。
+    """
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("stream"):
+            return [_content_chunk("沙特"), _content_chunk("市场")]
+        return FakeResponse("沙特市场")
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    t._thinking_disabled_ok = None
+    ctx = "原文：We met in Riad last week\n译文：上周我们在利雅得见过"
+
+    assert list(t.translate_stream("Saudi market", "en", context=ctx)) == ["沙特", "沙特市场"]
+    user = calls[0]["messages"][1]["content"]
+    assert "【上文参考" in user
+    assert "【待翻译】" in user
+    assert ctx in user                       # 上下文原样传入（不截断/不改写）
+    assert user.endswith("Saudi market")      # 待译文本在最后，紧贴【待翻译】
+    # 系统提示词第 9 条：统一术语/人名 + 按上下文纠口音错字
+    system = calls[0]["messages"][0]["content"]
+    assert "口音" in system and "术语" in system
+
+    # 非流式同一条构造路径（stop() 补译也用 context）
+    assert t.translate("Saudi market", "en", context=ctx) == "沙特市场"
+    plain_user = calls[1]["messages"][1]["content"]
+    assert ctx in plain_user and "【待翻译】" in plain_user
+
+    # 不传 context：与旧版完全一致（不带分节标记，也不留空壳标题）
+    t.translate("Saudi market", "en")
+    no_ctx = calls[2]["messages"][1]["content"]
+    assert "【上文参考" not in no_ctx and "【待翻译】" not in no_ctx
+    assert no_ctx.endswith("Saudi market")
+
+
 def test_system_translate_prompt_covers_meeting_context(monkeypatch):
     """提示词升级：会议语境 + 识别错字/医学术语/数字/品牌名四条要求必须在系统提示里。"""
     calls = []

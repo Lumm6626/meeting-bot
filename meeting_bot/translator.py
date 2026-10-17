@@ -56,8 +56,32 @@ SYSTEM_TRANSLATE = (
     "5) 修正口语重复、语气词与识别错字（结合上下文推测本意）；"
     "6) 医学术语与药品/器械名称译准确（不确定时保留原文）；"
     "7) 数字、比例、金额、日期必须精确对应；"
-    "8) 地名/公司名/品牌名译成通行的中文名称（无通行译名保留原文）。"
+    "8) 地名/公司名/品牌名译成通行的中文名称（无通行译名保留原文）；"
+    "9) 结合上文参考统一术语、人名、称呼的译法；口音/识别导致的错字按上下文推测修正。"
 )
+
+CONTEXT_HEADER = "【上文参考（用于统一术语/人名并修正识别错字）】"
+TARGET_HEADER = "【待翻译】"
+
+
+def build_user_message(text: str, lang: str = "", context: str = "") -> str:
+    """构造 user 消息：有会议上文参考时用分节标记把「参考」与「待译」隔开。
+
+    标记不是装饰：同一条消息里混两段文本时，模型很容易把上文参考当成待译内容
+    一起译出来（译文开头冒出上一句）。显式的【上文参考】/【待翻译】抬头把两者
+    划开，口音重的句子能稳定复用上文的术语 / 人名，并按上下文纠正识别错字。
+
+    无 context 时与旧版完全一致（``（原文语种：xx）`` + 待译文本），保证不传
+    context 的调用方零行为变化。
+    """
+    src = f"（原文语种：{lang}）" if lang and lang != "zh" else ""
+    ctx = (context or "").strip()
+    if not ctx:
+        return f"{src}\n{text}"
+    # 带上文参考时不再叠「原文语种」前缀：参考里的原文本身就是语种线索，
+    # 多一行前缀只会把待译文本推远、增加首 token 延迟。
+    return f"{CONTEXT_HEADER}\n{ctx}\n{TARGET_HEADER}\n{text}"
+
 
 MINUTES_PROMPT = """你是资深会议记录助理。根据下面的会议逐字稿，生成会议纪要。
 严格输出 JSON，不要输出其他内容，格式：
@@ -118,15 +142,20 @@ class Translator:
                 raise TranslationError(f"接口响应结构异常：{e}") from e
         raise TranslationError("翻译接口不可用")
 
-    def translate(self, text: str, lang: str = "") -> str:
-        src = f"（原文语种：{lang}）" if lang and lang != "zh" else ""
+    def translate(self, text: str, lang: str = "", context: str = "") -> str:
+        """非流式翻译（stop() 收尾补译走这里）。
+
+        ``context``：会议上文参考（前几句的原文/译文），见 :func:`build_user_message`。
+        不传则与旧版完全一致。
+        """
         messages = [
             {"role": "system", "content": SYSTEM_TRANSLATE},
-            {"role": "user", "content": f"{src}\n{text}"},
+            {"role": "user", "content": build_user_message(text, lang, context)},
         ]
         return self._chat(messages, max_tokens=512)
 
-    def translate_stream(self, text: str, lang: str = "") -> Iterator[str]:
+    def translate_stream(self, text: str, lang: str = "",
+                         context: str = "") -> Iterator[str]:
         """流式翻译：每次 yield **累积**译文（不是增量），供字幕逐字上屏。
 
         控制器实测（本机真 API，deepseek-v4-pro）：首 token 1.99s、全文 2.28s，
@@ -139,13 +168,15 @@ class Translator:
         * 连接建立失败（create 抛错）沿用既有退避重试；**流中途断开不重试**——
           半句已在屏上，重试会重放前缀，由调用方把译文清空退回原文。
 
+        ``context``（可选）：前几句的原文/译文参考，让模型统一术语/人名并按上下文
+        纠正口音识别错字；不传时 prompt 与旧版逐字节一致。
+
         生成器语义：调用时不发请求（首次 next() 才发）。流正常结束但 content
         全空 → 抛 :class:`TranslationError`。
         """
-        src = f"（原文语种：{lang}）" if lang and lang != "zh" else ""
         messages = [
             {"role": "system", "content": SYSTEM_TRANSLATE},
-            {"role": "user", "content": f"{src}\n{text}"},
+            {"role": "user", "content": build_user_message(text, lang, context)},
         ]
         extra = ({"thinking": {"type": "disabled"}}
                  if self._thinking_disabled_ok is not False else None)

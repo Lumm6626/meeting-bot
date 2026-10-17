@@ -121,7 +121,7 @@ class FakeASRSlowBatch:
                 for i in range(n)]
 
 
-def _stream_via_translate(self, text, lang=""):
+def _stream_via_translate(self, text, lang="", context=""):
     """把「非流式」fake 适配成流式：一次 yield 完整译文（等于「译完才上屏」）。
 
     生产实现按 delta 累积逐字 yield；对 worker 而言两者只差通知次数，
@@ -136,7 +136,7 @@ class FakeTranslator:
 
     translate_stream = _stream_via_translate
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         self.calls += 1
         return "你好世界"
 
@@ -151,7 +151,7 @@ class FakeTranslatorThreads(FakeTranslator):
         super().__init__()
         self.threads: list[threading.Thread] = []
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         self.threads.append(threading.current_thread())
         return super().translate(text, lang)
 
@@ -164,7 +164,7 @@ class FakeTranslatorFailOnce:
 
     translate_stream = _stream_via_translate
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         self.calls += 1
         if self.calls == 1:
             raise TranslationError("模拟翻译接口失败")
@@ -414,7 +414,7 @@ class FakeTranslatorStreamChunks:
     """流式 fake：逐块吐字符，块间可插延时（节流用例的核心道具）。
 
     ``delay=0`` → 10 块在毫秒级吐完（必然落在同一节流窗口内）；
-    ``delay=0.3`` → 每块间隔均 > STREAM_RERENDER_INTERVAL（每块都该通知）。
+    ``delay=0.6`` → 每块间隔均 > STREAM_UPDATE_INTERVAL（每块都该通知）。
     """
 
     def __init__(self, chunks="0123456789", delay: float = 0.0):
@@ -423,7 +423,7 @@ class FakeTranslatorStreamChunks:
         self.stream_calls = 0
         self.translate_calls = 0
 
-    def translate_stream(self, text, lang=""):
+    def translate_stream(self, text, lang="", context=""):
         self.stream_calls += 1
         acc = ""
         for ch in self.chunks:
@@ -432,7 +432,7 @@ class FakeTranslatorStreamChunks:
             acc += ch
             yield acc
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         """stop() 收尾补译走非流式（收尾阶段无人看实时性）。"""
         self.translate_calls += 1
         return "".join(self.chunks)
@@ -448,13 +448,13 @@ class FakeTranslatorStreamBreaks:
         self.stream_calls = 0
         self.translate_calls = 0
 
-    def translate_stream(self, text, lang=""):
+    def translate_stream(self, text, lang="", context=""):
         self.stream_calls += 1
         yield "你"
         yield "你好"
         raise TranslationError("模拟流中断")
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         self.translate_calls += 1
         return "你好世界"
 
@@ -463,7 +463,7 @@ class FakeTranslatorStreamBreaks:
 
 
 def test_streaming_updates_throttled(monkeypatch):
-    """快流：10 块在 0.25s 内吐完 → 通知被节流（不是每块都推 Qt），且末次必刷。
+    """快流：10 块在毫秒级吐完（同一节流窗口）→ 通知被节流（不是每块都推 Qt），且末次必刷。
 
     变异自查点：去掉 _stream_translate 的节流判断 → 通知次数变成 10，断言失败。
     """
@@ -492,10 +492,10 @@ def test_streaming_updates_throttled(monkeypatch):
 
 
 def test_streaming_updates_every_chunk_when_slow(monkeypatch):
-    """慢流：块间隔 > 0.25s → 每块都通知（字幕看起来就是逐字冒出）。"""
+    """慢流：块间隔 > 0.5s → 每块都通知（稀疏 token 不会被节流吞掉）。"""
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
     monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
-    tr = FakeTranslatorStreamChunks(chunks="0123", delay=0.3)
+    tr = FakeTranslatorStreamChunks(chunks="0123", delay=0.6)
     r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASR(),
                  translator=tr, diarizer=None)
     updates = []          # 回调里立刻快照译文（同一 Segment 对象会被原地改写）
@@ -507,7 +507,7 @@ def test_streaming_updates_every_chunk_when_slow(monkeypatch):
         assert _wait_until(lambda: r.store.segments()
                            and r.store.segments()[0].translation == "0123",
                            timeout=10), "译文未完成"
-        # 每块间隔 0.3s > 0.25s 节流阈值 → 每块都通知，逐字上屏逐字可见
+        # 每块间隔 0.6s > 0.5s 节流阈值 → 每块都通知，逐字上屏逐字可见
         assert updates == ["0", "01", "012", "0123"]
     finally:
         r.stop()
@@ -544,6 +544,172 @@ def test_stream_failure_reverts_to_original_then_backfill(monkeypatch):
     assert r.store.segments()[0].translation == "你好世界"
     assert updates[-1] == "你好世界"                  # 面板拿到最终译文
     assert tr.translate_calls == 1
+
+
+class FakeTranslatorStreamPaced:
+    """1.5 秒内匀速吐 30 块（模拟真 API 的 token 节奏）：验证刷新是匀速的。
+
+    30 块 / 0.05s 间隔 = 1.5s。若「每块一刷」，面板会被推 30 次（用户反馈的
+    拼接感正来自这里）；按 0.5s 节奏只该推 3~4 次。
+    """
+
+    def __init__(self, chunks: int = 30, interval: float = 0.05):
+        self.chunks = chunks
+        self.interval = interval
+        self.full = "*" * chunks
+        self.stream_calls = 0
+        self.translate_calls = 0
+
+    def translate_stream(self, text, lang="", context=""):
+        self.stream_calls += 1
+        acc = ""
+        for _ in range(self.chunks):
+            time.sleep(self.interval)
+            acc += "*"
+            yield acc
+
+    def translate(self, text, lang="", context=""):
+        self.translate_calls += 1
+        return self.full
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+def test_streaming_updates_evenly_paced(monkeypatch):
+    """匀速刷新：1.5 秒内 30 块 → 通知 ≤ 6 次（≈每 0.5s 一次），末次译文完整。
+
+    变异自查点：
+    * STREAM_UPDATE_INTERVAL 改成 0（每块都刷）→ 30 次通知 → 断言失败；
+    * 改回 0.25（仍按 token 碎片刷）→ 约 7 次 → 断言失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    tr = FakeTranslatorStreamPaced()
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASR(),
+                 translator=tr, diarizer=None)
+    updates = []          # 回调里立刻快照译文（同一 Segment 对象会被原地改写）
+    r.on_update(lambda s: updates.append(s.translation))
+    r.on_status(lambda m: None)
+
+    r.start("匀速会议")
+    try:
+        assert _wait_until(lambda: updates and updates[-1] == tr.full,
+                           timeout=15), "最终译文未上屏"
+        # 30 块摊成 1.5 秒：0.5s 节奏下 3~4 次；≤6 给调度抖动留余量
+        assert len(updates) <= 6, f"刷新过密（拼接感）：{len(updates)} 次 / 30 块"
+        assert len(updates) >= 3, f"刷新太稀（看不出进度）：{len(updates)} 次 / 30 块"
+        assert updates[-1] == tr.full, "末次通知必须是完整译文"
+        assert r.store.segments()[0].translation == tr.full
+    finally:
+        r.stop()
+
+
+class FakeASRFourLines:
+    """一次 transcribe 吐 4 条语句：让第 4 句有 3 条已翻译的前文。"""
+
+    def transcribe(self, audio, sample_rate=16000):
+        return [Segment(0.5 + i, 0.9 + i, f"line {i + 1}", lang="en") for i in range(4)]
+
+
+class FakeTranslatorRecordsContext:
+    """记录每次翻译收到的 context；译文带前缀以验证「前文译文」进入了上下文。"""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []      # (原文, context)
+
+    def translate_stream(self, text, lang="", context=""):
+        self.calls.append((text, context))
+        yield f"译:{text}"
+
+    def translate(self, text, lang="", context=""):
+        self.calls.append((text, context))
+        return f"译:{text}"
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+def test_context_passed_to_translate(monkeypatch):
+    """翻译带会议上下文：第 4 句吃前 3 句的原文/译文，且绝不含自己。
+
+    变异自查点：把 worker 里的 ``context=self._recent_context(seg)`` 去掉
+    → 第 4 句 context 变成空串 → 「line 1..3 in ctx4」断言失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    tr = FakeTranslatorRecordsContext()
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASRFourLines(),
+                 translator=tr, diarizer=None)
+    r.on_status(lambda m: None)
+
+    r.start("上下文会议")
+    try:
+        assert _wait_until(lambda: len(r.store.segments()) == 4
+                           and all(s.translation for s in r.store.segments()),
+                           timeout=10), "4 条语句未全部翻译"
+    finally:
+        r.stop()
+
+    assert [s.text for s in r.store.segments()] == [f"line {i}" for i in range(1, 5)]
+    ctx_of = dict(tr.calls)          # 同一句只翻一次 → 用原文当 key 安全
+    assert ctx_of["line 1"] == ""                  # 首句没有上文
+    ctx4 = ctx_of["line 4"]
+    for prev in ("line 1", "line 2", "line 3"):
+        assert prev in ctx4, prev
+    assert "line 4" not in ctx4, "待译句自己不得进上文（模型会照抄自己）"
+    assert "原文：" in ctx4 and "译文：" in ctx4
+    assert "译:line 1" in ctx4                     # 优先带已有译文（术语锚点）
+
+
+class FakeTranslatorFailsInWorker:
+    """流式阶段非首句一律失败（留给 stop() 补译），并记录补译收到的 context。"""
+
+    def __init__(self):
+        self.stream_calls = 0
+        self.backfill: list[tuple[str, str]] = []      # (原文, context)
+
+    def translate_stream(self, text, lang="", context=""):
+        self.stream_calls += 1
+        if text != "line 1":
+            raise TranslationError("模拟流中断")
+        yield f"译:{text}"
+
+    def translate(self, text, lang="", context=""):
+        self.backfill.append((text, context))
+        return f"译:{text}"
+
+    def minutes(self, md):
+        raise NotImplementedError
+
+
+def test_stop_backfill_passes_context(monkeypatch):
+    """stop() 补译同样带上文（此刻 store 更全）：口音句在收尾时才有足够前文纠错。
+
+    变异自查点：把 stop() 补译里的 ``context=self._recent_context(seg)`` 去掉
+    → 补译收到的 context 全为空 → 「line 1 in backfill["line 2"]」断言失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    tr = FakeTranslatorFailsInWorker()
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=FakeASRFourLines(),
+                 translator=tr, diarizer=None)
+    statuses = []
+    r.on_status(statuses.append)
+
+    r.start("补译上下文会议")
+    try:
+        assert _wait_until(lambda: sum(1 for s in r.store.segments() if s.translation) == 1
+                           and len(r.store.segments()) == 4, timeout=10), "只有首句该译成功"
+    finally:
+        r.stop()                                # 补译 line 2/3/4（带上下文）
+
+    backfill = dict(tr.backfill)
+    assert set(backfill) == {"line 2", "line 3", "line 4"}, f"补译集合异常：{set(backfill)}"
+    assert "line 1" in backfill["line 2"]
+    assert "line 2" not in backfill["line 2"], "补译句自己不得进上文"
+    assert "line 3" in backfill["line 4"]     # 收尾时前文的译文也已补齐
+    assert all(s.translation for s in r.store.segments())
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +948,7 @@ class FakeTranslatorUnexpectedErrorOnce:
 
     translate_stream = _stream_via_translate
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("模拟翻译接口意外异常")
@@ -903,7 +1069,7 @@ class FakeTranslatorBlocking:
 
     translate_stream = _stream_via_translate
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         with self._lock:
             self.calls += 1
             first = self.calls == 1
@@ -1238,7 +1404,7 @@ class FakeTranslatorChoicesNone:
 
     translate_stream = _stream_via_translate
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         self.calls += 1
         raise TypeError("'NoneType' object is not subscriptable")
 
@@ -2056,7 +2222,7 @@ class FakeTranslatorGated:
 
     translate_stream = _stream_via_translate
 
-    def translate(self, text, lang=""):
+    def translate(self, text, lang="", context=""):
         self.calls += 1
         self.started.set()
         assert self.release.wait(timeout=10), "测试未放行翻译"

@@ -31,7 +31,9 @@ PRODUCER_DONE_TIMEOUT = 10.0  # stop() 等主循环完成尾部 flush 的上限
 TRANSLATE_DRAIN_TIMEOUT = 20.0  # stop() 等翻译 worker 排空退出的上限
 TRANSLATE_POLL_TIMEOUT = 0.5  # 翻译 worker 队列轮询间隔
 BACKFILL_MAX_CONSECUTIVE_FAILS = 3  # stop() 补译连续失败上限（超过则放弃补译，防无界重试）
-STREAM_RERENDER_INTERVAL = 0.25  # 流式译文重绘节流（秒）：太密会淹没 Qt 事件循环，太疏则看不出「逐字」
+STREAM_UPDATE_INTERVAL = 0.5  # 流式译文刷新间隔（秒）：0.5s 一次是「均匀打字」的手感，再密
+                              # 就是 token 碎片闪屏（用户反馈的拼接感），再疏则像卡住不掉字
+CONTEXT_RECENT_SEGMENTS = 4   # 翻译上文参考取最近几条语句（统一术语/人名 + 纠口音错字）
 ASR_BATCH_SECONDS = 30.0      # 攒够 30 秒音频触发一批识别
 ASR_BATCH_MAX_WAIT = 35.0     # 静默会议兜底：最老语句积压 35 秒墙钟也强制识别
 ASR_POLL_TIMEOUT = 0.5        # 识别 worker 轮询间隔（无新语句也要醒来查 max-wait）
@@ -424,11 +426,32 @@ class Recorder:
             if self._translator:
                 self._translate_queue.put(seg)
 
+    def _recent_context(self, seg: Segment) -> str:
+        """取该句之前最近几条语句的「原文/译文」，作为翻译的上文参考。
+
+        为什么读 store 而不在 worker 里另存滚动缓冲：store 是唯一事实源、天然按
+        seq 有序，worker 与 stop() 都能复用；``segments()`` 返回副本（``list(...)``），
+        与 ``_globalize_spans`` / ``_diarize_worker`` 的既有读法一样是线程安全的。
+
+        优先取「已有译文的语句」：译文里已固化的术语 / 人名才是要统一的锚点；
+        前几句都还没译出来时退回全部更早语句 —— 原文本身也能帮模型纠正口音错字。
+        只取 ``seq < seg.seq``：绝不能把待译句自己塞进上文（模型会照抄自己）。
+        """
+        prev = [s for s in self._store.segments() if s.seq < seg.seq]
+        if not prev:
+            return ""
+        translated = [s for s in prev if (s.translation or "").strip()]
+        picked = (translated or prev)[-CONTEXT_RECENT_SEGMENTS:]
+        return "\n".join(
+            f"原文：{s.text}\n译文：{s.translation or '（无）'}" for s in picked)
+
     def _stream_translate(self, seg: Segment) -> None:
         """流式翻译一条语句：译文逐字上屏，节流刷新，末次必刷。
 
         为什么要节流：deepseek-v4-pro 流式约 20~60 块/句，每块都推一次 Qt 重绘
-        会把事件循环刷满（面板卡顿、丢字），而 0.25s 一次人眼已看不出停顿。
+        会把事件循环刷满（面板卡顿、丢字）；而按块刷新在视觉上就是「碎片拼接」，
+        所以改成固定 0.5 秒节奏（STREAM_UPDATE_INTERVAL）：约每半秒推一次当时
+        的累积译文，看起来是匀速打字，而不是 token 一抖一抖地冒。
 
         为什么「末次必刷」：最后一块往往落在节流窗口内被跳过，不补一次的话面板
         会停在倒数第二块 —— 字幕缺尾巴，且 store 里是全量译文、屏幕上是残句。
@@ -442,13 +465,17 @@ class Recorder:
         已卡住的接口再发一次请求，且有第二个写者覆盖 seg.translation。原文始终在
         store 里，纪要上下文不缺。
         """
+        # 上文参考在进入流之前取一次：流式过程中 store 可能新增语句（别的 worker
+        # 正在翻译更靠后的句子），中途换上下文会让同一句的术语前后不一致。
+        context = self._recent_context(seg)
         last_at = 0.0
         last_text = ""
         try:
-            for partial in self._translator.translate_stream(seg.text, seg.lang):
+            for partial in self._translator.translate_stream(seg.text, seg.lang,
+                                                              context=context):
                 seg.translation = partial
                 now = time.monotonic()
-                if now - last_at >= STREAM_RERENDER_INTERVAL:
+                if now - last_at >= STREAM_UPDATE_INTERVAL:
                     last_at = now
                     last_text = partial
                     self._notify_update(seg)
@@ -457,8 +484,10 @@ class Recorder:
                 seg.translation = ""
                 self._notify_update(seg)   # 回退：面板回到原文显示
             raise
+        # 末次必刷：只要屏上还不是最终文本就再推一次（与最后一块通知的时间无关，
+        # 尾块被节流挡掉时面板会缺尾巴）；文本已相同说明屏上即最终，无需空重绘。
         if seg.translation and seg.translation != last_text:
-            self._notify_update(seg)       # 末次必刷（尾块被节流挡掉时）
+            self._notify_update(seg)
 
     def _translate_worker(self) -> None:
         try:
@@ -636,7 +665,8 @@ class Recorder:
             for seg in self._store.segments():
                 if not backfill_given_up and not seg.translation and seg.lang != "zh":
                     try:
-                        seg.translation = self._translator.translate(seg.text, seg.lang)
+                        seg.translation = self._translator.translate(
+                            seg.text, seg.lang, context=self._recent_context(seg))
                         backfill_fails = 0          # 成功即清零：偶发失败不累计
                         # 补译成功 → 面板要拿到最终译文（原文阶段早已上屏）
                         self._notify_update(seg)
