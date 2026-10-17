@@ -79,32 +79,44 @@ class FakeASRZh:
         return [Segment(0.5, 2.5, "你好世界", lang="zh")]
 
 
-class FakeASRPerChunk:
-    """每次 transcribe 调用产出 1 句。"""
+class FakeASRBatchChunks:
+    """按批内每 1 秒切一条语句（模拟 whisper 对整批音频的分段）。
+
+    识别改批处理前，每个 transcribe 调用恰好对应一句；改后一次调用对应一批。
+    返回值按「批内 1 秒粒度」还原语句，使断言与「这批是怎么切的」完全解耦：
+    无论批里有 1 句还是 3 句，产出的语句条数与文本序列都确定。
+    """
 
     def __init__(self):
         self.calls = 0
+        self.batch_lens: list[int] = []      # 每次 transcribe 收到的样本数（批大小证据）
+        self._produced = 0                   # 已产出的语句数（跨批连续编号）
 
     def transcribe(self, audio, sample_rate=16000):
         self.calls += 1
-        return [Segment(0.1, 0.9, f"line {self.calls}", lang="en")]
+        self.batch_lens.append(len(audio))
+        n = max(1, len(audio) // 16000)      # 每条语句恰好 1 秒 → n = 批内语句数
+        segs = [Segment(i + 0.1, i + 0.9, f"line {self._produced + i + 1}", lang="en")
+                for i in range(n)]
+        self._produced += n                  # 跨批连续编号：文本与批如何切分无关
+        return segs
 
 
-class FakeASRSlowTail:
-    """前 2 次快返回；第 3 次（尾部语句）慢 tail_delay 秒才返回。"""
+class FakeASRSlowBatch:
+    """每次 transcribe 阻塞 delay 秒才返回（模拟收尾批的完整识别开销）。"""
 
-    def __init__(self, tail_delay: float = 0.3):
+    def __init__(self, delay: float = 0.3):
         self.calls = 0
-        self.tail_delay = tail_delay
-        self.third_started = threading.Event()
+        self.delay = delay
+        self.started = threading.Event()
 
     def transcribe(self, audio, sample_rate=16000):
         self.calls += 1
-        if self.calls < 3:
-            return [Segment(0.1, 0.9, f"head {self.calls}", lang="en")]
-        self.third_started.set()
-        time.sleep(self.tail_delay)
-        return [Segment(0.1, 0.9, "tail 3", lang="en")]
+        self.started.set()
+        time.sleep(self.delay)
+        n = max(1, len(audio) // 16000)
+        return [Segment(i + 0.1, i + 0.9, f"line {i + 1}", lang="en")
+                for i in range(n)]
 
 
 class FakeTranslator:
@@ -117,6 +129,18 @@ class FakeTranslator:
 
     def minutes(self, md):
         raise NotImplementedError
+
+
+class FakeTranslatorThreads(FakeTranslator):
+    """记录每次 translate 发生在哪个线程（分辨「worker 翻译」与「stop() 补译」）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.threads: list[threading.Thread] = []
+
+    def translate(self, text, lang=""):
+        self.threads.append(threading.current_thread())
+        return super().translate(text, lang)
 
 
 class FakeTranslatorFailOnce:
@@ -194,6 +218,9 @@ class FakeVADPerChunk:
 def test_full_pipeline(monkeypatch):
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
     monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.1)
+    # 批处理改造后默认阈值 30s：测试里把它压到「有语句就出批」，
+    # 让语句在录制中途入库（diarize 才有一轮机会标注它）
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
     r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASR(),
                  translator=FakeTranslator(), diarizer=FakeDiarizer())
     events = []
@@ -224,14 +251,16 @@ def test_capture_end_flushes_tail_and_translates_all(monkeypatch):
     """
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADFlushOnly)
     monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.1)
-    asr = FakeASRPerChunk()
+    asr = FakeASRBatchChunks()
     r = Recorder(_settings(), capture=FakeCaptureWithSentinel(), asr=asr,
                  translator=FakeTranslator(), diarizer=None)
     r.on_status(lambda m: None)
     r.start("尾部 flush 会议")
     r.stop()
 
-    assert asr.calls == 3
+    # 批处理：3 条语句（各 16000 样本）在收尾时拼成一批、只识别一次
+    assert asr.calls == 1
+    assert asr.batch_lens == [3 * 16000]
     segs = r.store.segments()
     assert len(segs) == 3
     assert [s.text for s in segs] == ["line 1", "line 2", "line 3"]
@@ -243,16 +272,19 @@ def test_capture_end_flushes_tail_and_translates_all(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_stop_waits_for_tail_utterance(monkeypatch):
-    """stop() 时主循环仍卡在尾段 ASR（0.3s）：尾部语句必须照样翻译并 emit。
+    """收尾批（stop 之后才触发的识别）必须由翻译 worker 消化，不能丢给 stop() 补译。
 
-    旧实现 worker 循环用 _stop 判定，队列一空即退出；
-    stop() 置位 _stop 后 worker 退出、尾段稍后才入队 → 永不翻译、永不 emit。
+    批处理下最末一批语句在 _producer_done 置位**之后**才产出：翻译 worker 若仍只按
+    「生产者完结 + 队列空」判定退出，会在那一瞬退出 → 尾批语句入队时已无人消费。
+    断言译文的执行线程不是调用 stop() 的线程，即证明 worker 等到了 _asr_finished
+    （走 stop() 补译路径时译文会由调用线程产出 → 本用例失败）。
     """
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.1)
-    asr = FakeASRSlowTail(tail_delay=0.3)
+    asr = FakeASRSlowBatch(delay=0.3)
+    tr = FakeTranslatorThreads()
     r = Recorder(_settings(), capture=FakeCapture(), asr=asr,
-                 translator=FakeTranslator(), diarizer=None)
+                 translator=tr, diarizer=None)
     events = []
     r.on_segment(events.append)
     r.on_status(lambda m: None)
@@ -260,17 +292,23 @@ def test_stop_waits_for_tail_utterance(monkeypatch):
     thread = threading.Thread(target=r.start, args=("尾部会议",), daemon=True)
     thread.start()
     try:
-        assert asr.third_started.wait(timeout=5), "第 3 次 transcribe（尾段）未开始"
-        time.sleep(0.15)  # 前两句已翻译 emit，此刻翻译队列为空
-        r.stop()
+        # 主循环（生产者）先跑完：3 条语句已入批但都没触发识别（阈值 30s）
+        assert _wait_until(lambda: r._producer_done.is_set()), "主循环未结束"
+        assert r.store.segments() == [], "阈值未到却已出批，用例前提不成立"
+        assert asr.calls == 0
+        r.stop()          # stop() 才触发收尾批 → 必须等它识别完再排空翻译
     finally:
-        thread.join(timeout=5)
+        thread.join(timeout=10)
     assert not thread.is_alive()
 
     segs = r.store.segments()
-    assert [s.text for s in segs] == ["head 1", "head 2", "tail 3"]
+    assert [s.text for s in segs] == ["line 1", "line 2", "line 3"]
     assert all(s.translation == "你好世界" for s in segs)
-    assert [s.text for s in events] == ["head 1", "head 2", "tail 3"]
+    assert [s.text for s in events] == ["line 1", "line 2", "line 3"]
+    # 收尾批译自 worker 线程（而非 stop() 补译的调用线程）
+    assert len(tr.threads) == 3
+    assert all(t is not threading.current_thread() for t in tr.threads)
+    assert not r._asr_thread.is_alive()        # stop() 已 join 识别线程
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +324,9 @@ def test_lazy_asr_engine_created_once(monkeypatch):
             created.append(settings)
 
         def transcribe(self, audio, sample_rate=16000):
-            return [Segment(0.5, 2.5, "lazy ok", lang="en")]
+            # 批处理下一次调用对应整批音频 → 按批内 1 秒一句还原（3 句 = 3 秒）
+            n = max(1, len(audio) // 16000)
+            return [Segment(i + 0.5, i + 0.9, "lazy ok", lang="en") for i in range(n)]
 
     monkeypatch.setattr("meeting_bot.recorder.ASREngine", _RecordingASREngine)
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
@@ -492,6 +532,8 @@ def test_diarize_windowed(monkeypatch):
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADTwoUtterances)
     monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.05)
     monkeypatch.setattr("meeting_bot.recorder.DIARIZE_WINDOW", 1.0)     # 16000 样本
+    # 批处理阈值压到「有语句就出批」：语句必须在录制中途入库，diarize 才有机会标注
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
 
     seen = []
     real_assign = assign_speakers
@@ -503,7 +545,7 @@ def test_diarize_windowed(monkeypatch):
     monkeypatch.setattr("meeting_bot.recorder.assign_speakers", _spy)
 
     diarizer = FakeDiarizerWindow(local_label="SPK_A")
-    r = Recorder(_settings(), capture=FakeCaptureOneLongChunk(32000), asr=FakeASRPerChunk(),
+    r = Recorder(_settings(), capture=FakeCaptureOneLongChunk(32000), asr=FakeASRBatchChunks(),
                  translator=FakeTranslator(), diarizer=diarizer)
     r.on_status(lambda m: None)
     r.start("窗口会议")     # capture 只有一块，主循环很快结束
@@ -535,10 +577,11 @@ def test_diarize_maps_local_labels_across_windows(monkeypatch):
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.05)
     monkeypatch.setattr("meeting_bot.recorder.DIARIZE_WINDOW", 2.0)     # 32000 样本
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)  # 逐句入库（见上）
 
     diarizer = FakeDiarizerSequence(["SPK_A", "SPK_B"], full_window_samples=32000)
     capture = FakeCaptureStaged(chunks=3, chunk_samples=16000)
-    r = Recorder(_settings(), capture=capture, asr=FakeASRPerChunk(),
+    r = Recorder(_settings(), capture=capture, asr=FakeASRBatchChunks(),
                  translator=FakeTranslator(), diarizer=diarizer)
     r.on_status(lambda m: None)
 
@@ -602,7 +645,9 @@ def test_worker_survives_unexpected_error(monkeypatch):
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.1)
     tr = FakeTranslatorUnexpectedErrorOnce()
-    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+    # 批处理阈值压到「有语句就出批」：本用例要求在 stop() 之前就观察到语句/事件
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRBatchChunks(),
                  translator=tr, diarizer=None)
     events = []
     statuses = []
@@ -639,7 +684,7 @@ def test_no_ghost_speaker(monkeypatch):
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.DIARIZE_INTERVAL", 0.05)
     diarizer = FakeDiarizerNoOverlap()
-    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRBatchChunks(),
                  translator=FakeTranslator(), diarizer=diarizer)
     statuses = []
     r.on_status(statuses.append)
@@ -704,8 +749,10 @@ def test_stop_backfill_does_not_duplicate_events(monkeypatch):
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.05)
     monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_DRAIN_TIMEOUT", 0.05)
+    # 批处理阈值压到「有语句就出批」：本用例要求在 stop() 之前就观察到语句/事件
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
     tr = FakeTranslatorBlocking(delay=0.3)
-    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRBatchChunks(),
                  translator=tr, diarizer=None)
     events = []
 
@@ -748,10 +795,13 @@ def test_segment_callback_exception_does_not_kill_worker(monkeypatch):
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.1)
 
+    # 批处理阈值压到「有语句就出批」：本用例要求在 stop() 之前就观察到语句/事件
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+
     def _boom(seg):
         raise RuntimeError("模拟事件回调异常")
 
-    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRBatchChunks(),
                  translator=FakeTranslator(), diarizer=None)
     events = []
     statuses = []
@@ -792,7 +842,7 @@ def test_diarize_worker_survives_post_label_error(monkeypatch):
 
     diarizer = FakeDiarizerAssignBoom()
     capture = FakeCaptureStaged(chunks=3, chunk_samples=16000)
-    r = Recorder(_settings(), capture=capture, asr=FakeASRPerChunk(),
+    r = Recorder(_settings(), capture=capture, asr=FakeASRBatchChunks(),
                  translator=FakeTranslator(), diarizer=diarizer)
     statuses = []
     r.on_status(statuses.append)
@@ -1042,7 +1092,7 @@ def test_stop_backfill_survives_unexpected_error(monkeypatch, tmp_path):
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
     monkeypatch.setattr("meeting_bot.recorder.TRANSLATE_POLL_TIMEOUT", 0.1)
     tr = FakeTranslatorChoicesNone()
-    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRPerChunk(),
+    r = Recorder(_settings(), capture=FakeCapture(), asr=FakeASRBatchChunks(),
                  translator=tr, diarizer=None)
     events = []
     statuses = []
@@ -1168,3 +1218,187 @@ def test_audio_source_forwarded_to_capture(monkeypatch):
     assert len(created) == before, "注入 capture 时不应构造 AudioCapture"
     assert r._capture is injected
     assert r._audio_source == "mic"      # 参数仍记录（便于诊断），但不生效
+
+
+# ---------------------------------------------------------------------------
+# 识别批处理（ASR_BATCH_SECONDS / ASR_BATCH_MAX_WAIT / 收尾批）
+# ---------------------------------------------------------------------------
+
+class FakeCaptureHeld:
+    """喂完给定块后一直「读超时」（不返回结束哨兵），录制持续到 stop() 置位。"""
+
+    def __init__(self, chunks: list[np.ndarray]):
+        self._chunks = list(chunks)
+        self._fed = 0
+        self._done = threading.Event()
+
+    def start(self):
+        pass
+
+    def read(self, timeout=1.0):
+        if self._fed < len(self._chunks):
+            c = self._chunks[self._fed]
+            self._fed += 1
+            return c
+        if self._done.is_set():
+            return None                 # 收尾哨兵：只有 stop() 之后才出现
+        time.sleep(0.005)               # 真实 read 会阻塞 timeout 秒，这里只做节流
+        raise queue.Empty()
+
+    def stop(self):
+        self._done.set()
+
+
+class FakeVADOffsets:
+    """flush 时吐出指定样本偏移的语句（用于构造确定的批起点）。"""
+
+    def __init__(self, offsets, samples: int = 16000):
+        self.offsets = list(offsets)
+        self.samples = samples
+
+    def push(self, chunk):
+        return []
+
+    def flush(self):
+        out = [(o, np.zeros(self.samples, dtype=np.float32)) for o in self.offsets]
+        self.offsets = []
+        return out
+
+
+class FakeASRRelative:
+    """总返回批内相对段 (0.5,1.5) / (1.5,2.5)：验证「批内相对 → 会议绝对」换算。"""
+
+    def __init__(self):
+        self.calls = 0
+        self.batch_lens: list[int] = []
+
+    def transcribe(self, audio, sample_rate=16000):
+        self.calls += 1
+        self.batch_lens.append(len(audio))
+        return [Segment(0.5, 1.5, "r1", lang="en"),
+                Segment(1.5, 2.5, "r2", lang="en")]
+
+
+def test_batch_triggers_on_audio_length(monkeypatch):
+    """长度触发：积压音频达 ASR_BATCH_SECONDS 立即出批（录制仍在进行，非收尾触发）。
+
+    变异自查点：去掉 _asr_batch_ready 里的长度判定 → 只能等 stop() 收尾 → 本用例超时失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADTwoUtterances)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.05)    # 800 样本即达标
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_MAX_WAIT", 999.0)  # 排除 max-wait 干扰
+
+    asr = FakeASRBatchChunks()
+    capture = FakeCaptureHeld([np.zeros(16000, dtype=np.float32)])
+    r = Recorder(_settings(), capture=capture, asr=asr,
+                 translator=FakeTranslator(), diarizer=None)
+    r.on_status(lambda m: None)
+
+    thread = threading.Thread(target=r.start, args=("按长度出批",), daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: len(r.store.segments()) == 2), \
+            f"积压 2s 远超阈值 0.05s 却未出批：batch_lens={asr.batch_lens}"
+        # 一批 = 两条语句拼接（2 秒音频），不是逐句识别
+        assert asr.calls == 1
+        assert asr.batch_lens == [2 * 16000]
+        assert r._stop.is_set() is False          # 出批发生在录制中途
+        assert [s.start for s in r.store.segments()] == [0.1, 1.1]
+    finally:
+        r.stop()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def test_batch_flushes_on_max_wait(monkeypatch):
+    """静默会议兜底：音频长度永远够不到阈值时，最老语句等够墙钟也必须出批。
+
+    变异自查点：去掉 max-wait 判定 → 只有 stop() 才出批 → 本用例超时失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 999.0)   # 长度永不达标
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_MAX_WAIT", 0.05)   # 只需等 50ms
+
+    asr = FakeASRBatchChunks()
+    capture = FakeCaptureHeld([np.zeros(16000, dtype=np.float32)])
+    r = Recorder(_settings(), capture=capture, asr=asr,
+                 translator=FakeTranslator(), diarizer=None)
+    r.on_status(lambda m: None)
+
+    thread = threading.Thread(target=r.start, args=("静默会议",), daemon=True)
+    thread.start()
+    try:
+        # 轮询间隔 0.5s → 首次醒来即判定 waited >= 0.05s
+        assert _wait_until(lambda: len(r.store.segments()) == 1), "max-wait 兜底未触发"
+        assert asr.calls == 1 and asr.batch_lens == [16000]
+        assert r._stop.is_set() is False          # 同样发生在录制中途
+        assert r.store.segments()[0].start == 1.1  # 偏移 16000 样本（1s）+ 0.1
+    finally:
+        r.stop()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def test_final_batch_on_stop(monkeypatch):
+    """收尾批：录制结束时残余积压（两个阈值都没到）必须被识别，一条不丢。
+
+    变异自查点：把 worker 的 force 参数（stop 置位即强制出批）改成 False → 残余批要等
+    max-wait（默认 35s）才肯出，stop() 耗时断言失败（收尾被无谓拖长）。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_MAX_WAIT", 999.0)  # 排除 max-wait
+
+    asr = FakeASRBatchChunks()
+    capture = FakeCaptureHeld([np.zeros(16000, dtype=np.float32)] * 3)
+    r = Recorder(_settings(), capture=capture, asr=asr,
+                 translator=FakeTranslator(), diarizer=None)
+    r.on_status(lambda m: None)
+
+    thread = threading.Thread(target=r.start, args=("收尾批会议",), daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: len(r._asr_batch) == 3), "3 条语句未全部入批"
+        assert asr.calls == 0 and r.store.segments() == []   # 阈值未到：一条都没识别
+        t0 = time.monotonic()
+        r.stop()                                              # 收尾批在此触发
+        elapsed = time.monotonic() - t0
+    finally:
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    # 收尾是「立即带走」（force），不是等 max-wait 35 秒才出批
+    assert elapsed < 5.0, f"stop() 等了 {elapsed:.1f}s 才收尾（force 未生效？）"
+
+    assert asr.calls == 1
+    assert asr.batch_lens == [3 * 16000]        # 残余 3 条拼成一批带走
+    segs = r.store.segments()
+    assert [s.text for s in segs] == ["line 1", "line 2", "line 3"]
+    assert all(s.translation == "你好世界" for s in segs)
+
+
+def test_offsets_preserved_in_batch(monkeypatch):
+    """绝对时间轴：语句绝对时间 = 批起点（批内最小偏移）+ whisper 相对时间。
+
+    两个场景批起点不同（0 / 1s），ASR 返回的相对段完全一样 → 绝对时间必须整体平移 1s。
+    变异自查点：忽略 base（直接用 s.start / s.end）→ 场景 B 断言失败（两场景结果相同）。
+    """
+    def _run(offsets):
+        monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer",
+                            lambda: FakeVADOffsets(offsets))
+        asr = FakeASRRelative()
+        rec = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=asr,
+                       translator=None, diarizer=None)
+        rec.on_status(lambda m: None)
+        rec.start("偏移会议")
+        rec.stop()
+        return asr, rec.store.segments()
+
+    # 场景 A：批起点 = 0 样本 → 绝对时间 = 相对时间
+    asr_a, segs_a = _run([0, 16000])
+    assert asr_a.batch_lens == [2 * 16000]
+    assert [(s.start, s.end) for s in segs_a] == [(0.5, 1.5), (1.5, 2.5)]
+
+    # 场景 B：批起点 = 16000 样本（1s）→ 绝对时间整体 +1s
+    asr_b, segs_b = _run([16000, 32000])
+    assert asr_b.batch_lens == [2 * 16000]
+    assert [(s.start, s.end) for s in segs_b] == [(1.5, 2.5), (2.5, 3.5)]

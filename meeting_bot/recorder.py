@@ -31,6 +31,10 @@ PRODUCER_DONE_TIMEOUT = 10.0  # stop() 等主循环完成尾部 flush 的上限
 TRANSLATE_DRAIN_TIMEOUT = 20.0  # stop() 等翻译 worker 排空退出的上限
 TRANSLATE_POLL_TIMEOUT = 0.5  # 翻译 worker 队列轮询间隔
 BACKFILL_MAX_CONSECUTIVE_FAILS = 3  # stop() 补译连续失败上限（超过则放弃补译，防无界重试）
+ASR_BATCH_SECONDS = 30.0      # 攒够 30 秒音频触发一批识别
+ASR_BATCH_MAX_WAIT = 35.0     # 静默会议兜底：最老语句积压 35 秒墙钟也强制识别
+ASR_POLL_TIMEOUT = 0.5        # 识别 worker 轮询间隔（无新语句也要醒来查 max-wait）
+ASR_JOIN_TIMEOUT = 180.0      # stop() 等识别线程把收尾批（最后 30s+ 音频）识别完的上限
 
 
 def map_local_labels(prev_labeled: list[tuple[float, float, str]],
@@ -102,6 +106,18 @@ class Recorder:
         self._translate_thread: threading.Thread | None = None
         self._diarize_thread: threading.Thread | None = None
         self._translate_queue: Queue[Segment] = Queue()
+        # --- 识别批处理（替代逐句识别）---
+        # whisper 每次 transcribe 有 ~10s 固定开销（30s 窗口 padding）：逐句识别 RTF 高达
+        # 5.6，连续对话（每 5~10s 一句）积压以 2 倍实时增长 → 字幕永远追不上。攒够一批
+        # 一次识别后 RTF < 1（34s 音频 19s，RTF 0.55），代价是字幕成批延迟出现。
+        self._asr_batch: list[tuple[int, np.ndarray]] = []   # (绝对样本偏移, 语句音频)
+        self._asr_batch_first_at = 0.0        # 当前批最老条目的入队时刻（monotonic 秒）
+        self._asr_batch_lock = threading.Lock()   # 主循环 append / worker 取走 → 必须原子
+        self._asr_batch_event = threading.Event()   # 有积压时唤醒 worker
+        self._asr_thread: threading.Thread | None = None
+        # 识别线程已收尾（批队列全部产出）：翻译 worker 必须等到它才排空退出，
+        # 否则收尾批的语句入队时 worker 已因「生产者完结 + 队列空」退出 → 无人翻译。
+        self._asr_finished = threading.Event()
         # 已 emit 的 seq：stop() 兜底补发时去重（store 跨 start 不重置，seq 全局唯一 → 无需 clear）
         self._emitted: set[int] = set()
         # _emit_once 的记账锁：worker 与 stop() 会并发对同一 seq 兜底补发，
@@ -180,8 +196,11 @@ class Recorder:
         self._say("开始录制（等待语音…）")
         self._producer_done.clear()
         self._worker_done.clear()
+        self._asr_finished.clear()
         self._running.set()
         self._capture.start()
+        self._asr_thread = threading.Thread(target=self._asr_worker, daemon=True)
+        self._asr_thread.start()
         self._translate_thread = threading.Thread(target=self._translate_worker, daemon=True)
         self._translate_thread.start()
         if self._diarizer:
@@ -205,9 +224,9 @@ class Recorder:
                     self._diarize_appended += 1
                     self._trim_diarize_buffer()
                 for offset, utterance in buf.push(chunk):
-                    self._process_utterance(utterance, offset / 16000)
+                    self._enqueue_asr(offset, utterance)
             for offset, utterance in buf.flush():
-                self._process_utterance(utterance, offset / 16000)
+                self._enqueue_asr(offset, utterance)
         finally:
             # 采集侧故障对外可见：record() 抛错只会让采集线程退出，主循环收到的是
             # 「正常结束哨兵」，若不检查就表现为「录到一半音频没了」且无任何提示。
@@ -228,18 +247,70 @@ class Recorder:
             # clear + join 已结束的线程，重复调用无副作用）。
             self._capture.stop()
 
-    def _process_utterance(self, audio: np.ndarray, start_offset: float) -> None:
+    # --- 识别批处理 ---
+    def _enqueue_asr(self, offset: int, utterance: np.ndarray) -> None:
+        """把一条 VAD 语句追加进识别批（主循环唯一入口，不阻塞主循环）。"""
+        with self._asr_batch_lock:
+            if not self._asr_batch:
+                # 记「本批最老条目」的入队时刻：max-wait 兜底以它为基准
+                self._asr_batch_first_at = time.monotonic()
+            self._asr_batch.append((offset, utterance))
+        self._asr_batch_event.set()
+
+    def _asr_batch_ready(self, force: bool) -> bool:
+        """是否该识别这一批了：够长 / 等够久 / 收尾（force）。"""
+        with self._asr_batch_lock:
+            if not self._asr_batch:
+                return False
+            pending = sum(len(a) for _, a in self._asr_batch)
+            waited = time.monotonic() - self._asr_batch_first_at
+        if force:
+            return True                      # 停止录制：残余全部带走
+        return pending >= int(ASR_BATCH_SECONDS * 16000) or waited >= ASR_BATCH_MAX_WAIT
+
+    def _take_asr_batch(self) -> list[tuple[int, np.ndarray]]:
+        """取走当前全部积压（原子：与主循环 append 互斥）。"""
+        with self._asr_batch_lock:
+            batch = self._asr_batch
+            self._asr_batch = []
+            self._asr_batch_first_at = 0.0
+        return batch
+
+    def _asr_worker(self) -> None:
+        """批处理识别线程：攒批 → 一次 transcribe → 按批内相对时间回填绝对时间轴。"""
+        try:
+            # 退出条件 = 已收到停止信号且积压已清空（收尾批必须识别完）
+            while not (self._stop.is_set() and not self._asr_batch):
+                # 事件唤醒（新语句入批）+ 固定轮询（静默会议靠 max-wait 兜底醒来）
+                self._asr_batch_event.wait(timeout=ASR_POLL_TIMEOUT)
+                self._asr_batch_event.clear()
+                if not self._asr_batch_ready(self._stop.is_set()):
+                    continue
+                self._transcribe_batch(self._take_asr_batch())
+        finally:
+            # 不论正常退出还是异常，都要放行翻译 worker 的排空条件
+            self._asr_finished.set()
+
+    def _transcribe_batch(self, batch: list[tuple[int, np.ndarray]]) -> None:
+        if not batch:
+            return
+        # 绝对时间原点 = 批内最早语句的样本偏移（VAD 给的是录制起点的绝对偏移）
+        base_samples = min(offset for offset, _ in batch)
+        audio = (batch[0][1] if len(batch) == 1
+                 else np.concatenate([u for _, u in batch]))
         try:
             if self._asr is None:
-                # 惰性创建：重型模型只在首句到来时加载（测试注入 fake 时不走此行）
+                # 惰性创建：重型模型只在首批语句到来时加载（测试注入 fake 时不走此行）
                 self._asr = ASREngine(self._settings)
             segments = self._asr.transcribe(audio)
         except Exception as e:
-            self._say(f"识别失败：{e}")
+            # 单批失败只丢这一批（告警可见），不得杀掉识别线程 —— 否则整场再无字幕
+            self._say(f"[警告] 识别失败（本批 {len(batch)} 条语句已丢弃）：{e}")
             return
+        base = base_samples / 16000.0
         for s in segments:
-            seg = self._store.add(start_offset + s.start, start_offset + s.end,
-                                  s.text, lang=s.lang)
+            # whisper 返回的是批内相对时间 → 加批起点才是会议绝对时间轴
+            seg = self._store.add(base + s.start, base + s.end, s.text, lang=s.lang)
             if self._translator:
                 self._translate_queue.put(seg)
             else:
@@ -250,7 +321,11 @@ class Recorder:
             # producer-done 模式：只认「生产者完结 + 队列排空」才退出。
             # 若用 _stop 判定，尾段仍在内核 ASR（0.5~3s）时 worker 就会因队列暂空而退出，
             # flush 产出的 Segment 将永远无人翻译、无人 emit。
-            while not self._producer_done.is_set() or not self._translate_queue.empty():
+            # 除 producer-done 外还必须等识别线程收尾：批处理下最末一批语句
+            # 在 _producer_done 之后才产出，那一刻队列是空的。
+            while not (self._producer_done.is_set()
+                       and self._asr_finished.is_set()
+                       and self._translate_queue.empty()):
                 try:
                     seg = self._translate_queue.get(timeout=TRANSLATE_POLL_TIMEOUT)
                 except queue.Empty:
@@ -387,6 +462,18 @@ class Recorder:
             # 等 producer_done 即可确保尾部 flush 已经把 Segment 投进翻译队列。
             # stop() 早于/独立于 start()（无人在跑主循环）时 _running 为 False，直接跳过。
             self._producer_done.wait(timeout=PRODUCER_DONE_TIMEOUT)
+        # 识别收尾：此刻尾部 flush 的语句都已入批 → 唤醒 worker 把残余批一次识别完，
+        # 再排空翻译队列（顺序不能反：翻译 worker 的退出条件含 _asr_finished）。
+        self._asr_batch_event.set()
+        asr_thread = self._asr_thread
+        if asr_thread is not None and asr_thread is not threading.current_thread():
+            if asr_thread.is_alive():
+                asr_thread.join(timeout=ASR_JOIN_TIMEOUT)
+                if asr_thread.is_alive():
+                    self._say(f"[警告] 识别线程未在 {ASR_JOIN_TIMEOUT:.0f} 秒内退出"
+                              "（尾部语句可能缺失）")
+            # join 超时兜底：翻译 worker 不能因为识别线程卡死而永远等下去
+            self._asr_finished.set()
         worker = self._translate_thread
         if worker is not None and worker.is_alive():
             # 只等 queue.empty() 不够：worker 可能已取走最后一条却还没 emit。
