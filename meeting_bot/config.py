@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+ASR_PROVIDERS = ("local", "groq")
+
 
 class ConfigError(Exception):
     """配置缺失或不合法。"""
@@ -25,6 +27,12 @@ class Settings:
     hf_token: str
     output_dir: Path
     root: Path
+    # 以下两项带默认值，必须排在最后：既有代码用位置参数构造 Settings
+    groq_api_key: str = ""
+    asr_provider: str = "local"      # local（本地 faster-whisper）| groq（云端，低延迟）
+    # 本地模式攒批阈值：None = 用 recorder.py 里的模块默认值（30.0 / 35.0）
+    asr_batch_seconds: float | None = None
+    asr_batch_max_wait: float | None = None
 
 
 def _clean_hf_token(raw: str) -> str:
@@ -43,6 +51,20 @@ def _clean_hf_token(raw: str) -> str:
     return token
 
 
+def _float_env(name: str) -> float | None:
+    """读正数浮点环境变量：未配置 → None（由调用方回落到默认值）。"""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ConfigError(f"{name}={raw} 不是合法数字：{e}") from e
+    if value <= 0:
+        raise ConfigError(f"{name}={raw} 必须大于 0")
+    return value
+
+
 def load_settings(env_path: Path | None = None) -> Settings:
     env_path = env_path or PROJECT_ROOT / ".env"
     load_dotenv(env_path)
@@ -52,6 +74,10 @@ def load_settings(env_path: Path | None = None) -> Settings:
         raise ConfigError("缺少 OPENCODE_API_KEY：请复制 .env.example 为 .env 并填入 API key")
     if not key.startswith("sk-"):
         raise ConfigError("OPENCODE_API_KEY 格式异常（应以 sk- 开头）")
+
+    provider = (os.getenv("ASR_PROVIDER") or "local").strip().lower()
+    if provider not in ASR_PROVIDERS:
+        raise ConfigError(f"ASR_PROVIDER={provider} 不合法：可选值 {'|'.join(ASR_PROVIDERS)}")
 
     output_dir = os.getenv("OUTPUT_DIR") or "会议记录"
     if not Path(output_dir).is_absolute():
@@ -66,4 +92,8 @@ def load_settings(env_path: Path | None = None) -> Settings:
         hf_token=_clean_hf_token(os.getenv("HF_TOKEN") or ""),
         output_dir=Path(output_dir),
         root=PROJECT_ROOT,
+        groq_api_key=(os.getenv("GROQ_API_KEY") or "").strip(),
+        asr_provider=provider,
+        asr_batch_seconds=_float_env("ASR_BATCH_SECONDS"),
+        asr_batch_max_wait=_float_env("ASR_BATCH_MAX_WAIT"),
     )

@@ -12,9 +12,9 @@ from typing import Callable
 
 import numpy as np
 
-from .asr import ASREngine
+from .asr import ASREngine, CloudASREngine
 from .capture import SOURCE_SPEAKER, AudioCapture
-from .config import Settings
+from .config import ConfigError, Settings
 from .diarization import Diarizer, assign_speakers
 from .transcript import Segment, TranscriptStore
 from .translator import TranslationError, Translator
@@ -90,6 +90,13 @@ class Recorder:
         """
         self._settings = settings
         self._audio_source = audio_source
+        # 云端识别（groq）：每条语句到达即识别（不再攒批），getattr 兜住旧构造的 Settings
+        self._asr_provider = (getattr(settings, "asr_provider", "local") or "local").strip().lower()
+        # 攒批阈值：.env 里显式配置则以后者为准，否则用模块常量（测试 monkeypatch 常量生效）
+        self._asr_batch_seconds = (getattr(settings, "asr_batch_seconds", None)
+                                   or ASR_BATCH_SECONDS)
+        self._asr_batch_max_wait = (getattr(settings, "asr_batch_max_wait", None)
+                                    or ASR_BATCH_MAX_WAIT)
         self._capture = capture or AudioCapture(source=audio_source)
         self._asr = asr
         self._translator = translator
@@ -115,6 +122,9 @@ class Recorder:
         self._asr_batch_lock = threading.Lock()   # 主循环 append / worker 取走 → 必须原子
         self._asr_batch_event = threading.Event()   # 有积压时唤醒 worker
         self._asr_thread: threading.Thread | None = None
+        # 引擎构造失败（缺 GROQ_API_KEY 等配置错误）只告警一次：这是持续性问题，
+        # 每句都报会把状态栏刷满、把字幕挤没（云端模式下每句都触发一次识别尝试）
+        self._asr_engine_error_said = False
         # 识别线程已收尾（批队列全部产出）：翻译 worker 必须等到它才排空退出，
         # 否则收尾批的语句入队时 worker 已因「生产者完结 + 队列空」退出 → 无人翻译。
         self._asr_finished = threading.Event()
@@ -262,11 +272,16 @@ class Recorder:
         with self._asr_batch_lock:
             if not self._asr_batch:
                 return False
+            if self._asr_provider == "groq":
+                # 云端识别单次延迟低（约 1s），攒批只会白白增加字幕延迟：
+                # 有积压就出批（通常恰好 1 条 VAD 语句）。阈值退化为 0 的效果。
+                return True
             pending = sum(len(a) for _, a in self._asr_batch)
             waited = time.monotonic() - self._asr_batch_first_at
         if force:
             return True                      # 停止录制：残余全部带走
-        return pending >= int(ASR_BATCH_SECONDS * 16000) or waited >= ASR_BATCH_MAX_WAIT
+        return (pending >= int(self._asr_batch_seconds * 16000)
+                or waited >= self._asr_batch_max_wait)
 
     def _take_asr_batch(self) -> list[tuple[int, np.ndarray]]:
         """取走当前全部积压（原子：与主循环 append 互斥）。"""
@@ -312,11 +327,23 @@ class Recorder:
                  else np.concatenate([u for _, u in batch]))
         try:
             if self._asr is None:
-                # 惰性创建：重型模型只在首批语句到来时加载（测试注入 fake 时不走此行）
-                self._asr = ASREngine(self._settings)
+                # 惰性创建：重型模型只在首批语句到来时加载（测试注入 fake 时不走此行）。
+                # groq 模式走云端 client：没有 500MB 模型下载，也不用等首句识别预热。
+                self._asr = (CloudASREngine(self._settings)
+                             if self._asr_provider == "groq" else ASREngine(self._settings))
             segments = self._asr.transcribe(audio)
         except Exception as e:
-            # 单批失败只丢这一批（告警可见），不得杀掉识别线程 —— 否则整场再无字幕
+            # 单批失败只丢这一批（告警可见），不得杀掉识别线程 —— 否则整场再无字幕。
+            # 云端模式的 CloudASRError（重试后仍失败/结构异常）与本地异常同路处理；
+            # 缺 key 时 CloudASREngine 构造抛 ConfigError 也落在这里（告警里带原因）。
+            if isinstance(e, ConfigError):
+                # 配置错误是持续性的：首次失败后每句都会再失败，只报一次即可，
+                # 否则状态栏被同一句警告刷满、字幕反而看不见。
+                if self._asr_engine_error_said:
+                    return
+                self._asr_engine_error_said = True
+                self._say(f"[错误] 识别引擎不可用，本场不再有字幕：{e}")
+                return
             self._say(f"[警告] 识别失败（本批 {len(batch)} 条语句已丢弃）：{e}")
             return
 

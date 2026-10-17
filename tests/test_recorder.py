@@ -6,7 +6,9 @@ import threading
 import time
 
 import numpy as np
+import pytest
 
+from meeting_bot.config import Settings
 from meeting_bot.recorder import Recorder, assign_speakers, map_local_labels
 from meeting_bot.transcript import Segment
 from meeting_bot.translator import TranslationError
@@ -1581,3 +1583,193 @@ def test_emit_exception_does_not_kill_asr_worker(monkeypatch):
         thread.join(timeout=10)
     assert not thread.is_alive()
     assert len(r.store.segments()) == 3                 # 收尾未丢语句
+
+
+# ---------------------------------------------------------------------------
+# 云端识别（ASR_PROVIDER=groq）：每条语句到达即识别，不等攒批阈值
+# ---------------------------------------------------------------------------
+
+def _groq_settings():
+    """云端模式 Settings（新增字段带默认值，追加在既有位置参数之后）。"""
+    from meeting_bot.config import Settings
+    return Settings("https://x", "sk-test", "m1", "m2", "medium", "", None, None,
+                    groq_api_key="gsk_test", asr_provider="groq")
+
+
+class FakeCloudASR:
+    """云端 ASR：单条语句一次调用，记录每次收到的样本数（批大小证据）。"""
+
+    def __init__(self):
+        self.calls = 0
+        self.batch_lens: list[int] = []
+        self._produced = 0          # 跨批连续编号：文本与「批次怎么切」解耦
+
+    def transcribe(self, audio, sample_rate=16000):
+        self.calls += 1
+        self.batch_lens.append(len(audio))
+        n = max(1, len(audio) // 16000)
+        segs = [Segment(i + 0.1, i + 0.9, f"line {self._produced + i + 1}", lang="en")
+                for i in range(n)]
+        self._produced += n
+        return segs
+
+
+class FakeCaptureGated:
+    """每喂一块前先等上一块被识别完（calls 追平已喂块数）。
+
+    没有这道闸门，主循环会把 3 条语句一股脑塞进积压，worker 醒来时取走全部 3 条
+    （批大小 48000）—— 那样测的是「取批时机」而不是「云端逐句识别」，且存在竞态。
+    """
+
+    def __init__(self, asr: FakeCloudASR, chunks: int = 3, samples: int = 16000):
+        self._asr = asr
+        self._chunks = [np.zeros(samples, dtype=np.float32)] * chunks
+        self._fed = 0
+        self._done = threading.Event()
+
+    def start(self):
+        pass
+
+    def read(self, timeout=1.0):
+        if self._fed < len(self._chunks):
+            deadline = time.monotonic() + 10.0
+            while self._asr.calls < self._fed and time.monotonic() < deadline:
+                time.sleep(0.005)      # 等上一条语句被识别（批内恒为 1 条）
+            c = self._chunks[self._fed]
+            self._fed += 1
+            return c
+        if self._done.is_set():
+            return None                # 收尾哨兵：只有 stop() 之后才出现
+        time.sleep(0.005)
+        raise queue.Empty()
+
+    def stop(self):
+        self._done.set()
+
+
+def test_groq_provider_processes_each_utterance(monkeypatch):
+    """e. provider=groq：每条语句各自触发一次 transcribe（批大小恒为 1 条）。
+
+    阈值故意压到「永不达标」（999s）：只有 _asr_batch_ready 的 groq 分支
+    （有积压就出批）能让字幕在录制中途逐条出现。
+    变异自查点：去掉 groq 即时出批分支 → 本用例的 calls==3 等待超时失败。
+    """
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVADPerChunk)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 999.0)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_MAX_WAIT", 999.0)
+
+    asr = FakeCloudASR()
+    capture = FakeCaptureGated(asr, chunks=3)
+    r = Recorder(_groq_settings(), capture=capture, asr=asr,
+                 translator=FakeTranslator(), diarizer=None)
+    r.on_status(lambda m: None)
+
+    thread = threading.Thread(target=r.start, args=("云端逐句",), daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: asr.calls == 3), \
+            f"云端模式未逐句识别：calls={asr.calls} batch_lens={asr.batch_lens}"
+        assert asr.batch_lens == [16000, 16000, 16000], asr.batch_lens
+        assert [s.text for s in r.store.segments()] == ["line 1", "line 2", "line 3"]
+        assert r._asr_provider == "groq"
+        assert r._stop.is_set() is False          # 逐句出字幕发生在录制中途
+    finally:
+        r.stop()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert asr.calls == 3
+    assert all(s.translation == "你好世界" for s in r.store.segments())
+
+
+def test_groq_provider_lazy_init_uses_cloud_engine(monkeypatch):
+    """provider=groq 且未注入 asr 时，惰性构造的是 CloudASREngine（不是本地模型）。"""
+    built: list[str] = []
+
+    class _FakeCloudEngine:
+        def __init__(self, settings):
+            built.append("cloud")
+
+        def transcribe(self, audio, sample_rate=16000):
+            n = max(1, len(audio) // 16000)
+            return [Segment(i + 0.5, i + 0.9, "cloud ok", lang="en") for i in range(n)]
+
+    monkeypatch.setattr("meeting_bot.recorder.CloudASREngine", _FakeCloudEngine)
+    monkeypatch.setattr("meeting_bot.recorder.ASREngine",
+                        lambda settings: pytest.fail("groq 模式不得构造本地 ASREngine"))
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+
+    r = Recorder(_groq_settings(), capture=FakeCapture(chunks=1),
+                 translator=FakeTranslator(), diarizer=None)
+    r.on_status(lambda m: None)
+    r.start("云端惰性")
+    r.stop()
+
+    assert built == ["cloud"]
+    assert [s.text for s in r.store.segments()] == ["cloud ok"]
+
+
+def test_groq_provider_cloud_failure_drops_only_that_batch(monkeypatch):
+    """CloudASRError 与本地识别异常同路：只丢该批 + 告警，识别线程存活。"""
+    from meeting_bot.asr import CloudASRError
+
+    class FailingCloudASR:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            raise CloudASRError("云端识别不可用（模拟）")
+
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    asr = FailingCloudASR()
+    r = Recorder(_groq_settings(), capture=FakeCapture(chunks=1), asr=asr,
+                 translator=None, diarizer=None)
+    statuses: list[str] = []
+    r.on_status(statuses.append)
+    r.start("云端失败")
+    r.stop()
+
+    assert asr.calls == 1
+    assert r.store.segments() == []
+    assert any("识别失败" in m and "云端识别不可用" in m for m in statuses)
+    assert not r._asr_thread.is_alive()
+
+
+def test_batch_thresholds_come_from_settings(monkeypatch):
+    """阈值可由 .env（Settings）覆盖；未配置时回落模块常量（既有测试依赖后者）。"""
+    import meeting_bot.recorder as rec
+
+    s = Settings("https://x", "sk-test", "m1", "m2", "medium", "", None, None,
+                 asr_batch_seconds=0.05, asr_batch_max_wait=999.0)
+    r = Recorder(s, capture=FakeCapture(chunks=0), asr=FakeASR(), translator=None,
+                 diarizer=None)
+    r._enqueue_asr(0, np.zeros(16000, dtype=np.float32))   # 1 秒音频 ≥ 0.05s 阈值
+    assert r._asr_batch_ready(False) is True
+
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_MAX_WAIT", 42.0)
+    d = Recorder(_settings(), capture=FakeCapture(chunks=0), asr=FakeASR(),
+                 translator=None, diarizer=None)
+    assert d._asr_batch_seconds == rec.ASR_BATCH_SECONDS == 0.01
+    assert d._asr_batch_max_wait == rec.ASR_BATCH_MAX_WAIT == 42.0
+
+
+def test_asr_config_error_reported_once(monkeypatch):
+    """缺 GROQ_API_KEY 时引擎构造每次失败：告警只报一次，不能刷满状态栏。"""
+    from meeting_bot.config import ConfigError
+
+    def _boom(settings):
+        raise ConfigError("缺少 GROQ_API_KEY")
+
+    monkeypatch.setattr("meeting_bot.recorder.CloudASREngine", _boom)
+    r = Recorder(_groq_settings(), capture=FakeCapture(chunks=0),
+                 translator=None, diarizer=None)
+    statuses: list[str] = []
+    r.on_status(statuses.append)
+
+    for _ in range(3):    # 三条语句各自一批（云端模式逐句识别）
+        r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
+
+    assert sum("识别引擎不可用" in m for m in statuses) == 1
+    assert sum("缺少 GROQ_API_KEY" in m for m in statuses) == 1
+    assert r.store.segments() == []
