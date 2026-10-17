@@ -7,8 +7,10 @@
   c. 字号随窗口宽度缩放 + 倍率 0.6~2.2 钳制；
   d. 滚轮调倍率（走 eventFilter 真实路径）、倍率标签文本与字号同步；
   e. 8px 边缘（右下角）拖拽缩放、中间区域拖动移动窗口、最小尺寸约束；
-  f. show_segment 的块内容（时间+名字 / 译文 / 原文+语种 / 省略重复原文）；
-  g. 回合分块语义：同人连续合并、停顿分块、换人分块、原地更新、按块计数。
+  f. show_segment 的块内容（时间+名字 / 译文段 / 原文段+语种 / 省略重复原文）；
+  g. 回合分块语义：同人连续合并、停顿分块、换人分块、原地更新、按块计数；
+  h. 段落拼接：块内各句不逐句换行，译文段补分隔符规则（无标点补 "，"、
+     下句以标点开头不补、已有句末标点直接相接），原文段用空格拼成小段；
 
 全程 QT_QPA_PLATFORM=offscreen：不弹真实窗口、不建事件循环、不发网络请求。
 布局/滚动区的 range 更新是事件循环驱动的，故断言前用 ``_pump`` 手动跑几轮
@@ -330,8 +332,12 @@ def test_same_turn_merges_into_one_block(qapp, win):
     assert len(blocks) == 1
     b = blocks[0]
     assert b.meta.text() == "[00:00:00]  发言人?"      # 头行取回合首句时间
-    assert b.main.text().split("\n") == ["译文0", "译文1", "译文2"]
-    assert b.sub.text().split("\n") == ["(en) line0", "(en) line1", "(en) line2"]
+    # 译文段：块内各句译文连续拼成一整段（无标点 → 补 "，"），不逐句换行
+    assert b.main.text() == "译文0，译文1，译文2"
+    assert len(b.main.text().splitlines()) == 1
+    # 原文段：空格拼接的一小段，语种标签只在段首出现一次
+    assert b.sub.text() == "(en) line0 line1 line2"
+    assert len(b.sub.text().splitlines()) == 1
     assert b.sub.isVisibleTo(b)
     assert len(b.segments) == 3
     assert [s.start for s in win.current_turn] == [0.0, 1.2, 2.4]
@@ -374,7 +380,7 @@ def test_speaker_change_creates_new_block(qapp, win):
     win2.show_segment(_seg(2, start=2.0, speaker="A"), "发言人?")
     _pump(qapp)
     assert len(win2.entries()) == 1
-    assert win2.entries()[0].main.text().split("\n") == ["译文0", "译文1", "译文2"]
+    assert win2.entries()[0].main.text() == "译文0，译文1，译文2"
     win2.hide()
     win2.deleteLater()
     _pump(qapp)
@@ -392,8 +398,8 @@ def test_block_updates_in_place(qapp, win):
 
     assert len(win.entries()) == 1
     assert win.entries()[0] is first                   # 原地更新，不是新增块
-    assert first.main.text().split("\n") == ["甲甲", "乙乙"]
-    assert first.sub.text().split("\n") == ["(en) aa", "(en) bb"]
+    assert first.main.text() == "甲甲，乙乙"          # 追加后重新拼成一段
+    assert first.sub.text() == "(en) aa bb"
     # 头行仍是回合首句时间
     assert first.meta.text() == "[00:00:00]  甲"
 
@@ -405,9 +411,76 @@ def test_turn_block_falls_back_to_text(qapp, win):
     _pump(qapp)
 
     b = win.entries()[0]
-    assert b.main.text().split("\n") == ["你好", "world"]
-    assert b.sub.text().split("\n") == ["(en) hello"]
+    # 无译文那句的原文占位进译文段（"你好" 无标点 → 补 "，"）
+    assert b.main.text() == "你好，world"
+    # 原文段只收真有译文的句子（world 已在上方占位，不重复）
+    assert b.sub.text() == "(en) hello"
     assert b.sub.isVisibleTo(b)
+
+
+def test_original_paragraph_joins_with_space(qapp, win):
+    """原文段：多句原文用空格拼成一小段（英文自然），不逐句换行。"""
+    win.show_segment(_seg(0, start=0.0, text="hello", lang="", translation="你好"), "甲")
+    win.show_segment(_seg(1, start=1.0, text="world", lang="", translation="世界"), "甲")
+    _pump(qapp)
+
+    b = win.entries()[0]
+    assert b.main.text() == "你好，世界"
+    assert b.sub.text() == "hello world"
+    assert len(b.sub.text().splitlines()) == 1
+    assert b.sub.isVisibleTo(b)
+
+
+def test_no_translation_placeholder_not_duplicated(qapp, win):
+    """无译文句：译文段用原文占位，原文段不含该句（不重复显示）。"""
+    win.show_segment(_seg(0, start=0.0, text="hello", translation="你好"), "甲")
+    win.show_segment(_seg(1, start=1.0, text="pending part", translation=""), "甲")
+    win.show_segment(_seg(2, start=2.0, text="world", translation="世界"), "甲")
+    _pump(qapp)
+
+    b = win.entries()[0]
+    assert b.main.text() == "你好，pending part，世界"
+    assert b.sub.text() == "(en) hello world"          # pending part 不在原文段
+    assert "pending part" not in b.sub.text()
+
+    # 译文到位 → 原地重渲染：占位换译文，原文同时进入原文段
+    assert win.update_segment(
+        _seg(1, start=1.0, text="pending part", translation="待译"), "甲") is True
+    _pump(qapp)
+    assert b.main.text() == "你好，待译，世界"
+    assert b.sub.text() == "(en) hello pending part world"
+
+
+def test_paragraph_separator_rules(qapp, win):
+    """补分隔符只在必要时出现：无标点补 "，"，下一句以标点开头不补，已有标点直接相接。"""
+    # 3 句译文 "你好" / "世界" / "！" → "你好，世界！"（"！" 前不补 "，"）
+    for i, (txt, tr) in enumerate([("a", "你好"), ("b", "世界"), ("c", "！")]):
+        win.show_segment(_seg(i, start=float(i), text=txt, translation=tr), "甲")
+    _pump(qapp)
+    assert win.entries()[0].main.text() == "你好，世界！"
+
+    # 上一句已带句末标点 → 直接相接（靠时间间隔拉开新块）
+    win.show_segment(_seg(10, start=100.0, text="x", translation="今天下雨。"), "乙")
+    win.show_segment(_seg(11, start=101.0, text="y", translation="我们改期"), "乙")
+    _pump(qapp)
+    assert win.entries()[-1].main.text() == "今天下雨。我们改期"
+
+
+def test_join_paragraph_helper():
+    """join_paragraph：空片段跳过、空输入返回空、标点处不重复补分隔符。"""
+    from meeting_bot.subtitle import join_paragraph
+
+    assert join_paragraph([], "，") == ""
+    assert join_paragraph(["你好"], "，") == "你好"
+    assert join_paragraph([" 你好 ", "", "   "], "，") == "你好"
+    assert join_paragraph(["你好", "世界"], "，") == "你好，世界"
+    assert join_paragraph(["你好。", "世界"], "，") == "你好。世界"
+    assert join_paragraph(["你好", "！"], "，") == "你好！"
+    # 英文原文段：punct_gap=" " → 半角标点后补空格，保持词边界
+    assert join_paragraph(["hello", "world"], " ", punct_gap=" ") == "hello world"
+    assert join_paragraph(["hello,", "world"], " ", punct_gap=" ") == "hello, world"
+    # 全角标点后不补空格（中文原文段不会被塞进空格）
+    assert join_paragraph(["今天下雨。", "我们改期"], " ", punct_gap=" ") == "今天下雨。我们改期"
 
 
 def test_turn_cap_counts_blocks(qapp, win):
@@ -496,7 +569,7 @@ def test_show_segment_dedupes_by_seq(qapp, win):
     win.show_segment(_seg(1, start=1.0, text="next", translation="下一句"), "甲")
     _pump(qapp)
     assert len(win.entries()) == 1
-    assert win.entries()[0].main.text().split("\n") == ["译文", "下一句"]
+    assert win.entries()[0].main.text() == "译文，下一句"
 
 
 def test_update_segment_after_block_evicted_is_noop(qapp, win):

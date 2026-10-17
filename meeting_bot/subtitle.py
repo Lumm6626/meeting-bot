@@ -8,7 +8,8 @@
   翻译到达后 ``update_segment`` 按 seq 找到同一句，**原地**替换并重渲染该块
   （不新增块、不重复文本；同 seq 重复到达按更新处理 → 幂等）；
 * 回合分块历史（Teams 转录风）：同一说话人连续说的话合成一个「回合块」——
-  头行时间+说话人、正文为回合内各句译文逐行拼接、副标签为各句原文+语种；
+  头行时间+说话人、正文为回合内各句译文**连续拼成的段落**（不再逐句换行，
+  免得空行把译文挤得看不全）、副标签为回合内各句原文用空格拼成的小段落；
   换人（声纹标签变化）或停顿超过 ``TURN_GAP_SECONDS`` 才开新块；同回合追加
   语句时原地更新该块（不新增条目）；最多保留 ``MAX_TURNS`` 个块，丢弃最旧；
 * 自动跟随：停在底部时新记录自动滚到底；用户向上翻看时暂停，滚回底部恢复；
@@ -18,6 +19,8 @@
   滚轮 / +/- 键调整倍率（0.6~2.2），实际字号 = 基础字号 × 倍率，全部条目同步。
 """
 from __future__ import annotations
+
+from collections.abc import Iterable
 
 from PyQt6.QtCore import QEvent, QPoint, QRectF, QTimer, Qt
 from PyQt6.QtGui import QColor, QPainter
@@ -75,13 +78,67 @@ _CURSORS = {
 }
 
 
+# ---------------------------------------------------------------- 段落拼接
+# 块内不再逐句换行：同一回合的各句连续拼成一段（译文段用 "，"，原文段用 " "）。
+# 补分隔符的判据 —— 只有「上一句没有句末标点」且「下一句不以标点开头」时才补：
+#   "你好" + "世界"           → "你好，世界"
+#   "你好" + "！"             → "你好！"          （下一句以标点开头，不补）
+#   "今天下雨。" + "我们改期"  → "今天下雨。我们改期"（已有句末标点，直接相接）
+#   "hello," + "world"        → "hello, world"   （punct_gap=" "：英文词边界不能丢）
+SENTENCE_END_PUNCT = "。！？；：，、…" + ".!?;:,"
+SENTENCE_START_PUNCT = "。！？；：，、…" + ".!?;:,)）】」』”’"
+CJK_PUNCT = "。！？；：，、…“”‘’（）【】《》"   # 全角标点自带留白，后面不再补空格
+MAIN_JOIN_SEP = "，"     # 译文段分隔符
+SUB_JOIN_SEP = " "       # 原文段分隔符（英文自然）
+
+
+def join_paragraph(parts: Iterable[str], sep: str, *, punct_gap: str = "") -> str:
+    """把一句句文本拼成一整段（不插换行、不留空行）。
+
+    ``sep``：上一句没有句末标点、下一句也不以标点开头时补的连接符；
+    ``punct_gap``：上一句以**半角**标点结尾时补的连接符（英文原文段传空格，
+    否则 "hello," 与 "world" 会粘成 "hello,world"）；全角标点后一律不再补。
+    空片段（含纯空白）直接跳过，全部为空时返回空串。
+    """
+    out = ""
+    for raw in parts:
+        piece = (raw or "").strip()
+        if not piece:
+            continue
+        if out:
+            last = out[-1]
+            if last in SENTENCE_END_PUNCT:
+                if punct_gap and last not in CJK_PUNCT:
+                    out += punct_gap
+            elif piece[0] not in SENTENCE_START_PUNCT:
+                out += sep
+        out += piece
+    return out
+
+
+def _format_original_paragraph(texts: list[str], langs: list[str]) -> str:
+    """原文段：多句原文拼成一小段，语种标签只在段首出现一次。
+
+    同一回合内混用多种语种时（少见）退回逐句前缀，免得张冠李戴；无语种则不加。
+    """
+    if not texts:
+        return ""
+    distinct = {lang for lang in langs if lang}
+    if len(distinct) > 1:
+        texts = [f"({lang}) {text}" if lang else text for text, lang in zip(texts, langs)]
+    body = join_paragraph(texts, SUB_JOIN_SEP, punct_gap=SUB_JOIN_SEP)
+    if len(distinct) == 1:
+        return f"({next(iter(distinct))}) {body}"
+    return body
+
+
 class SubtitleEntry(QWidget):
     """一个「说话回合」块。
 
     头行（小号蓝）：回合首句时间 + 说话人；
-    主标签（主字号白）：回合内各句译文逐行拼接，译文缺失的句子用原文顶上；
-    副标签（小号灰）：回合内各句原文（带 (语种) 前缀）逐行拼接——某句译文与
-    原文完全一致（或该句无译文）时，原文已在主标签可见，不再重复进副标签；
+    主标签（主字号白）：回合内各句译文连续拼成一整段，译文缺失的句子用原文顶上；
+    副标签（小号灰）：回合内各句原文用空格拼成一小段（语种标签只在段首出现一次）
+    ——某句译文与原文完全一致（或该句无译文）时原文已在主标签可见，不重复进副标签；
     副标签整体为空时整行隐藏。
 
     同回合追加语句走 :meth:`add_segment`，原地重建标签文本，控件数量不变。
@@ -155,17 +212,24 @@ class SubtitleEntry(QWidget):
         return False
 
     def _rebuild(self) -> None:
+        """按「段落」重建两块文本：译文段（主标签）+ 原文段（副标签），无换行。
+
+        译文段：各句译文连续拼接（缺译文 → 原文占位，译文到达后原地换掉）；
+        原文段：只收**真有译文**的句子（无译文/译文==原文的句子已在译文段可见，
+        不重复），用空格拼成一小段。两段内都不插入换行或空行。
+        """
         mains: list[str] = []
         subs: list[str] = []
+        sub_langs: list[str] = []
         for s in self.segments:
             tr = (s.translation or "").strip()
             txt = (s.text or "").strip()
             mains.append(tr or txt)             # 译文缺失 → 原文顶上主标签
             if tr and tr != txt:                # 译文==原文时原文已在主标签，不重复
-                lang_part = f"({s.lang}) " if s.lang else ""
-                subs.append(f"{lang_part}{s.text}")
-        self.main.setText("\n".join(mains))
-        self.sub.setText("\n".join(subs))
+                subs.append(txt)
+                sub_langs.append((s.lang or "").strip())
+        self.main.setText(join_paragraph(mains, MAIN_JOIN_SEP))
+        self.sub.setText(_format_original_paragraph(subs, sub_langs))
         self.sub.setVisible(bool(subs))
 
     def set_sizes(self, main_pt: int) -> None:
