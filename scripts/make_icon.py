@@ -39,7 +39,6 @@ BAR_GAP = 11                # 字幕条间距
 BAR_TOP = 156               # 第一条字幕条顶端 y
 BAR_X = 40                  # 字幕条左端 x
 BAR_WIDTHS = (176, 132, 88) # 三条条宽（递减）
-BAR_RADIUS = BAR_H // 2     # 两端圆头 → 胶囊状
 
 COLOR_TOP = (0x2A, 0x7D, 0xE1)
 COLOR_BOTTOM = (0x1F, 0xB6, 0xB8)
@@ -96,12 +95,13 @@ def _draw_master() -> Image.Image:
         x = (n - (right - left)) / 2 - left
         draw.text((x, _s(GLYPH_TOP) - top), GLYPH, font=font, fill=WHITE)
 
-    # 3) 三条字幕条：胶囊圆头、居左错落、宽度递减
+    # 3) 三条字幕条：胶囊圆头（半径 = 半高，圆角精确贴合条高）、居左错落、宽度递减
+    bar_h = _s(BAR_H)
     for i, w in enumerate(BAR_WIDTHS):
         top = _s(BAR_TOP + i * (BAR_H + BAR_GAP))
         draw.rounded_rectangle(
-            (BAR_X * SS, top, _s(BAR_X + w), top + _s(BAR_H)),
-            radius=_s(BAR_RADIUS), fill=WHITE)
+            (_s(BAR_X), top, _s(BAR_X + w), top + bar_h),
+            radius=bar_h // 2, fill=WHITE)
 
     return canvas
 
