@@ -16,11 +16,28 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdi
 
 from .capture import AudioCapture, CaptureError
 from .config import PROJECT_ROOT, ConfigError, Settings, load_settings
-from .diarization import Diarizer, DiarizationError
 from .export import export_all
-from .recorder import Recorder
 from .subtitle import SubtitleWindow
 from .translator import Translator
+
+
+# 重型依赖延迟导入：顶层 import 会连带加载 pyannote/torch/faster-whisper，
+# 实测让「双击快捷方式」到窗口出现的耗时从 ~1 秒涨到 13 秒以上（用户会以为没启动）。
+# 这里留模块级占位名，首次真正需要时由 _ensure_heavy() 填充；测试 monkeypatch
+# 这些名字（非 None）时不会被覆盖。
+Recorder = None        # type: ignore[assignment]
+Diarizer = None        # type: ignore[assignment]
+
+
+def _ensure_heavy() -> None:
+    """填充重型依赖（Recorder → faster-whisper/silero；Diarizer → pyannote/torch）。"""
+    global Recorder, Diarizer
+    if Recorder is None:
+        from .recorder import Recorder as _Recorder
+        Recorder = _Recorder
+    if Diarizer is None:
+        from .diarization import Diarizer as _Diarizer
+        Diarizer = _Diarizer
 
 
 def app_icon() -> QIcon:
@@ -431,39 +448,48 @@ class MainWindow(QMainWindow):
             return None
 
     def _start(self):
-        # 先探测设备再加载翻译/说话人：设备不可用时立刻失败，不必等重型初始化
+        """开始录制：设备探测留在 GUI 线程（快），重型引擎初始化 + 录制放后台线程。
+
+        Recorder 首次导入要加载 faster-whisper/av/torch（实测 3~13 秒），在 GUI
+        线程里做会让窗口「点了没反应」；这里只切按钮状态并提示，初始化在后台完成。
+        """
         capture = self._probe_capture()
         if capture is None:
             return
-        try:
-            translator = Translator(self.settings)
-        except Exception as e:
-            QMessageBox.critical(self, "启动失败", f"翻译接口初始化失败：{e}")
-            return
-        diarizer = None
-        if self.settings.diarize_enabled:
-            try:
-                diarizer = Diarizer(self.settings)
-            except DiarizationError as e:
-                # 预期内：未配置 HF_TOKEN / 模型不可用等
-                self._warn_diarizer_unavailable(e)
-            except Exception as e:
-                # 非预期：Pipeline.from_pretrained 的网络异常（HTTPError/ConnectionError）等。
-                # Qt 槽内异常若外冒会直接终止进程（qFatal），故与预期内一样降级为「无说话人」继续记录。
-                self._warn_diarizer_unavailable(e)
-        self.recorder = Recorder(self.settings, capture=capture, translator=translator,
-                                 diarizer=diarizer,
-                                 audio_source=getattr(self.settings, "audio_source", "both"))
-        self.recorder.on_segment(self.bridge.segment.emit)
-        self.recorder.on_update(self.bridge.update.emit)
-        self.recorder.on_status(self.bridge.status.emit)
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        threading.Thread(
-            target=self.recorder.start,
-            args=(self.title_input.text().strip(),),
-            daemon=True,
-        ).start()
+        self.status.setText("正在准备识别引擎…")
+        title = self.title_input.text().strip()
+
+        def _boot():
+            try:
+                _ensure_heavy()
+                translator = Translator(self.settings)
+            except Exception as e:
+                self.bridge.finished.emit(False, f"启动失败：{e}")
+                return
+            diarizer = None
+            if self.settings.diarize_enabled:
+                try:
+                    diarizer = Diarizer(self.settings)
+                except Exception as e:
+                    # 预期内（未配 HF_TOKEN）与非预期（模型下载/网络异常）一律降级继续：
+                    # Qt 槽内异常外冒会直接终止进程（qFatal），不能让它冒出去。
+                    self._warn_diarizer_unavailable(e)
+            try:
+                self.recorder = Recorder(
+                    self.settings, capture=capture, translator=translator,
+                    diarizer=diarizer,
+                    audio_source=getattr(self.settings, "audio_source", "both"))
+                self.recorder.on_segment(self.bridge.segment.emit)
+                self.recorder.on_update(self.bridge.update.emit)
+                self.recorder.on_status(self.bridge.status.emit)
+            except Exception as e:
+                self.bridge.finished.emit(False, f"启动失败：{e}")
+                return
+            self.recorder.start(title)
+
+        threading.Thread(target=_boot, daemon=True).start()
 
     def _warn_diarizer_unavailable(self, e: Exception) -> None:
         QMessageBox.warning(self, "说话人功能不可用", f"{e}\n\n将继续记录，但无法区分说话人。")
@@ -567,3 +593,20 @@ class MainWindow(QMainWindow):
         # 字幕浮窗是独立顶层窗口：hide 掉才会「最后一个窗口关完 → 进程退出」
         self.subtitle.hide()
         e.accept()
+
+
+def main():
+    """应用入口：创建窗口并进入事件循环（重型依赖由 _start 在后台惰性加载）。"""
+    app = QApplication(sys.argv)
+    try:
+        settings = load_settings()
+    except ConfigError as e:
+        QMessageBox.critical(None, "配置错误", f"{e}\n\n请复制 .env.example 为 .env 并填写配置。")
+        sys.exit(1)
+    win = MainWindow(settings)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

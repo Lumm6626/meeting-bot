@@ -684,3 +684,9 @@ def test_elapsed_label_updates_while_recording(win):
     # 从未开始录制（recorder 为 None）也不能崩
     win.recorder = None
     assert win._refresh_elapsed() == "就绪"
+
+
+def test_entry_point_and_main_exist():
+    """回归：app.main 必须存在且可导入（曾被正则手术误删 → 双击快捷方式毫无反应）。"""
+    import meeting_bot.__main__  # noqa: F401  （导入即验证入口模块完整）
+    assert callable(appmod.main)
