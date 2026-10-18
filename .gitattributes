@@ -1,0 +1,3 @@
+*.bat text eol=crlf
+*.ico binary
+*.py text eol=lf
