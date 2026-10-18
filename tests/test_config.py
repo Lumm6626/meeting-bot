@@ -22,11 +22,20 @@ def test_missing_key_raises(tmp_path, monkeypatch):
 
 
 def test_bad_key_format_raises(tmp_path, monkeypatch):
+    """含非 ASCII 的 key 判为配置错误（前缀格式不再强校验）。"""
     _clean_env(monkeypatch)
     env = tmp_path / ".env"
-    env.write_text("OPENCODE_API_KEY=not-a-key\n", encoding="utf-8")
+    env.write_text("OPENCODE_API_KEY=sk-测试key\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_settings(env)
+
+
+def test_oc_sk_prefix_key_accepted(tmp_path, monkeypatch):
+    """OpenCode Go 新格式 oc_sk_... 必须被接受（旧 sk- 前缀校验会误拒）。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=oc_sk_abc123\n", encoding="utf-8")
+    assert load_settings(env).opencode_api_key == "oc_sk_abc123"
 
 
 def test_valid_env_applies_defaults_and_overrides(tmp_path, monkeypatch):

@@ -77,8 +77,10 @@ def load_settings(env_path: Path | None = None) -> Settings:
     key = (os.getenv("OPENCODE_API_KEY") or "").strip()
     if not key:
         raise ConfigError("缺少 OPENCODE_API_KEY：请复制 .env.example 为 .env 并填入 API key")
-    if not key.startswith("sk-"):
-        raise ConfigError("OPENCODE_API_KEY 格式异常（应以 sk- 开头）")
+    # 前缀不做强校验：OpenCode Go 已出现过 sk- / oc_sk_ 两种格式，硬编码前缀会把
+    # 换 key 变成"配置错误"。这里只拦住明显异常（含空白/非 ASCII）的值。
+    if any(c.isspace() for c in key) or not key.isascii():
+        raise ConfigError("OPENCODE_API_KEY 格式异常（含空白或非 ASCII 字符）")
 
     provider = (os.getenv("ASR_PROVIDER") or "local").strip().lower()
     if provider not in ASR_PROVIDERS:

@@ -18,7 +18,7 @@
    - `HF_TOKEN`：**可选**，仅说话人区分需要。到 https://huggingface.co/settings/tokens
      创建 token，并打开 https://huggingface.co/pyannote/speaker-diarization-3.1
      点击 "Agree and access repository" 接受使用协议；留空则关闭说话人区分
-3. `python install_shortcut.py` 创建桌面快捷方式
+3. `.venv\Scripts\python install_shortcut.py` 创建桌面快捷方式（用 pythonw 启动：只有界面、没有命令行窗口，图标用 assets/app.ico）
 4. 首次运行会自动下载语音模型（small 约 500MB，请耐心等待）
 
 ## 使用
