@@ -334,6 +334,10 @@ class MainWindow(QMainWindow):
 
         self.title_input = QLineEdit()
         self.title_input.setPlaceholderText("会议名称（用于文件命名，可留空）")
+        # 默认用「年-月-日 时:分」预填；用户没手动改过时，点开始时刷新成实际开始时间
+        self._title_edited = False
+        self.title_input.textEdited.connect(self._mark_title_edited)
+        self.title_input.setText(datetime.now().strftime("%Y-%m-%d %H:%M"))
         lay.addWidget(self.title_input)
 
         # ---- 按钮行：主（渐变）/ 次（描边），等高 44px ----
@@ -459,6 +463,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status.setText("正在准备识别引擎…")
+        if not self._title_edited:
+            self.title_input.setText(datetime.now().strftime("%Y-%m-%d %H:%M"))
         title = self.title_input.text().strip()
 
         def _boot():
@@ -490,6 +496,10 @@ class MainWindow(QMainWindow):
             self.recorder.start(title)
 
         threading.Thread(target=_boot, daemon=True).start()
+
+    def _mark_title_edited(self, _text: str = "") -> None:
+        """用户手动改过会议名：之后不再用时间自动覆盖。"""
+        self._title_edited = True
 
     def _warn_diarizer_unavailable(self, e: Exception) -> None:
         QMessageBox.warning(self, "说话人功能不可用", f"{e}\n\n将继续记录，但无法区分说话人。")

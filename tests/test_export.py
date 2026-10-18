@@ -238,3 +238,11 @@ def test_blank_owner_placeholder(tmp_path):
                       action_items=[ActionItem("写方案", "  ", "10/20")])
     texts = _docx_text(minutes_to_docx(m, tmp_path / "纪要.docx"))
     assert "负责人：待定" in texts
+
+
+def test_meeting_dir_no_duplicated_date_when_title_has_one(tmp_path):
+    """标题自带日期（自动生成的会议名）时，目录不再重复前缀日期。"""
+    s = _settings(tmp_path)
+    d = meeting_dir(s, "2026-10-18 18:45", datetime(2026, 10, 18, 18, 45))
+    assert d.name == "2026-10-18 18_45"      # ':' 被净化成 '_'
+    assert not d.name.startswith("2026-10-18_1845_")

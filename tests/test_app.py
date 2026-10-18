@@ -16,6 +16,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 必须在 import PyQt6 之前
 
 import threading
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -690,3 +691,13 @@ def test_entry_point_and_main_exist():
     """回归：app.main 必须存在且可导入（曾被正则手术误删 → 双击快捷方式毫无反应）。"""
     import meeting_bot.__main__  # noqa: F401  （导入即验证入口模块完整）
     assert callable(appmod.main)
+
+
+def test_title_defaults_to_timestamp_and_refreshes(win):
+    """会议名默认「年-月-日 时:分」；用户没手改时，点开始时刷新成实际开始时间。"""
+    assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", win.title_input.text())
+    first = win.title_input.text()
+    win._mark_title_edited("手改的名字")     # 模拟用户手改（textEdited 信号）
+    win.title_input.setText("手改的名字")
+    win._title_edited = True
+    assert win.title_input.text() == "手改的名字"    # 手改后不被覆盖

@@ -43,7 +43,12 @@ def _xml_safe(s: str) -> str:
 
 
 def meeting_dir(settings: Settings, title: str, started_at: datetime) -> Path:
-    d = settings.output_dir / f"{started_at:%Y-%m-%d_%H%M}_{_safe_title(title)}"
+    """产物目录：标题已含日期时直接用标题（避免「日期_时间_日期 时间」重复）。"""
+    safe = _safe_title(title)
+    if re.match(r"^\d{4}-\d{2}-\d{2}", safe):
+        d = settings.output_dir / safe
+    else:
+        d = settings.output_dir / f"{started_at:%Y-%m-%d_%H%M}_{safe}"
     # 防线：净化后仍校验落点包含关系，且先校验后建目录（越界不留半成品）
     assert d.resolve().is_relative_to(settings.output_dir.resolve())
     d.mkdir(parents=True, exist_ok=True)
