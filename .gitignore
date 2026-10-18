@@ -6,3 +6,8 @@ __pycache__/
 会议记录/
 models/
 *.egg-info/
+
+# 临时调试产物
+_*.log
+_*.txt
+.pw_probe*
