@@ -28,7 +28,6 @@ from .translator import Translator
 Recorder = None        # type: ignore[assignment]
 Diarizer = None        # type: ignore[assignment]
 _heavy_lock = threading.Lock()
-_heavy_warm = False
 
 
 def _ensure_heavy(preload_diarize: bool = True) -> None:
@@ -37,7 +36,7 @@ def _ensure_heavy(preload_diarize: bool = True) -> None:
     实测 ``import recorder`` 要 6 秒左右（torch/faster-whisper/silero），所以窗口
     出现后会先调一次预热（见 MainWindow._preload_engine），点开始时不再等这 6 秒。
     """
-    global Recorder, Diarizer, _heavy_warm
+    global Recorder, Diarizer
     with _heavy_lock:
         if Recorder is None:
             from .recorder import Recorder as _Recorder
@@ -45,14 +44,7 @@ def _ensure_heavy(preload_diarize: bool = True) -> None:
         if preload_diarize and Diarizer is None:
             from .diarization import Diarizer as _Diarizer
             Diarizer = _Diarizer
-        if not _heavy_warm:
-            # 预热 silero VAD（约 0.2s），让首次切句不额外等待
-            try:
-                from .vad import UtteranceBuffer
-                UtteranceBuffer()
-            except Exception:
-                pass
-            _heavy_warm = True
+
 
 
 def app_icon() -> QIcon:
@@ -515,6 +507,10 @@ class MainWindow(QMainWindow):
         """后台预热重型依赖：把「点开始记录」的等待从 ~6 秒压到 ~1 秒。"""
         try:
             _ensure_heavy(self.settings.diarize_enabled)
+            # 预热 silero VAD（加载 ONNX，约 0.2 秒）：只放在预热阶段，
+            # 不进点击路径，否则测试里（依赖被打桩时）会白等模型加载
+            from .vad import UtteranceBuffer
+            UtteranceBuffer()
         except Exception:
             pass          # 预热失败不影响使用：首次点击时还会再试一次
 

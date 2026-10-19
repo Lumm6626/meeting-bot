@@ -443,6 +443,8 @@ def _install_fake_stack(monkeypatch):
     monkeypatch.setattr(appmod, "Recorder", _recorder_factory)
     monkeypatch.setattr(appmod, "Translator", lambda settings: object())
     monkeypatch.setattr(appmod, "Diarizer", lambda settings: None)   # 无说话人，不影响录制
+    # 关掉后台预热：它会 import torch（持 GIL 数秒），把被测的后台初始化线程饿死
+    monkeypatch.setattr(appmod.MainWindow, "_preload_engine", lambda self: None)
     return made
 
 
@@ -495,6 +497,9 @@ def test_start_forwards_audio_source_and_reuses_probed_capture(qapp, tmp_path, m
     w = _make_win(qapp, tmp_path, "speaker")
     try:
         w._start()
+        # _start 的重型初始化在后台线程（避免点击卡 6 秒）：等 Recorder 就绪
+        assert _pump_until(qapp, lambda: bool(made["recorder"]) and w.recorder is not None,
+                           timeout=5.0), "后台初始化未在 5 秒内完成"
 
         assert made["capture"], "未做设备探测（构造 AudioCapture）"
         assert made["capture"][0].source == "speaker"
