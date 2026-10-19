@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""配置加载：读取 .env，校验必填项。"""
+"""配置加载：读取 Windows 凭据管理器 / .env，校验必填项。
+
+密钥优先级：**Windows 凭据管理器（keyring）> 环境变量 / .env**。
+keyring 在 Windows 上的后端是 Credential Locker，无需额外服务；导入/后端
+不可用（Linux 无 SecretService、被策略禁用等）时一律静默降级为 .env，
+绝不因为凭据管理器异常而让程序起不来。
+"""
 from __future__ import annotations
 
 import os
@@ -8,7 +14,21 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+try:                      # keyring 缺失（老安装 / 精简环境）时按「无凭据管理器」处理
+    import keyring
+except Exception:         # pragma: no cover - 依赖异常一律降级，不让配置加载失败
+    keyring = None        # type: ignore[assignment]
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------- 凭据管理器
+KEYRING_SERVICE = "meeting-bot"
+# 条目名 ↔ .env 变量名（顺序即 secrets_source 的探测顺序）
+SECRET_ITEMS = (
+    ("opencode_api_key", "OPENCODE_API_KEY"),
+    ("groq_api_key", "GROQ_API_KEY"),
+    ("hf_token", "HF_TOKEN"),
+)
 
 ASR_PROVIDERS = ("local", "groq")
 # 纪要模板：standard 标准（现有顺序）| action_first 行动项优先 | bilingual 中英双语
@@ -82,11 +102,66 @@ def _float_env(name: str) -> float | None:
     return value
 
 
+def _keyring_get(name: str) -> str:
+    """从 Windows 凭据管理器读一项（读不到 / 后端不可用 → ""，绝不抛异常）。
+
+    ``name`` 用条目名（``opencode_api_key`` 等，见 ``SECRET_ITEMS``），
+    服务名固定 ``KEYRING_SERVICE``。
+    """
+    try:
+        mod = keyring
+        if mod is None:
+            return ""
+        return (mod.get_password(KEYRING_SERVICE, name) or "").strip()
+    except Exception:      # 无后端 / 被禁用 / 条目损坏：一律当作「没配」
+        return ""
+
+
+def save_secret(name: str, value: str) -> bool:
+    """把密钥写进 Windows 凭据管理器；写不进去返回 False（调用方回退 .env）。
+
+    值为空串时删除该条目（清空配置 = 移除凭据，不留空密码占位）。
+    """
+    value = (value or "").strip()
+    try:
+        mod = keyring
+        if mod is None:
+            return False
+        if value:
+            mod.set_password(KEYRING_SERVICE, name, value)
+        else:
+            try:
+                mod.delete_password(KEYRING_SERVICE, name)
+            except Exception:   # 本来就没有该条目：删除失败不影响「空值」语义
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def secrets_source(env_path: Path | None = None) -> str:
+    """密钥来源：``"keyring"`` / ``".env"`` / ``"none"``（供 UI 提示用）。
+
+    三项密钥只要有一项来自凭据管理器就算 ``keyring``（迁移完成）；否则只要
+    .env / 环境变量里有非空值就算 ``.env``（明文，给用户一条轻提示）。
+    """
+    env_path = env_path or PROJECT_ROOT / ".env"
+    for item, _var in SECRET_ITEMS:
+        if _keyring_get(item):
+            return "keyring"
+    load_dotenv(env_path)
+    for _item, var in SECRET_ITEMS:
+        if (os.getenv(var) or "").strip():
+            return ".env"
+    return "none"
+
+
 def load_settings(env_path: Path | None = None) -> Settings:
     env_path = env_path or PROJECT_ROOT / ".env"
     load_dotenv(env_path)
 
-    key = (os.getenv("OPENCODE_API_KEY") or "").strip()
+    # 凭据管理器优先，其次 .env / 环境变量（三类密钥一致）
+    key = _keyring_get("opencode_api_key") or (os.getenv("OPENCODE_API_KEY") or "").strip()
     if not key:
         raise ConfigError("缺少 OPENCODE_API_KEY：请复制 .env.example 为 .env 并填入 API key")
     # 前缀不做强校验：OpenCode Go 已出现过 sk- / oc_sk_ 两种格式，硬编码前缀会把
@@ -118,10 +193,12 @@ def load_settings(env_path: Path | None = None) -> Settings:
         translate_model=os.getenv("TRANSLATE_MODEL") or "deepseek-v4-flash",
         minutes_model=os.getenv("MINUTES_MODEL") or "deepseek-v4-pro",
         whisper_model=os.getenv("WHISPER_MODEL") or "small",
-        hf_token=_clean_hf_token(os.getenv("HF_TOKEN") or ""),
+        hf_token=_clean_hf_token(
+            _keyring_get("hf_token") or (os.getenv("HF_TOKEN") or "")),
         output_dir=Path(output_dir),
         root=PROJECT_ROOT,
-        groq_api_key=(os.getenv("GROQ_API_KEY") or "").strip(),
+        groq_api_key=_keyring_get("groq_api_key")
+        or (os.getenv("GROQ_API_KEY") or "").strip(),
         asr_provider=provider,
         audio_source=(os.getenv("AUDIO_SOURCE") or "both").strip().lower(),
         asr_batch_seconds=_float_env("ASR_BATCH_SECONDS"),

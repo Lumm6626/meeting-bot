@@ -8,8 +8,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from meeting_bot.config import save_secret
+
 ROOT = Path(__file__).resolve().parent
 ENV = ROOT / ".env"
+
+# 写入 .env 的注释提示（凭据管理器模式下敏感项留空 + 注释说明）
+KEYRING_HINT = "已存入 Windows 凭据管理器"
 
 PROVIDERS = {
     "1": {
@@ -76,27 +81,61 @@ def main() -> int:
     print("     https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM")
     hf_token = ask("HuggingFace token（hf_ 开头，直接回车跳过）")
 
-    lines = [
-        "# 由 setup_env.py 生成；密钥只存在本机，勿提交到 git",
-        f"OPENCODE_BASE_URL={base}",
-        f"OPENCODE_API_KEY={api_key}",
+    # ---- 密钥写入 Windows 凭据管理器（三处：翻译 / Groq / HF）----
+    # 空值也调用一次：清空旧凭据（删条目），避免「向导里留空、程序仍用旧 key」。
+    secrets = (
+        ("opencode_api_key", api_key),
+        ("groq_api_key", groq_key),
+        ("hf_token", hf_token),
+    )
+    keyring_ok = True
+    for name, value in secrets:
+        if value and not save_secret(name, value):
+            keyring_ok = False
+        elif not value:
+            save_secret(name, value)      # 失败无所谓：本来就没有要写的值
+
+    lines: list[str] = []
+    if keyring_ok:
+        lines.append("# 由 setup_env.py 生成；密钥已存入 Windows 凭据管理器（服务名 meeting-bot）")
+        lines.append("# 本文件不再保存明文密钥，可安全备份（仍建议勿提交到 git）")
+    else:
+        lines.append("# 由 setup_env.py 生成；密钥只存在本机，勿提交到 git")
+    lines.append(f"OPENCODE_BASE_URL={base}")
+    if keyring_ok:
+        lines += [f"# OPENCODE_API_KEY：{KEYRING_HINT}", "OPENCODE_API_KEY="]
+    else:
+        lines.append(f"OPENCODE_API_KEY={api_key}")
+    lines += [
         f"TRANSLATE_MODEL={translate_model}",
         f"MINUTES_MODEL={minutes_model}",
         "WHISPER_MODEL=small",
         f"ASR_PROVIDER={asr}",
-        f"GROQ_API_KEY={groq_key}",
-        f"HF_TOKEN={hf_token}",
+    ]
+    if keyring_ok:
+        lines += [f"# GROQ_API_KEY：{KEYRING_HINT}", "GROQ_API_KEY="]
+    else:
+        lines.append(f"GROQ_API_KEY={groq_key}")
+    if keyring_ok:
+        lines += [f"# HF_TOKEN：{KEYRING_HINT}", "HF_TOKEN="]
+    else:
+        lines.append(f"HF_TOKEN={hf_token}")
+    lines += [
         "DIARIZE_ENABLED=" + ("true" if hf_token else "false"),
         "AUDIO_SOURCE=both",
         "OUTPUT_DIR=会议记录",
         "# 国内网络下载 HuggingFace 模型走镜像（官方 CDN 常被墙）",
         "HF_ENDPOINT=https://hf-mirror.com",
     ]
+
     ENV.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"\n✅ 配置已保存：{ENV}")
+    if keyring_ok:
+        print(f"\n✅ 配置已保存：{ENV}")
+        print("   密钥已存入 Windows 凭据管理器（凭据管理器 → Windows 凭据 → meeting-bot）。")
+    else:
+        print(f"\n⚠️ 未能写入凭据管理器，密钥仍保存在 .env（请勿分享该文件）：{ENV}")
     print("   下一步：双击桌面「会议翻译助手」开始使用。")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

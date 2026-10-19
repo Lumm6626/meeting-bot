@@ -18,7 +18,8 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdi
                              QVBoxLayout, QWidget)
 
 from .capture import AudioCapture, CaptureError
-from .config import PROJECT_ROOT, ConfigError, Settings, load_settings
+from .config import (PROJECT_ROOT, ConfigError, Settings, load_settings,
+                     secrets_source)
 from .export import export_all
 from .subtitle import SubtitleWindow
 from .transcript import (Journal, TranscriptStore, journal_finished, journal_meta,
@@ -74,6 +75,12 @@ PILL_FG = "#A8C7F0"        # 配置胶囊字
 FONT_FAMILY = "Microsoft YaHei UI"
 
 RECORDING_DIR = ".recording"     # <output_dir>/.recording/：边录边落盘的工作区（git 忽略）
+
+WINDOW_TITLE = "会议翻译助手"
+WINDOW_TITLE_RECORDING = "会议翻译助手 · 录音中"
+# 密钥仍是 .env 明文时启动给一条轻提示（不弹窗、不打断）
+PLAINTEXT_SECRETS_HINT = ("提示：密钥存放在 .env 明文文件中，"
+                          "可运行 setup_env.py 迁到 Windows 凭据管理器")
 
 _AUDIO_PILL = {
     "both": "音频 · 自动双路",
@@ -262,6 +269,14 @@ def merge_asr_prompt(base: str, terms: str) -> str:
     return ", ".join(merged)
 
 
+def _secrets_source_is_env() -> bool:
+    """密钥是否来自 .env 明文（读取失败一律当作不是，绝不因提示而崩溃）。"""
+    try:
+        return secrets_source() == ".env"
+    except Exception:
+        return False
+
+
 def asr_pill_text(settings: Settings) -> str:
     """识别徽章：groq → 云端；其余（local）→ 本地 + whisper 模型名。"""
     provider = (getattr(settings, "asr_provider", "local") or "local").strip().lower()
@@ -411,7 +426,13 @@ class MainWindow(QMainWindow):
         card_lay = QVBoxLayout(card)
         card_lay.setContentsMargins(14, 12, 14, 12)
         card_lay.setSpacing(6)
-        self.status = QLabel("就绪")
+        # 密钥来源轻提示：凭据管理器优先；仍是 .env 明文时只在启动状态栏说一句
+        self._secrets_hint = (PLAINTEXT_SECRETS_HINT
+                              if _secrets_source_is_env() else "")
+        status_text = "就绪"
+        if self._secrets_hint:
+            status_text = chr(10).join((status_text, self._secrets_hint))
+        self.status = QLabel(status_text)
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
         self.elapsed_label = QLabel("就绪")
@@ -618,6 +639,7 @@ class MainWindow(QMainWindow):
             return
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self._set_recording_state(True)
         self.status.setText("正在准备识别引擎…")
         if not self._title_edited:
             self.title_input.setText(datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -742,9 +764,17 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=finish, daemon=True).start()
 
+    def _set_recording_state(self, active: bool) -> None:
+        """录制状态同步到「主窗口标题」与「字幕浮窗右上角红点」。"""
+        self.setWindowTitle(WINDOW_TITLE_RECORDING if active else WINDOW_TITLE)
+        setter = getattr(self.subtitle, "set_recording", None)
+        if callable(setter):
+            setter(active)
+
     def _on_finished(self, ok: bool, msg: str):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self._set_recording_state(False)
         self.status.setText("完成" if ok else "导出失败")
         self._refresh_elapsed()          # 计时行立刻回到「就绪」（不必等下一秒的定时器）
         if ok:

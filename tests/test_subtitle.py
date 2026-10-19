@@ -735,3 +735,49 @@ def test_constructor_mode_and_menu_checks(qapp, isolated_mode_settings):
     assert w3.mode == MODE_BILINGUAL
     w3.deleteLater()
     _pump(qapp)
+
+
+# ---------------------------------------------------------------------------
+# j. 录制中提示：右上角红点 + 「录音中」pill（app.py 的 set_recording 驱动）
+# ---------------------------------------------------------------------------
+
+def test_recording_pill_hidden_by_default(qapp, win):
+    """默认不显示录制提示（未录制时不该有红点干扰看字幕）。"""
+    _pump(qapp)
+    assert win.recording is False
+    assert win.recording_pill.isHidden()
+
+
+def test_set_recording_shows_and_hides_pill(qapp, win):
+    win.set_recording(True)
+    _pump(qapp)
+    assert win.recording is True
+    assert win.recording_pill.isVisible(), "录制中红点提示未显示"
+    assert win.recording_label.isVisible()
+    assert "录音中" in win.recording_label.text()
+
+    win.set_recording(False)
+    _pump(qapp)
+    assert win.recording is False
+    assert not win.recording_pill.isVisible(), "停止录制后红点提示未隐藏"
+
+
+def test_recording_pill_sits_top_right(qapp, win):
+    """位置在右上角（不遮挡正文，与右下角倍率提示分离）。"""
+    win.set_recording(True)
+    _pump(qapp)
+    assert win.recording_pill.x() > win.width() // 2
+    assert win.recording_pill.y() < 60
+    right_edge = win.recording_pill.x() + win.recording_pill.width()
+    assert right_edge <= win.width(), "红点 pill 超出窗口右边界"
+
+
+def test_set_recording_is_idempotent(qapp, win):
+    win.set_recording(True)
+    win.set_recording(True)
+    _pump(qapp)
+    assert win.recording is True and win.recording_pill.isVisible()
+    win.set_recording(False)
+    win.set_recording(False)
+    _pump(qapp)
+    assert win.recording is False and not win.recording_pill.isVisible()

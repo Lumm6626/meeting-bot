@@ -27,8 +27,8 @@ from collections.abc import Iterable
 
 from PyQt6.QtCore import QEvent, QPoint, QRectF, QSettings, QTimer, Qt
 from PyQt6.QtGui import QActionGroup, QColor, QPainter
-from PyQt6.QtWidgets import (QFrame, QLabel, QMenu, QScrollArea, QSizePolicy,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMenu, QScrollArea,
+                             QSizePolicy, QVBoxLayout, QWidget)
 
 from .config import SUBTITLE_MODES
 from .transcript import Segment, fmt_ts
@@ -45,6 +45,9 @@ COLOR_META = "#4FC3F7"      # 时间 + 说话人
 COLOR_MAIN = "#FFFFFF"      # 译文（主字号）
 COLOR_SUB = "#B0BEC5"       # 原文 + 语种
 COLOR_ZOOM = "#90A4AE"      # 角落倍率提示
+COLOR_REC_DOT = "#FF5252"   # 录制红点
+REC_PILL_STYLE = ("background-color: rgba(229, 57, 53, 110);"
+                  " border-radius: 9px;")
 
 TURN_GAP_SECONDS = 4.0      # 相邻语句起始时间间隔上限，超过即视为新回合（新块）
 # 2.0 太小：连续说话时句中稍作停顿（2~4 秒）就被切成新块，字幕一块块跳；
@@ -344,6 +347,7 @@ class SubtitleWindow(QWidget):
         self._current_block: SubtitleEntry | None = None
         self._current_speaker = ""                   # 当前回合的声纹标签（可能为空）
         self._zoom = 1.0
+        self._recording = False        # 录制中提示态（set_recording 维护）
         self._auto_scroll = True          # 停在底部 → True，用户向上翻看 → False
         self._op: str | None = None       # "move" / "resize"
         self._grab_edge: str | None = None
@@ -382,12 +386,37 @@ class SubtitleWindow(QWidget):
         self.zoom_label.setFont(f)
         self.zoom_label.hide()
 
+        # 录制中提示：右上角半透明红底 pill（红点 + 「录音中」小字），默认隐藏
+        self.recording_pill = QFrame(self)
+        self.recording_pill.setObjectName("recording_pill")
+        self.recording_pill.setStyleSheet(REC_PILL_STYLE)
+        self.recording_pill.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        pill_lay = QHBoxLayout(self.recording_pill)
+        pill_lay.setContentsMargins(8, 2, 10, 2)
+        pill_lay.setSpacing(4)
+        self.recording_dot = QLabel("●", self.recording_pill)
+        self.recording_dot.setStyleSheet(
+            f"color: {COLOR_REC_DOT}; background: transparent; font-weight: bold;")
+        self.recording_label = QLabel("录音中", self.recording_pill)
+        self.recording_label.setStyleSheet(
+            "color: #FFFFFF; background: transparent; font-weight: bold;")
+        for lab in (self.recording_dot, self.recording_label):
+            f = lab.font()
+            f.setPointSize(9)
+            lab.setFont(f)
+            lab.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            pill_lay.addWidget(lab)
+        self.recording_pill.adjustSize()
+        self.recording_pill.hide()
+
         bar = self.scroll_bar()
         bar.valueChanged.connect(self._on_scroll_changed)
         bar.rangeChanged.connect(self._on_range_changed)
 
         # 子控件（滚动区/视口/容器）自己会吃掉鼠标与滚轮，统一过滤回窗口处理
-        for w in (self.scroll, self.scroll.viewport(), self._container, self.zoom_label):
+        for w in (self.scroll, self.scroll.viewport(), self._container,
+                  self.zoom_label, self.recording_pill):
             w.installEventFilter(self)
 
         # 布局落定后再补一次滚到底（rangeChanged 已覆盖多数情况，这是兜底）
@@ -483,6 +512,32 @@ class SubtitleWindow(QWidget):
                 bar.setValue(min(value, bar.maximum()))
         if persist:
             save_mode(mode)
+
+    # ---------------------------------------------------------- 录制状态提示
+    def set_recording(self, active: bool) -> None:
+        """录制中在右上角显示红点 + 「录音中」pill；停止后隐藏（幂等）。"""
+        self._recording = bool(active)
+        pill = getattr(self, "recording_pill", None)
+        if pill is None:            # 构造期异常状态：不影响既有接口
+            return
+        if self._recording:
+            self._position_recording_pill()
+            pill.show()
+            pill.raise_()
+        else:
+            pill.hide()
+
+    @property
+    def recording(self) -> bool:
+        """当前是否处于「录制中」提示态。"""
+        return bool(getattr(self, "_recording", False))
+
+    def _position_recording_pill(self) -> None:
+        pill = getattr(self, "recording_pill", None)
+        if pill is None:
+            return
+        pill.adjustSize()
+        pill.move(max(6, self.width() - pill.width() - 16), 10)
 
     # ------------------------------------------------------------ 测试辅助
     def entries(self) -> list[SubtitleEntry]:
@@ -647,10 +702,12 @@ class SubtitleWindow(QWidget):
         if getattr(self, "_entries", None) is not None:
             self._apply_fonts()
         self._position_zoom_label()
+        self._position_recording_pill()
 
     def showEvent(self, e):
         super().showEvent(e)
         self._apply_fonts()
+        self._position_recording_pill()
         self.setFocus()
 
     def wheelEvent(self, e):

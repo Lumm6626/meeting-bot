@@ -66,6 +66,15 @@ def qapp():
 
 
 @pytest.fixture(autouse=True)
+def _no_secrets_probe(monkeypatch):
+    """默认不改状态栏提示：避免读开发者本机凭据库/环境变量，断言可复现。
+
+    需要提示的用例在测试体内再 monkeypatch 成 ".env"（后设的覆盖本 fixture）。
+    """
+    monkeypatch.setattr(appmod, "secrets_source", lambda: "none")
+
+
+@pytest.fixture(autouse=True)
 def _no_preload(monkeypatch):
     """整个模块禁用后台预热：它在后台 import torch（持 GIL 数秒），会让依赖时序的
     用例（后台初始化线程）随机变慢/超时。真实启动行为由 test_preload_runs 覆盖。"""
@@ -846,4 +855,84 @@ def test_start_terms_without_env_prompt(qapp, tmp_path, monkeypatch):
     finally:
         w.recorder = None
         w.start_btn.setEnabled(True)
+        w.hide()
+
+
+# ---------------------------------------------------------------------------
+# f. 录制中醒目提示：窗口标题 + 字幕浮窗红点（keyring 之外的用户感知）
+# ---------------------------------------------------------------------------
+
+class _RecordingSubtitle:
+    """字幕面板替身：记录 set_recording 调用（其余接口空实现）。"""
+
+    def __init__(self):
+        self.recording_calls: list[bool] = []
+
+    def set_recording(self, active: bool):
+        self.recording_calls.append(bool(active))
+
+    def show_segment(self, *_a, **_k):
+        pass
+
+    def update_segment(self, *_a, **_k):
+        return False
+
+    def hide(self):
+        pass
+
+
+def test_start_and_finish_toggle_recording_ui(qapp, tmp_path, monkeypatch):
+    """_start → 标题含「录音中」+ set_recording(True)；_on_finished → 全部复位。"""
+    _install_fake_stack(monkeypatch)
+    monkeypatch.setattr(appmod.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(appmod.QMessageBox, "critical", lambda *a, **k: None)
+    w = _make_win(qapp, tmp_path, "both")
+    fake = _RecordingSubtitle()
+    w.subtitle = fake
+    try:
+        assert w.windowTitle() == appmod.WINDOW_TITLE
+
+        w._start()
+        assert "录音中" in w.windowTitle(), "开始录制后主窗口标题没有提示录音中"
+        assert fake.recording_calls == [True], "未通知字幕浮窗显示录制提示"
+        assert _pump_until(qapp, lambda: w.recorder is not None, timeout=5.0)
+
+        w._on_finished(True, "已生成")
+        assert w.windowTitle() == appmod.WINDOW_TITLE, "收尾完成后标题未复位"
+        assert fake.recording_calls[-1] is False
+        assert w.start_btn.isEnabled()
+    finally:
+        w.recorder = None
+        w.hide()
+
+
+def test_plaintext_secrets_hint_in_status(qapp, tmp_path, monkeypatch):
+    """密钥还在 .env 明文 → 启动状态栏追加一条轻提示（不弹窗）。"""
+    monkeypatch.setattr(appmod, "secrets_source", lambda: ".env")
+    w = MainWindow(_settings(tmp_path))
+    for timer_name in ("_timer", "_elapsed_timer"):
+        timer = getattr(w, timer_name, None)
+        if timer is not None:
+            timer.stop()
+    try:
+        text = w.status.text()
+        assert ".env" in text and "凭据管理器" in text
+        assert "setup_env.py" in text
+    finally:
+        w.recorder = None
+        w.hide()
+
+
+def test_no_hint_when_secrets_in_keyring(qapp, tmp_path, monkeypatch):
+    """已在凭据管理器：状态栏保持干净的「就绪」，不打扰用户。"""
+    monkeypatch.setattr(appmod, "secrets_source", lambda: "keyring")
+    w = MainWindow(_settings(tmp_path))
+    for timer_name in ("_timer", "_elapsed_timer"):
+        timer = getattr(w, timer_name, None)
+        if timer is not None:
+            timer.stop()
+    try:
+        assert w.status.text() == "就绪"
+    finally:
+        w.recorder = None
         w.hide()
