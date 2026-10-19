@@ -38,6 +38,8 @@ ASR_BATCH_SECONDS = 30.0      # 攒够 30 秒音频触发一批识别
 ASR_BATCH_MAX_WAIT = 35.0     # 静默会议兜底：最老语句积压 35 秒墙钟也强制识别
 ASR_POLL_TIMEOUT = 0.5        # 识别 worker 轮询间隔（无新语句也要醒来查 max-wait）
 ASR_JOIN_TIMEOUT = 180.0      # stop() 等识别线程把收尾批（最后 30s+ 音频）识别完的上限
+# 云端识别（groq）不可用时自动切本地的告警文案：只在回退那一刻报一次
+ASR_FALLBACK_MESSAGE = "[警告] 云端识别不可用，已自动切换本地识别（速度会变慢，但不会丢句）"
 
 
 def map_local_labels(prev_labeled: list[tuple[float, float, str]],
@@ -136,6 +138,9 @@ class Recorder:
         # 引擎构造失败（缺 GROQ_API_KEY 等配置错误）只告警一次：这是持续性问题，
         # 每句都报会把状态栏刷满、把字幕挤没（云端模式下每句都触发一次识别尝试）
         self._asr_engine_error_said = False
+        # 云端识别失败时是否已回退过本地引擎：只回退一次（回退后再失败不再重试，
+        # 否则云端挂掉 + 本地也挂时会无限重试同一批音频）
+        self._asr_fallback_used = False
         # 识别线程已收尾（批队列全部产出）：翻译 worker 必须等到它才排空退出，
         # 否则收尾批的语句入队时 worker 已因「生产者完结 + 队列空」退出 → 无人翻译。
         self._asr_finished = threading.Event()
@@ -346,6 +351,48 @@ class Recorder:
             return self._asr.transcribe(audio, should_stop=self._stop.is_set)
         return self._asr.transcribe(audio)
 
+    def _make_asr_engine(self):
+        """按当前 provider 惰性构造识别引擎（首批语句到来时调用）。
+
+        groq 模式走云端 client：没有 500MB 模型下载，也不用等首句识别预热；
+        本地模式加载 faster-whisper 模型。回退到本地后 provider 已置 "local"，
+        这里自然构造本地引擎。
+        """
+        if self._asr_provider == "groq":
+            return CloudASREngine(self._settings)
+        return ASREngine(self._settings)
+
+    def _fallback_to_local(self) -> bool:
+        """云端识别不可用 → 永久切到本地引擎（整场只切一次）。
+
+        返回 True 表示「已切到本地，可以用同一批音频重试」；返回 False 表示不该切
+        （本来就是本地 / 已经切过）或本地引擎起不来（此时保持原状，交给调用方按
+        普通失败丢弃该批）。
+
+        为什么只切一次：云端挂掉时每批都会失败，若每次都重建本地引擎，会把
+        WhisperModel 的加载开销（数百 MB）反复付一遍；且「回退后再失败」若仍重试，
+        同一批音频会无限循环重试，识别线程等于窒息。
+        """
+        if self._asr_provider != "groq" or self._asr_fallback_used:
+            return False
+        # 先落状态再构造：构造若抛异常，也不能再次进入回退分支（防重复告警/重试）
+        self._asr_provider = "local"
+        self._asr_fallback_used = True
+        # 先告警再构造：本地模型首次加载可能要几十秒（未缓存时还要下载数百 MB），
+        # 用户需要立刻知道「字幕为什么停了」，而不是盯着一片空白等。状态回调只报
+        # 一次 —— _asr_fallback_used 已置位，后续批次不会再走本分支。
+        self._say(ASR_FALLBACK_MESSAGE)
+        try:
+            engine = ASREngine(self._settings)
+        except Exception as e:
+            # 本地模型也起不来（首次下载失败/磁盘满）：保持 self._asr 为 None，
+            # 让后续批次按 provider=local 再试一次构造，失败只走一次性告警路径。
+            self._asr = None
+            self._say(f"[警告] 本地识别引擎无法启动，本场不再有字幕：{e}")
+            return False
+        self._asr = engine
+        return True
+
     def _transcribe_batch(self, batch: list[tuple[int, np.ndarray]]) -> None:
         if not batch:
             return
@@ -368,26 +415,37 @@ class Recorder:
         try:
             if self._asr is None:
                 # 惰性创建：重型模型只在首批语句到来时加载（测试注入 fake 时不走此行）。
-                # groq 模式走云端 client：没有 500MB 模型下载，也不用等首句识别预热。
-                self._asr = (CloudASREngine(self._settings)
-                             if self._asr_provider == "groq" else ASREngine(self._settings))
+                self._asr = self._make_asr_engine()
             segments = self._transcribe(audio)
         except Exception as e:
-            # 单批失败只丢这一批（告警可见），不得杀掉识别线程 —— 否则整场再无字幕。
-            # 云端模式的 CloudASRError（重试后仍失败/结构异常/被停止）与本地异常同路处理；
-            # 缺 key 时 CloudASREngine 构造抛 ConfigError 也落在这里（告警里带原因）。
-            # CloudASRConfigError 是 ConfigError 的子类（key 无效/无权限），
-            # 所以下面这一个分支同时覆盖「缺 key」与「key 无效」两种配置类错误。
-            if isinstance(e, ConfigError):
-                # 配置错误是持续性的：首次失败后每句都会再失败，只报一次即可，
-                # 否则状态栏被同一句警告刷满、字幕反而看不见。
-                if self._asr_engine_error_said:
+            # 云端模式失败（限速/断网/key 失效/结构异常）时先尝试降级：切本地引擎
+            # 立即重跑同一批音频 —— 用户最不能接受的是「整场没有字幕」，慢一点可以。
+            fallback_ok = self._fallback_to_local()
+            if fallback_ok:
+                try:
+                    segments = self._transcribe(audio)
+                except Exception as e2:
+                    # 本地也失败：回退后不再重试（否则同一批音频无限重试），
+                    # 按原逻辑丢这一批 + 告警，线程继续跑下一批。
+                    self._say(f"[警告] 识别失败（本批 {len(batch)} 条语句已丢弃）：{e2}")
                     return
-                self._asr_engine_error_said = True
-                self._say(f"[错误] 识别引擎不可用，本场不再有字幕：{e}")
+            else:
+                # 单批失败只丢这一批（告警可见），不得杀掉识别线程 —— 否则整场再无字幕。
+                # 走到这里的情形：非云端失败（本地引擎报错/云端已回退过）。
+                # 云端模式的 CloudASRError（重试后仍失败/结构异常/被停止）与本地异常同路处理；
+                # 缺 key 时 CloudASREngine 构造抛 ConfigError 也落在这里（告警里带原因）。
+                # CloudASRConfigError 是 ConfigError 的子类（key 无效/无权限），
+                # 所以下面这一个分支同时覆盖「缺 key」与「key 无效」两种配置类错误。
+                if isinstance(e, ConfigError):
+                    # 配置错误是持续性的：首次失败后每句都会再失败，只报一次即可，
+                    # 否则状态栏被同一句警告刷满、字幕反而看不见。
+                    if self._asr_engine_error_said:
+                        return
+                    self._asr_engine_error_said = True
+                    self._say(f"[错误] 识别引擎不可用，本场不再有字幕：{e}")
+                    return
+                self._say(f"[警告] 识别失败（本批 {len(batch)} 条语句已丢弃）：{e}")
                 return
-            self._say(f"[警告] 识别失败（本批 {len(batch)} 条语句已丢弃）：{e}")
-            return
 
         def to_abs(t_rel: float, is_end: bool = False) -> float:
             """拼接缓冲内的相对秒 → 会议绝对秒（按语句分段映射回填间隙）。

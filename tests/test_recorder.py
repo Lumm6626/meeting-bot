@@ -2064,7 +2064,11 @@ def test_groq_provider_lazy_init_uses_cloud_engine(monkeypatch):
 
 
 def test_groq_provider_cloud_failure_drops_only_that_batch(monkeypatch):
-    """CloudASRError 与本地识别异常同路：只丢该批 + 告警，识别线程存活。"""
+    """云端失败 → 回退本地；本地也失败时只丢该批 + 告警，识别线程存活。
+
+    回退改造后「云端失败」不再直接丢批（先切本地重试），本用例固定住回退后的
+    兜底：本地引擎同样失败 → 丢这一批、告警可见、线程不猝死（后续批次仍能跑）。
+    """
     from meeting_bot.asr import CloudASRError
 
     class FailingCloudASR:
@@ -2075,7 +2079,25 @@ def test_groq_provider_cloud_failure_drops_only_that_batch(monkeypatch):
             self.calls += 1
             raise CloudASRError("云端识别不可用（模拟）")
 
+    class FailingLocalASR:
+        """回退目标：本地引擎也起不来/也失败（模型未下载、CPU 打满等）。"""
+
+        def __init__(self, settings):
+            self.calls = 0
+
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            raise CloudASRError("本地识别不可用（模拟）")
+
+    built: list[FailingLocalASR] = []
+
+    def _make_local(settings):
+        eng = FailingLocalASR(settings)
+        built.append(eng)
+        return eng
+
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASREngine", _make_local)
     asr = FailingCloudASR()
     r = Recorder(_groq_settings(), capture=FakeCapture(chunks=1), asr=asr,
                  translator=None, diarizer=None)
@@ -2085,8 +2107,9 @@ def test_groq_provider_cloud_failure_drops_only_that_batch(monkeypatch):
     r.stop()
 
     assert asr.calls == 1
-    assert r.store.segments() == []
-    assert any("识别失败" in m and "云端识别不可用" in m for m in statuses)
+    assert len(built) == 1 and built[0].calls == 1     # 回退 + 同一批立即重试
+    assert r.store.segments() == []                    # 本地也失败 → 该批丢弃
+    assert any("识别失败" in m and "本地识别不可用" in m for m in statuses), statuses
     assert not r._asr_thread.is_alive()
 
 
@@ -2110,31 +2133,39 @@ def test_batch_thresholds_come_from_settings(monkeypatch):
 
 
 def test_asr_config_error_reported_once(monkeypatch):
-    """缺 GROQ_API_KEY 时引擎构造每次失败：告警只报一次，不能刷满状态栏。"""
+    """本地引擎构造持续失败（模型损坏/磁盘满等）：告警只报一次，不能刷满状态栏。
+
+    注意本用例用 provider=local：groq 的配置类错误（缺 key/key 无效）在新实现里
+    会先回退本地（见 test_asr_cloud_config_error_falls_back_to_local），不再走
+    「本场不再有字幕」的一次性告警；一次性告警保留给「本地也起不来」这种无路可退
+    的情形 —— 它是持续性的，每批都会复现。
+    """
     from meeting_bot.config import ConfigError
 
     def _boom(settings):
-        raise ConfigError("缺少 GROQ_API_KEY")
+        raise ConfigError("本地模型不可用（模拟）")
 
-    monkeypatch.setattr("meeting_bot.recorder.CloudASREngine", _boom)
-    r = Recorder(_groq_settings(), capture=FakeCapture(chunks=0),
+    monkeypatch.setattr("meeting_bot.recorder.ASREngine", _boom)
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    r = Recorder(_settings(), capture=FakeCapture(chunks=0),
                  translator=None, diarizer=None)
     statuses: list[str] = []
     r.on_status(statuses.append)
 
-    for _ in range(3):    # 三条语句各自一批（云端模式逐句识别）
+    for _ in range(3):    # 三批：每批都会再撞一次同样的构造失败
         r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
 
-    assert sum("识别引擎不可用" in m for m in statuses) == 1
-    assert sum("缺少 GROQ_API_KEY" in m for m in statuses) == 1
+    assert sum("识别引擎不可用" in m for m in statuses) == 1, statuses
+    assert sum("本地模型不可用" in m for m in statuses) == 1, statuses
     assert r.store.segments() == []
 
 
-def test_asr_cloud_config_error_reported_once(monkeypatch):
-    """M1. key 无效/无权限（CloudASRConfigError）与缺 key 同待遇：只告警一次。
+def test_asr_cloud_config_error_falls_back_to_local(monkeypatch):
+    """M1 + 回退。key 无效/无权限（CloudASRConfigError）也走回退：不整场没字幕。
 
-    这类错误每次识别都必然复现（key 不会自己变好），逐句告警会把状态栏刷满、
-    把真正的字幕挤掉 —— 所以必须走 ConfigError 的一次性告警路径。
+    这类错误每次识别都必然复现（key 不会自己变好），旧实现干脆整场放弃字幕。
+    现在先切本地（本地识别不需要 key），并把「云端不可用」只报一次：
+    既不刷满状态栏，也不用让用户重开录制。
     """
     from meeting_bot.asr import CloudASRConfigError
 
@@ -2146,20 +2177,158 @@ def test_asr_cloud_config_error_reported_once(monkeypatch):
             self.calls += 1
             raise CloudASRConfigError("GROQ_API_KEY 无效或无权限（HTTP 401）")
 
+    class _LocalOk:
+        def __init__(self, settings):
+            self.calls = 0
+
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            return [Segment(0.5, 0.9, "本地兜底", lang="zh")]
+
+    built: list[_LocalOk] = []
+
+    def _make_local(settings):
+        eng = _LocalOk(settings)
+        built.append(eng)
+        return eng
+
+    monkeypatch.setattr("meeting_bot.recorder.ASREngine", _make_local)
     asr = _BadKeyCloud()
     r = Recorder(_groq_settings(), capture=FakeCapture(chunks=0),
                  asr=asr, translator=None, diarizer=None)
     statuses: list[str] = []
     r.on_status(statuses.append)
 
-    for _ in range(3):    # 三条语句各自一批（云端模式逐句识别）
+    for _ in range(3):    # 三批：回退后全部由本地引擎接手
         r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
 
-    assert asr.calls == 3, "批次仍要尝试（不得因已告警就跳过调用）"
-    assert sum("识别引擎不可用" in m for m in statuses) == 1, statuses
-    assert sum("HTTP 401" in m for m in statuses) == 1, statuses
-    assert sum("识别失败" in m for m in statuses) == 0, "配置错误不该报成普通批次失败"
+    assert asr.calls == 1, "回退后不再调用云端引擎（key 已确定不可用）"
+    assert len(built) == 1, "只回退一次（不得每批重建本地模型）"
+    assert built[0].calls == 3, "回退后每批都走本地（含回退当场的那次重试）"
+    assert sum("已自动切换本地识别" in m for m in statuses) == 1, statuses
+    assert sum("识别引擎不可用" in m for m in statuses) == 0, "已回退，不得再说整场没字幕"
+    assert sum("识别失败" in m for m in statuses) == 0, "本地成功，不该报批次失败"
+    assert [s.text for s in r.store.segments()] == ["本地兜底"] * 3
+    assert r._asr_provider == "local"
+
+
+# ---------------------------------------------------------------------------
+# 云端识别失败自动回退本地（不丢句）
+# ---------------------------------------------------------------------------
+
+def test_cloud_failure_falls_back_to_local(monkeypatch):
+    """Groq 挂掉（限速/断网/key 失效）时不丢句：切本地引擎重跑同一批音频。
+
+    旧实现：云端失败只告警 + 丢弃该批 → 用户整场没有字幕。
+    新实现：回退本地并继续，代价是字幕变慢（本地攒批 30s/35s），但内容不丢。
+
+    变异自查点：把 ``_fallback_to_local`` 的调用去掉（回到「丢批」）→ store 恒为空
+    → 本用例的 segments 断言失败。
+    """
+    from meeting_bot.asr import CloudASRError
+
+    class CeilingCloudASR:
+        """云端引擎：始终不可用（模拟 Groq 限速/断网/key 失效）。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            raise CloudASRError("云端识别不可用（模拟限速）")
+
+    class LocalASR:
+        """回退目标：本地引擎正常，返回 1 条语句。"""
+
+        def __init__(self, settings):
+            self.calls = 0
+            self.batch_lens: list[int] = []
+
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            self.batch_lens.append(len(audio))
+            return [Segment(0.5, 2.5, "本地识别结果", lang="zh")]
+
+    built: list[LocalASR] = []
+
+    def _make_local(settings):
+        eng = LocalASR(settings)
+        built.append(eng)
+        return eng
+
+    monkeypatch.setattr("meeting_bot.recorder.ASREngine", _make_local)
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    cloud = CeilingCloudASR()
+    r = Recorder(_groq_settings(), capture=FakeCapture(chunks=1), asr=cloud,
+                 translator=None, diarizer=None)
+    statuses: list[str] = []
+    r.on_status(statuses.append)
+
+    r.start("云端挂掉")
+    r.stop()
+
+    assert cloud.calls == 1, "云端先试一次"
+    assert len(built) == 1, "必须切到本地引擎"
+    assert built[0].calls == 1, "同一批音频要立即用本地重试（不丢句）"
+    assert [s.text for s in r.store.segments()] == ["本地识别结果"]
+    assert any("已自动切换本地识别" in m for m in statuses), statuses
+    assert not any("识别失败" in m for m in statuses), "回退成功不得报「本批已丢弃」"
+    assert r._asr_provider == "local", "回退后 provider 必须转 local（后续批次走本地攒批）"
+    assert r._asr_fallback_used is True
+
+
+def test_fallback_only_once(monkeypatch):
+    """回退只发生一次：本地也失败时每批只告警丢弃，不重建引擎、不再回退。
+
+    为什么必须限一次：云端挂掉时每批都会失败，若每次都重建本地引擎，就要反复付
+    WhisperModel 的加载开销；若「回退后再失败」仍重试同一批音频，识别线程会卡死
+    在这一批上无限循环。
+
+    计数说明：断言的是本地引擎的**构造**次数 == 1（= 回退次数）。transcribe 调用
+    次数等于批次数是设计使然 —— 回退后所有批次本就都该走本地。
+    """
+    from meeting_bot.asr import CloudASRError
+
+    class FailingCloudASR:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            raise CloudASRError("云端识别不可用（模拟限速）")
+
+    class FailingLocalASR:
+        def __init__(self, settings):
+            self.calls = 0
+
+        def transcribe(self, audio, sample_rate=16000):
+            self.calls += 1
+            raise CloudASRError("本地识别也不可用（模拟）")
+
+    built: list[FailingLocalASR] = []
+
+    def _make_local(settings):
+        eng = FailingLocalASR(settings)
+        built.append(eng)
+        return eng
+
+    monkeypatch.setattr("meeting_bot.recorder.ASREngine", _make_local)
+    cloud = FailingCloudASR()
+    r = Recorder(_groq_settings(), capture=FakeCapture(chunks=0), asr=cloud,
+                 translator=None, diarizer=None)
+    statuses: list[str] = []
+    r.on_status(statuses.append)
+
+    for _ in range(3):    # 三批：云端首批失败 → 回退；之后每批只告警
+        r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
+
+    assert cloud.calls == 1, "回退后不再调用云端引擎"
+    assert len(built) == 1, "回退只发生一次（不得每批重建本地引擎）"
+    assert built[0].calls == 3, "回退后每批仍交给本地（含回退当场的那次重试）"
+    assert sum("已自动切换本地识别" in m for m in statuses) == 1, statuses
+    assert sum("识别失败" in m for m in statuses) == 3, f"每批各告警一次：{statuses}"
     assert r.store.segments() == []
+    assert r._asr_provider == "local"
 
 
 def test_groq_transcribe_receives_should_stop(monkeypatch):
