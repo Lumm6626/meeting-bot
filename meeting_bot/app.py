@@ -25,6 +25,9 @@ from .subtitle import SubtitleWindow
 from .transcript import (Journal, TranscriptStore, journal_finished, journal_meta,
                          load_journal, write_footer)
 from .translator import Translator
+# 声纹库只依赖 numpy（几十毫秒）：可以在顶层 import；真正的 pyannote 模型在
+# voiceprints 内部惰性加载，不拖慢窗口出现。
+from .voiceprints import VoiceprintLibrary, compute_speaker_embeddings
 
 
 # 重型依赖延迟导入：顶层 import 会连带加载 pyannote/torch/faster-whisper，
@@ -115,6 +118,9 @@ OFFLINE_DIARIZE_STATUS = ("正在会后标注说话人"
                           "（约 0.5~1.5 倍会议时长，可继续用电脑）")
 OFFLINE_DIARIZED_DONE = "说话人标注完成，已更新逐字稿"
 OFFLINE_NO_AUDIO = "[提示] 未保存录音（SAVE_AUDIO=false），跳过会后说话人标注"
+# 声纹计算的硬上限：模型要下载 / 网络卡住 / CPU 太慢时，绝不能拖着不导出产物。
+# 冷启动（import torch + 加载 wespeaker + 每人 ≤60 秒音频）实测 20 秒内，留足余量。
+VOICEPRINT_TIMEOUT = 120.0
 
 WINDOW_TITLE = "会议翻译助手"
 WINDOW_TITLE_RECORDING = "会议翻译助手 · 录音中"
@@ -371,6 +377,9 @@ class RecorderBridge(QObject):
     recovered = pyqtSignal(bool, str)
     # 会后离线说话人标注结果（后台线程 → GUI 线程）：ok, 提示文案
     diarized = pyqtSignal(bool, str)
+    # 声纹库认出的「熟人」建议（后台线程 → GUI 线程）：{label: (姓名, 分数)}
+    # 单独一个信号而不是塞进 diarized：认人要弹模态框问用户，必须由主线程做
+    speaker_suggestions = pyqtSignal(object)
 
 
 class MainWindow(QMainWindow):
@@ -390,6 +399,10 @@ class MainWindow(QMainWindow):
         self.bridge.finished.connect(self._on_finished)
         self.bridge.recovered.connect(self._on_recovered)
         self.bridge.diarized.connect(self._on_diarized)
+        self.bridge.speaker_suggestions.connect(self._on_speaker_suggestions)
+        # 声纹库（本地 声纹库.json）：会后认「熟人」，改名即学习。IO 异常由库自己吞掉。
+        self._voiceprints = VoiceprintLibrary()
+        self._reset_voiceprints()
         # 关窗触发收尾时置 True：导出完成后由 _on_finished 直接退出应用
         self._quit_after_stop = False
 
@@ -683,6 +696,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._set_recording_state(True)
+        self._reset_voiceprints()
         self.status.setText("正在准备识别引擎…")
         if not self._title_edited:
             self.title_input.setText(datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -816,6 +830,8 @@ class MainWindow(QMainWindow):
         emit = getattr(self.recorder, "emit_speaker_renamed", None)
         if callable(emit):
             emit(label, name)
+        # ③ 声纹学习：新名字入库；若与本次自动匹配的建议不同，还要剔除那条误样本
+        self._learn_rename(label, name)
 
     def _stop(self):
         if not self.recorder:
@@ -896,6 +912,7 @@ class MainWindow(QMainWindow):
         任何失败（无 token / 模型下载失败 / 磁盘异常 / 导出异常）只告警：
         初版产物在导出成功时就已落盘，标注失败不改变它们。
         """
+        suggestions = None
         try:
             diarizer_cls, assign = _resolve_diarize_tools()
             diarizer = diarizer_cls(self.settings)
@@ -907,6 +924,8 @@ class MainWindow(QMainWindow):
             for seg in store.segments():
                 if seg.speaker:
                     store.register_label(seg.speaker)
+            # 声纹认人：算出本场每人的声纹向量并与本地库比对（失败只跳过，不影响产物）
+            suggestions = self._collect_voiceprints(store, audio, sample_rate, spans)
             # 覆盖同名产物：逐字稿/纪要现在带说话人
             export_all(store, self.settings, title, started_at,
                        translator=getattr(recorder, "translator", None))
@@ -914,11 +933,180 @@ class MainWindow(QMainWindow):
             self.bridge.diarized.emit(
                 False, f"[警告] 会后说话人标注失败（已导出的产物保持原样）：{e}")
             return
+        # 建议在产物更新之后发：模态框出现时，用户手上的文件已经是带说话人版本
+        if suggestions is not None:
+            self.bridge.speaker_suggestions.emit(suggestions)
         self.bridge.diarized.emit(True, OFFLINE_DIARIZED_DONE)
 
     def _on_diarized(self, ok: bool, msg: str) -> None:
         """标注结果回到 GUI 线程：只更新状态栏（不弹窗打断用户）。"""
         self.status.setText(msg)
+
+    # ------------------------------------------------------------------
+    # 说话人记忆（声纹库）：会后认「熟人」+ 改名即学习
+    # ------------------------------------------------------------------
+
+    def _voiceprint_on(self) -> bool:
+        """声纹库开关（VOICEPRINT_ENABLED，默认开）。关掉 = 不认人也不学习。"""
+        return bool(getattr(self.settings, "voiceprint_enabled", True))
+
+    def _reset_voiceprints(self) -> None:
+        """新一场会议：清掉上一场的待入库向量 / 已入库标记 / 自动匹配建议。
+
+        不清的话，上一场残留的 SPEAKER_00 向量会在本场第一次改名时被当成
+        「本场这个人的样本」写进库 —— 名字对、人却是另一个，等于往库里灌脏数据。
+        """
+        self._pending_vectors: dict[str, object] = {}
+        self._adopted: dict[str, str] = {}
+        self._suggestion_names: dict[str, str] = {}
+
+    def _embed_with_deadline(self, audio, sample_rate, spans):
+        """带硬超时地算声纹向量：模型下载卡住 / 网络不通时也要按时把产物交出去。
+
+        daemon 线程是为了「超时就真的放弃」：线程池在解释器退出时会 join，
+        卡住的下载会拖住整个程序退不出去；daemon 线程随进程一起消失。
+        """
+        box: dict[str, object] = {}
+        token = getattr(self.settings, "hf_token", "")
+
+        def work() -> None:
+            try:
+                box["value"] = compute_speaker_embeddings(
+                    audio, sample_rate, spans, token=token)
+            except Exception:        # 声纹是增强项：算不出来就当没有
+                box["value"] = {}
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        worker.join(VOICEPRINT_TIMEOUT)
+        value = box.get("value")
+        return value if isinstance(value, dict) else {}
+
+    def _collect_voiceprints(self, store, audio, sample_rate, spans):
+        """（标注线程）算本场声纹向量 → 比对本地库 → 返回 ``{label: (姓名, 分数)}``。
+
+        完全跳过（开关关掉 / 模型不可用 / 没有人声段）返回 ``None``，没有熟人时返回
+        ``{}``（空字典也要发回主线程：库里已有名字的标签还能靠这次学会样本）。
+        跑在非 GUI 线程：只碰 numpy 与库实例，绝不碰 Qt 控件。
+        """
+        if not self._voiceprint_on():
+            return None
+        embeddings = self._embed_with_deadline(audio, sample_rate, spans)
+        if not embeddings:
+            return None
+        threshold = float(getattr(self.settings, "voiceprint_threshold", 0.75) or 0.75)
+        known = {sp.label for sp in store.speakers()}
+        suggestions: dict[str, tuple[str, float]] = {}
+        for label, vector in embeddings.items():
+            label = str(label)
+            if known and label not in known:      # 库里算出来的标签必须在本场存在
+                continue
+            # 向量先暂存：等用户确认 / 之后手动改名时入库（本场结束也不丢）
+            self._pending_vectors[label] = vector
+            try:
+                hits = self._voiceprints.match(vector, threshold=threshold)
+            except Exception:
+                hits = []
+            if hits:
+                suggestions[label] = (str(hits[0][0]), float(hits[0][1]))
+        return suggestions
+
+    def _on_speaker_suggestions(self, suggestions) -> None:
+        """（GUI 线程）会后声纹建议：先把已有名字的入库，再问「要不要自动命名」。"""
+        if not self._voiceprint_on():
+            return
+        store = getattr(getattr(self, "recorder", None), "store", None)
+        if store is None:
+            return
+        known = {sp.label for sp in store.speakers()}
+        wanted: dict[str, tuple[str, float]] = {}
+        for label, value in dict(suggestions or {}).items():
+            label = str(label)
+            try:
+                name, score = str(value[0]), float(value[1])
+            except (TypeError, IndexError, ValueError):
+                continue
+            if label in known:            # 只认当前这场会议的标签（上一场的建议一律丢弃）
+                wanted[label] = (name, score)
+        # 用户此前手动改过名的标签：本场向量直接入学（不必等这次弹框）
+        changed = self._adopt_named(store)
+        if not wanted:
+            if changed:
+                self._voiceprints.save()
+            return
+        self._suggestion_names.update({l: n for l, (n, _s) in wanted.items()})
+        body = chr(10).join(f"  {l} ≈ {n}（{s:.2f}）" for l, (n, s) in wanted.items())
+        ret = QMessageBox.question(
+            self, "识别到熟悉发言人",
+            f"识别到熟悉发言人：{chr(10)}{body}{chr(10)}{chr(10)}"
+            f"是否用这些名字自动命名？（点「否」保持标签，之后在表格里改名也会记住）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            if changed:
+                self._voiceprints.save()
+            return                        # 保持标签：向量留在库里，下次匹配更准
+        for label, (name, _score) in wanted.items():
+            store.set_speaker_name(label, name)     # 落 store（导出产物与字幕都以它为准）
+            changed |= self._adopt_vector(label, name)
+        self._sync_subtitle_names()
+        refresh = getattr(self.subtitle, "refresh_names", None)
+        if callable(refresh):
+            refresh()                     # 已显示的块立刻换名字
+        self._refresh_speakers()          # 表格别等 5 秒定时器
+        if changed:
+            self._voiceprints.save()
+
+    def _adopt_named(self, store) -> bool:
+        """把「本场已有人名」的标签向量入库（自动应用 / 用户先前手动改名都算）。"""
+        changed = False
+        for speaker in store.speakers():
+            if speaker.label and (speaker.name or "").strip():
+                changed |= self._adopt_vector(speaker.label, speaker.name)
+        return changed
+
+    def _adopt_vector(self, label: str, name: str) -> bool:
+        """本场这个 label 的向量 → 记到 name 名下（同名只记一次，改名则重记）。"""
+        name = (name or "").strip()
+        if not name or self._adopted.get(label) == name:
+            return False
+        vector = self._pending_vectors.get(label)
+        if vector is None:                # 本场没算出这个 label 的向量（无音频 / 模型不可用）
+            return False
+        if not self._voiceprints.add(name, vector):
+            return False
+        self._adopted[label] = name
+        return True
+
+    def _learn_rename(self, label: str, name: str) -> None:
+        """（GUI 线程）改名 = 人工确认「这个声纹标签就是这个人」→ 声纹库学习。
+
+        两类信号：① 正样本——本场该 label 的向量记到新名字下（下次就能认出来）；
+        ② 纠错——本次自动匹配建议的是**别人**，说明库里那条样本是误归属，剔除它
+        （否则下次还会认错）。改名是用户动作、库操作只是内存 + 一个小 JSON（毫秒级），
+        异常一律吞掉：不能因为「学不会」而让改名报错。
+        """
+        if not self._voiceprint_on():
+            return
+        name = (name or "").strip()
+        suggested = self._suggestion_names.pop(label, "")
+        adopted = self._adopted.get(label, "")
+        # 该标签此前被记到过谁名下（自动匹配建议 / 本场已入库），而现在改成了别人：
+        # 这些归属都是错的，得把那条样本从库里剔除（去重后各剔除一次）
+        wrong = {other for other in (suggested, adopted) if other and other != name}
+        try:
+            changed = False
+            vector = self._pending_vectors.get(label) if wrong else None
+            if vector is not None:
+                for other in sorted(wrong):
+                    changed |= bool(self._voiceprints.penalize(other, vector))
+                # 误样本已剔除：同一条向量重新记到新名字下（它是对的样本，只是记错了人）
+                self._adopted.pop(label, None)
+            if name:
+                changed |= self._adopt_vector(label, name)
+            if changed:
+                self._voiceprints.save()
+        except Exception as e:            # 改名本身已经生效，这里只提示一句
+            self.status.setText(f"[警告] 声纹学习失败（改名已生效）：{e}")
 
     def _set_recording_state(self, active: bool) -> None:
         """录制状态同步到「主窗口标题」与「字幕浮窗右上角红点」。"""

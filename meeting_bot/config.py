@@ -77,6 +77,11 @@ class Settings:
     # 会后离线说话人标注（OFFLINE_DIARIZE）：录制结束、初版产物导出后，再对整场音频
     # 跑一遍 pyannote 并把「谁说的」补进逐字稿/纪要（耗时约 0.5~1.5 倍会议时长）。
     offline_diarize: bool = True
+    # 声纹库（VOICEPRINT_ENABLED / VOICEPRINT_THRESHOLD）：会后算声纹向量记住「谁的声音」，
+    # 下次自动认人；用户在表格里改名即入库学习。库是本机 声纹库.json（已 git 忽略）。
+    voiceprint_enabled: bool = True
+    # 余弦相似度阈值：越高越保守（宁可认不出，不可认错人）；0.75 是实测较稳的默认值
+    voiceprint_threshold: float = 0.75
 
 
 def _clean_hf_token(raw: str) -> str:
@@ -115,6 +120,27 @@ def _bool_env(name: str, default: bool = True) -> bool:
     if not raw:
         return default
     return raw not in ("false", "0", "no", "off")
+
+
+def _float_env_or(name: str, default: float, *, low: float = 0.0,
+                  high: float = 1.0) -> float:
+    """读浮点环境变量：未配置 / 非法 / 越界一律回退 default（不抛异常）。
+
+    与 ``_float_env`` 的区别：声纹阈值是「调参」而不是「必需配置」，手滑写成
+    ``0.75x`` 或 ``abc`` 不该让程序起不来 —— 回退默认值继续能用，用户只会发现
+    识别严了一点/松了一点。
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    # NaN / inf 也走这里：`low < nan` 恒为 False，自然回退
+    if not (low < value <= high):
+        return default
+    return value
 
 
 def _keyring_get(name: str) -> str:
@@ -226,4 +252,6 @@ def load_settings(env_path: Path | None = None) -> Settings:
         subtitle_mode=subtitle_mode,
         save_audio=_bool_env("SAVE_AUDIO", True),
         offline_diarize=_bool_env("OFFLINE_DIARIZE", True),
+        voiceprint_enabled=_bool_env("VOICEPRINT_ENABLED", True),
+        voiceprint_threshold=_float_env_or("VOICEPRINT_THRESHOLD", 0.75),
     )

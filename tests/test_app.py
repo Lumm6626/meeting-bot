@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PyQt6.QtWidgets import QAbstractItemView, QApplication, QTableWidgetItem
 from PyQt6.QtWidgets import QSystemTrayIcon as _RealTray
@@ -30,6 +31,7 @@ import meeting_bot.app as appmod
 from meeting_bot.app import MainWindow
 from meeting_bot.config import Settings
 from meeting_bot.transcript import Segment, TranscriptStore
+from meeting_bot.voiceprints import VoiceprintLibrary
 
 WIDGETS = ("title_input", "terms_input", "status", "start_btn", "stop_btn", "speaker_table")
 
@@ -76,6 +78,14 @@ def _no_secrets_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_embedding_model(monkeypatch):
+    """默认不加载真声纹模型：它在后台 import torch 并去 HF 拉权重（无缓存时会重试
+    到超时），本模块其余用例并不需要它。需要声纹行为的用例在测试体内再 monkeypatch
+    成自己的 fake（后设的覆盖本 fixture）。"""
+    monkeypatch.setattr(appmod, "compute_speaker_embeddings", lambda *a, **k: {})
+
+
+@pytest.fixture(autouse=True)
 def _no_preload(monkeypatch):
     """整个模块禁用后台预热：它在后台 import torch（持 GIL 数秒），会让依赖时序的
     用例（后台初始化线程）随机变慢/超时。真实启动行为由 test_preload_runs 覆盖。"""
@@ -85,6 +95,8 @@ def _no_preload(monkeypatch):
 @pytest.fixture
 def win(qapp, tmp_path):
     w = MainWindow(_settings(tmp_path))
+    # 声纹库指到 tmp_path：测试绝不读写真仓库里的 声纹库.json（生物特征数据）
+    w._voiceprints = VoiceprintLibrary(tmp_path / "声纹库.json")
     # 关掉定时刷新（说话人 5s / 录制计时 1s）：避免其读写控件干扰「零控件访问」断言
     for timer_name in ("_timer", "_elapsed_timer"):
         timer = getattr(w, timer_name, None)
@@ -1285,3 +1297,312 @@ def test_refresh_speakers_rebuilds_rows_when_not_editing(win, qapp):
     assert win.speaker_table.item(0, 0).text() == "SPEAKER_00"
     assert win.speaker_table.item(0, 1).text() == ""             # store 里还没名字
     assert win.speaker_table.item(0, 1) is not old_item
+
+
+# ---------------------------------------------------------------------------
+# d. 声纹库：会后认「熟人」+ 改名即学习（全部 fake，不加载模型、不碰磁盘）
+# ---------------------------------------------------------------------------
+
+VEC = np.array([1.0, 0.0], dtype=np.float32)
+
+
+class _FakeVoiceprints:
+    """VoiceprintLibrary 替身：记录调用与参数，绝不读写磁盘。"""
+
+    def __init__(self, hits=None):
+        self.hits = list(hits or [])
+        self.thresholds: list[float] = []
+        self.added: list[tuple[str, object]] = []
+        self.penalized: list[tuple[str, object]] = []
+        self.saves = 0
+
+    def match(self, vector, threshold=0.75):
+        self.thresholds.append(threshold)
+        return list(self.hits)
+
+    def add(self, name, vector):
+        self.added.append((name, vector))
+        return True
+
+    def penalize(self, name, vector, tol=0.15):
+        self.penalized.append((name, vector))
+        return True
+
+    def save(self):
+        self.saves += 1
+        return True
+
+
+def _fake_embeddings(monkeypatch, embeddings, calls=None):
+    """把真模型整段换掉：compute_speaker_embeddings 直接返回给定向量。"""
+    calls = calls if calls is not None else []
+
+    def fake(audio, sample_rate, spans, embed_fn=None, token=None):
+        calls.append((len(audio), sample_rate, list(spans)))
+        return dict(embeddings)
+
+    monkeypatch.setattr(appmod, "compute_speaker_embeddings", fake)
+    return calls
+
+
+def _questions(recorded):
+    return [d for d in recorded if d[0] == "question"]
+
+
+def test_offline_diarize_suggests_known_speaker_and_applies(
+        win, qapp, dialogs, monkeypatch, tmp_path, ):
+    """会后认出熟人 → 弹框问 → 选「是」：store 里改名、向量入库、产物照旧重导出。"""
+    recorded, answer = dialogs
+    exports, export_threads, calls, seen = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    _fake_embeddings(monkeypatch, {"SPEAKER_00": VEC})
+    library = _FakeVoiceprints(hits=[("张总", 0.83)])
+    win._voiceprints = library
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+    answer["ret"] = appmod.QMessageBox.StandardButton.Yes
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.speaker_suggestions.connect(seen.append)
+
+    win._stop()
+    assert _pump_until(
+        qapp, lambda: recorder.store.display_name("SPEAKER_00") == "张总", timeout=15.0), \
+        f"没有自动命名：seen={seen} 表格={win.speaker_table.rowCount()}"
+
+    # ① 信号契约：{label: (姓名, 分数)}，只发给主线程弹框用
+    assert seen == [{"SPEAKER_00": ("张总", 0.83)}]
+    # ② 弹框问过用户，且写明「谁 ≈ 谁（多少分）」
+    queries = _questions(recorded)
+    assert len(queries) == 1
+    assert "≈" in queries[0][2] and "张总" in queries[0][2] and "0.83" in queries[0][2]
+    # ③ store 落名字（导出产物与字幕都以它为准）+ 表格立刻可见
+    assert recorder.store.display_name("SPEAKER_00") == "张总"
+    assert win.speaker_table.item(0, 1).text() == "张总"
+    # ④ 本场向量入库 + 落盘；阈值来自 settings
+    assert library.added == [("张总", VEC)]
+    assert library.saves >= 1
+    assert library.thresholds == [0.75]
+    # ⑤ 认人不影响产物：初版 + 标注版各导出一次
+    assert len(exports) == 2
+
+
+def test_offline_diarize_suggestion_declined_keeps_labels(
+        win, qapp, dialogs, monkeypatch, tmp_path):
+    """选「否」：标签保持原样、不入库；但向量留着（下次改名时学，匹配也不丢）。"""
+    recorded, answer = dialogs
+    exports, export_threads, calls, seen = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    _fake_embeddings(monkeypatch, {"SPEAKER_00": VEC})
+    library = _FakeVoiceprints(hits=[("张总", 0.83)])
+    win._voiceprints = library
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+    answer["ret"] = appmod.QMessageBox.StandardButton.No
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.speaker_suggestions.connect(seen.append)
+
+    win._stop()
+    assert _pump_until(qapp, lambda: bool(_questions(recorded)) and bool(seen), timeout=15.0)
+    assert _pump_until(qapp, lambda: win.start_btn.isEnabled())
+
+    assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"   # 名字没被改
+    assert library.added == []                                         # 没名字就不入库
+    # 向量留着：之后用户在表格里改名时 `_learn_rename` 会拿它当正样本
+    assert "SPEAKER_00" in win._pending_vectors
+    assert win._suggestion_names == {"SPEAKER_00": "张总"}             # 供「改错即纠正」用
+
+
+def test_offline_diarize_without_embeddings_skips_recognition(
+        win, qapp, dialogs, monkeypatch, tmp_path):
+    """声纹算不出来（没 token / 没音频 / 模型挂）：不弹框、不发建议，产物照常更新。"""
+    recorded, _answer = dialogs
+    exports, export_threads, calls, seen = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    _fake_embeddings(monkeypatch, {})
+    library = _FakeVoiceprints(hits=[("张总", 0.83)])
+    win._voiceprints = library
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.speaker_suggestions.connect(seen.append)
+
+    win._stop()
+    assert _pump_until(qapp, lambda: len(exports) == 2 and win.start_btn.isEnabled())
+    deadline = time.time() + 0.3
+    while time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+    assert seen == [] and _questions(recorded) == []
+    assert library.added == [] and library.thresholds == []
+
+
+def test_voiceprint_disabled_skips_whole_path(win, qapp, dialogs, monkeypatch, tmp_path):
+    """.env 里 VOICEPRINT_ENABLED=false：连向量都不算（省时间），一切照旧。"""
+    exports, export_threads, calls, seen = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    emb = _fake_embeddings(monkeypatch, {"SPEAKER_00": VEC})
+    library = _FakeVoiceprints(hits=[("张总", 0.83)])
+    win._voiceprints = library
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken",
+                                       voiceprint_enabled=False)
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.speaker_suggestions.connect(seen.append)
+
+    win._stop()
+    assert _pump_until(qapp, lambda: len(exports) == 2 and win.start_btn.isEnabled())
+    assert emb == []            # 开关关掉就别白算声纹
+    assert seen == [] and library.thresholds == []
+
+
+def _rename_setup(win, library, label="SPEAKER_00", suggested="", vector=VEC):
+    """搭一个「本场已有声纹向量」的改名场景（recorder + 表格数据）。"""
+    win._voiceprints = library
+    win.subtitle = _RenameSubtitle()
+    rec = _RenameRecorder()
+    rec.store.register_label(label)
+    win.recorder = rec
+    win._pending_vectors = {label: vector} if vector is not None else {}
+    win._suggestion_names = {label: suggested} if suggested else {}
+    return rec
+
+
+def test_rename_learns_vector_and_penalizes_wrong_auto_match(win, qapp):
+    """改名 = 正样本入库；与自动匹配建议不同 → 剔除那条误归属样本（仅一次）。"""
+    library = _FakeVoiceprints()
+    rec = _rename_setup(win, library, suggested="张总")
+
+    _rename_in_table(win, "SPEAKER_00", "李四")
+
+    assert rec.renames == [("SPEAKER_00", "李四")]      # A3 广播照旧
+    assert library.penalized == [("张总", VEC)], "认错人了却没剔除误样本"
+    assert library.added == [("李四", VEC)], "新名字的样本没入库"
+    assert library.saves == 1, "学完没落盘（重启就白学）"
+    assert win._suggestion_names == {}, "建议已处理完，不该留着再纠正一次"
+
+
+def test_rename_matching_suggestion_does_not_penalize(win, qapp):
+    """用户把标签改成「就是建议的那个名字」：只入库，不惩罚（匹配是对的）。"""
+    library = _FakeVoiceprints()
+    _rename_setup(win, library, suggested="张总")
+
+    _rename_in_table(win, "SPEAKER_00", "张总")
+
+    assert library.penalized == []
+    assert library.added == [("张总", VEC)]
+    assert library.saves == 1
+
+
+def test_rename_without_pending_vector_touches_no_library(win, qapp):
+    """本场没算出这个标签的向量（没音频 / 无 token）：改名只是改名，库不动。"""
+    library = _FakeVoiceprints()
+    _rename_setup(win, library, suggested="张总", vector=None)
+
+    _rename_in_table(win, "SPEAKER_00", "李四")
+
+    assert library.added == [] and library.penalized == []
+    assert library.saves == 0
+
+
+def test_rename_twice_relearns_and_drops_previous_name(win, qapp):
+    """标签改两次（先李四、后王五 = 用户自己写错了）：新名字学一份，旧名字那条剔掉。"""
+    library = _FakeVoiceprints()
+    _rename_setup(win, library, suggested="")
+
+    _rename_in_table(win, "SPEAKER_00", "李四")
+    assert library.added == [("李四", VEC)]
+    _rename_in_table(win, "SPEAKER_00", "王五")
+
+    assert library.added == [("李四", VEC), ("王五", VEC)]
+    assert library.penalized == [("李四", VEC)], "旧名字的误样本没剔除，下次还会认成李四"
+
+
+def test_adopt_vector_does_not_duplicate_same_name(win, qapp):
+    """同场同一标签 → 同一个名字只入库一次（弹框自动命名与手动改名都会走这条）。"""
+    library = _FakeVoiceprints()
+    _rename_setup(win, library)
+
+    assert win._adopt_vector("SPEAKER_00", "李四") is True
+    assert win._adopt_vector("SPEAKER_00", "李四") is False
+    assert library.added == [("李四", VEC)]
+    assert library.penalized == []
+
+
+def test_correcting_auto_applied_name_relearns(win, qapp, dialogs):
+    """自动命名后用户发现认错了：剔除「张总」那条，并把同一条向量记到「李四」名下。"""
+    recorded, answer = dialogs
+    answer["ret"] = appmod.QMessageBox.StandardButton.Yes
+    library = _FakeVoiceprints(hits=[("张总", 0.83)])
+    rec = _rename_setup(win, library, vector=VEC)
+    win._pending_vectors = {"SPEAKER_00": VEC}
+
+    win._on_speaker_suggestions({"SPEAKER_00": ("张总", 0.83)})
+    assert rec.store.display_name("SPEAKER_00") == "张总"
+    assert library.added == [("张总", VEC)]
+
+    _rename_in_table(win, "SPEAKER_00", "李四")         # 用户发现认错了
+
+    assert library.penalized == [("张总", VEC)], "误归属样本没被剔除"
+    assert library.added[-1] == ("李四", VEC), "同一条向量没记到正确的人名下"
+    assert rec.store.display_name("SPEAKER_00") == "李四"
+    assert len(_questions(recorded)) == 1
+
+
+def test_voiceprint_embedding_has_hard_deadline(win, qapp, dialogs, monkeypatch, tmp_path):
+    """模型下载 / 网络卡住：按超时放弃，产物照常导出（声纹绝不能拖住交付）。"""
+    exports, export_threads, calls, seen = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    monkeypatch.setattr(appmod, "VOICEPRINT_TIMEOUT", 0.05)
+
+    def hang(*_a, **_k):
+        time.sleep(2.0)                 # 比超时更长
+        return {"SPEAKER_00": VEC}
+
+    monkeypatch.setattr(appmod, "compute_speaker_embeddings", hang)
+    library = _FakeVoiceprints(hits=[("张总", 0.83)])
+    win._voiceprints = library
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.speaker_suggestions.connect(seen.append)
+
+    started = time.time()
+    win._stop()
+    assert _pump_until(qapp, lambda: len(exports) == 2 and win.start_btn.isEnabled(),
+                       timeout=15.0)
+    assert time.time() - started < 5.0, "声纹卡住时把产物一起拖住了"
+    assert seen == [] and library.thresholds == []
+    assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"
+
+
+def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, tmp_path):
+    """HF token 由 settings 传入（密钥在 Windows 凭据管理器里时环境变量是空的）。"""
+    exports, export_threads, calls, captured = [], [], {}, {}
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+
+    def fake(audio, sample_rate, spans, embed_fn=None, token=None):
+        captured["token"] = token
+        return {}
+
+    monkeypatch.setattr(appmod, "compute_speaker_embeddings", fake)
+    win._voiceprints = _FakeVoiceprints()
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_from_keyring")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+
+    win._stop()
+    assert _pump_until(qapp, lambda: bool(captured) and len(exports) == 2, timeout=15.0)
+    assert captured["token"] == "hf_from_keyring"

@@ -14,7 +14,8 @@ def _clean_env(monkeypatch):
                 "MINUTES_MODEL", "WHISPER_MODEL", "HF_TOKEN", "OUTPUT_DIR",
                 "GROQ_API_KEY", "ASR_PROVIDER",
                 "ASR_BATCH_SECONDS", "ASR_BATCH_MAX_WAIT", "MINUTES_TEMPLATE",
-                "SUBTITLE_MODE", "DIARIZE_ENABLED", "SAVE_AUDIO", "OFFLINE_DIARIZE"):
+                "SUBTITLE_MODE", "DIARIZE_ENABLED", "SAVE_AUDIO", "OFFLINE_DIARIZE",
+                "VOICEPRINT_ENABLED", "VOICEPRINT_THRESHOLD"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -214,6 +215,53 @@ def test_offline_diarize_independent_of_realtime_flag(tmp_path, monkeypatch):
     s = load_settings(env)
     assert s.diarize_enabled is False
     assert s.offline_diarize is True
+
+
+# ---------------------------------------------------------------------------
+# 声纹库（VOICEPRINT_ENABLED / VOICEPRINT_THRESHOLD）
+# ---------------------------------------------------------------------------
+
+def test_voiceprint_defaults(tmp_path, monkeypatch):
+    """不写这两项时默认开启、阈值 0.75（老 .env 无需改动）。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123" + NL, encoding="utf-8")
+    s = load_settings(env)
+    assert s.voiceprint_enabled is True
+    assert s.voiceprint_threshold == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("on", True),
+    ("false", False), ("0", False), ("off", False), ("NO", False),
+])
+def test_voiceprint_enabled_parsing(tmp_path, monkeypatch, value, expected):
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123",
+                            f"VOICEPRINT_ENABLED={value}"]), encoding="utf-8")
+    assert load_settings(env).voiceprint_enabled is expected
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("0.9", 0.9), ("0.7", 0.7), (" 0.82 ", 0.82), ("1", 1.0),
+])
+def test_voiceprint_threshold_parsing(tmp_path, monkeypatch, value, expected):
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123",
+                            f"VOICEPRINT_THRESHOLD={value}"]), encoding="utf-8")
+    assert load_settings(env).voiceprint_threshold == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("bad", ["abc", "0.75x", "", "nan", "inf", "0", "-0.5", "1.5"])
+def test_voiceprint_threshold_bad_value_falls_back(tmp_path, monkeypatch, bad):
+    """阈值是调参而非必需配置：写错/越界不该让程序起不来，回退 0.75。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123",
+                            f"VOICEPRINT_THRESHOLD={bad}"]), encoding="utf-8")
+    assert load_settings(env).voiceprint_threshold == pytest.approx(0.75)
 
 
 # ---------------------------------------------------------------------------

@@ -19,3 +19,7 @@ cache/
 .recording/
 .env.*
 !.env.example
+
+# 声纹库（生物特征数据，只在本地，不入库）
+声纹库.json
+声纹库.json.tmp
