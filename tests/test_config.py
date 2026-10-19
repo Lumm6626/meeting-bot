@@ -9,7 +9,8 @@ def _clean_env(monkeypatch):
     for var in ("OPENCODE_API_KEY", "OPENCODE_BASE_URL", "TRANSLATE_MODEL",
                 "MINUTES_MODEL", "WHISPER_MODEL", "HF_TOKEN", "OUTPUT_DIR",
                 "GROQ_API_KEY", "ASR_PROVIDER",
-                "ASR_BATCH_SECONDS", "ASR_BATCH_MAX_WAIT", "MINUTES_TEMPLATE"):
+                "ASR_BATCH_SECONDS", "ASR_BATCH_MAX_WAIT", "MINUTES_TEMPLATE",
+                "SUBTITLE_MODE"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -195,3 +196,44 @@ def test_invalid_minutes_template_raises(tmp_path, monkeypatch):
         load_settings(env)
     assert "MINUTES_TEMPLATE" in str(ei.value)
     assert "action_first" in str(ei.value)      # 错误信息要带上合法取值
+
+# ---------------------------------------------------------------------------
+# SUBTITLE_MODE（字幕显示：bilingual 中英对照 / zh_only 只中文）
+# ---------------------------------------------------------------------------
+
+def test_subtitle_mode_defaults_to_bilingual(tmp_path, monkeypatch):
+    """不写 SUBTITLE_MODE 时默认中英对照（老 .env 无需改动，行为不变）。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123\n", encoding="utf-8")
+    assert load_settings(env).subtitle_mode == "bilingual"
+
+
+@pytest.mark.parametrize("value", ["bilingual", "zh_only"])
+def test_subtitle_mode_accepts_legal_values(tmp_path, monkeypatch, value):
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(f"OPENCODE_API_KEY=sk-test123\nSUBTITLE_MODE={value}\n",
+                   encoding="utf-8")
+    assert load_settings(env).subtitle_mode == value
+
+
+def test_subtitle_mode_case_insensitive(tmp_path, monkeypatch):
+    """手写 ZH_Only 不该被判成配置错误（与 ASR_PROVIDER / MINUTES_TEMPLATE 一致）。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123\nSUBTITLE_MODE=ZH_Only\n",
+                   encoding="utf-8")
+    assert load_settings(env).subtitle_mode == "zh_only"
+
+
+def test_invalid_subtitle_mode_raises(tmp_path, monkeypatch):
+    """拼错必须报错：静默回落会让用户以为切换没生效。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123\nSUBTITLE_MODE=zh_only_mode\n",
+                   encoding="utf-8")
+    with pytest.raises(ConfigError) as ei:
+        load_settings(env)
+    assert "SUBTITLE_MODE" in str(ei.value)
+    assert "zh_only" in str(ei.value)          # 错误信息带上合法取值

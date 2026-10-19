@@ -13,6 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ASR_PROVIDERS = ("local", "groq")
 # 纪要模板：standard 标准（现有顺序）| action_first 行动项优先 | bilingual 中英双语
 MINUTES_TEMPLATES = ("standard", "action_first", "bilingual")
+# 字幕显示模式：bilingual 中英对照（默认）| zh_only 只显示中文译文
+SUBTITLE_MODES = ("bilingual", "zh_only")
 
 
 class ConfigError(Exception):
@@ -46,6 +48,8 @@ class Settings:
     asr_prompt: str = ""
     # 纪要模板（见 MINUTES_TEMPLATES）：决定 minutes() 用哪套 prompt
     minutes_template: str = "standard"
+    # 字幕显示模式（见 SUBTITLE_MODES）：bilingual 中英对照 | zh_only 只中文
+    subtitle_mode: str = "bilingual"
 
 
 def _clean_hf_token(raw: str) -> str:
@@ -99,6 +103,11 @@ def load_settings(env_path: Path | None = None) -> Settings:
         raise ConfigError(f"MINUTES_TEMPLATE={template} 不合法："
                           f"可选值 {'|'.join(MINUTES_TEMPLATES)}")
 
+    subtitle_mode = (os.getenv("SUBTITLE_MODE") or "bilingual").strip().lower()
+    if subtitle_mode not in SUBTITLE_MODES:
+        raise ConfigError(f"SUBTITLE_MODE={subtitle_mode} 不合法："
+                          f"可选值 {'|'.join(SUBTITLE_MODES)}")
+
     output_dir = os.getenv("OUTPUT_DIR") or "会议记录"
     if not Path(output_dir).is_absolute():
         output_dir = PROJECT_ROOT / output_dir
@@ -122,4 +131,5 @@ def load_settings(env_path: Path | None = None) -> Settings:
         asr_language=(os.getenv("ASR_LANGUAGE") or "").strip(),
         asr_prompt=(os.getenv("ASR_PROMPT") or "").strip(),
         minutes_template=template,
+        subtitle_mode=subtitle_mode,
     )

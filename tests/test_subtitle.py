@@ -9,6 +9,8 @@
   e. 8px 边缘（右下角）拖拽缩放、中间区域拖动移动窗口、最小尺寸约束；
   f. show_segment 的块内容（时间+名字 / 译文段 / 原文段+语种 / 省略重复原文）；
   g. 回合分块语义：同人连续合并、停顿分块、换人分块、原地更新、按块计数；
+  i. 显示模式：zh_only 隐藏原文段（块变矮）、切换后滚动位置不跳、右键菜单
+     打勾当前项、选择写进 QSettings（下次启动优先用它）；
   h. 段落拼接：块内各句不逐句换行，译文段补分隔符规则（无标点补 "，"、
      下句以标点开头不补、已有句末标点直接相接），原文段用空格拼成小段；
 
@@ -21,13 +23,14 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 必须在 import PyQt6 之前
 
 import pytest
-from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt
 from PyQt6.QtGui import QMouseEvent, QWheelEvent
 from PyQt6.QtWidgets import QApplication
 
+from meeting_bot import subtitle as subtitle_mod
 from meeting_bot.subtitle import (MAX_ENTRIES, MAX_TURNS, MIN_H, MIN_W,
-                                  TURN_GAP_SECONDS, ZOOM_MAX, ZOOM_MIN,
-                                  SubtitleWindow)
+                                  MODE_BILINGUAL, MODE_ZH_ONLY, TURN_GAP_SECONDS,
+                                  ZOOM_MAX, ZOOM_MIN, SubtitleWindow)
 from meeting_bot.transcript import Segment
 
 
@@ -69,6 +72,22 @@ def _wheel(widget, delta: int, pos: QPoint | None = None) -> QWheelEvent:
 def qapp():
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+@pytest.fixture(autouse=True)
+def isolated_mode_settings(tmp_path, monkeypatch):
+    """把「模式记忆」隔离到临时 .ini。
+
+    双重作用：① 测试不写本机注册表；② 本机真实设置（比如用户手动切成
+    zh_only）不会反过来污染断言 —— 每个用例都从「没记过」的干净状态开始。
+    """
+    ini = tmp_path / "subtitle-mode.ini"
+
+    def factory():
+        return QSettings(str(ini), QSettings.Format.IniFormat)
+
+    monkeypatch.setattr(subtitle_mod, "_subtitle_settings", factory)
+    return ini
 
 
 @pytest.fixture
@@ -583,3 +602,136 @@ def test_update_segment_after_block_evicted_is_noop(qapp, win):
     assert win.update_segment(stale, "说话人0") is False
     _pump(qapp)
     assert len(win.entries()) == MAX_TURNS             # 没有多出块
+
+
+# ---------------------------------------------------------------------------
+# i. 显示模式：只中文 / 中英对照（右键切换 + QSettings 记忆）
+# ---------------------------------------------------------------------------
+
+def test_zh_only_hides_original(qapp, win):
+    """zh_only：原文段整段隐藏（文本清空、不占高），主标签仍是译文；切回恢复。"""
+    for i, (txt, tr) in enumerate([("hello", "你好"), ("world", "世界")]):
+        win.show_segment(_seg(i, start=float(i), text=txt, translation=tr), "甲")
+    _pump(qapp)
+
+    b = win.entries()[0]
+    assert win.mode == MODE_BILINGUAL          # 默认模式：向后兼容
+    assert b.main.text() == "你好，世界"
+    assert b.sub.text() == "(en) hello world"
+    assert b.sub.isVisibleTo(b)
+    bi_height = b.sizeHint().height()
+
+    win.set_mode(MODE_ZH_ONLY)
+    _pump(qapp)
+    assert win.mode == MODE_ZH_ONLY
+    assert b.main.text() == "你好，世界"        # 译文段落保留
+    assert b.sub.text() == ""                  # 原文文本清空
+    assert not b.sub.isVisibleTo(b)            # 且整行隐藏
+    zh_height = b.sizeHint().height()
+    assert zh_height < bi_height, f"块应变矮：{bi_height} → {zh_height}"
+
+    # 切回中英对照 → 原文段原样恢复（不新建块、不丢内容）
+    win.set_mode(MODE_BILINGUAL)
+    _pump(qapp)
+    assert win.entries()[0] is b
+    assert b.main.text() == "你好，世界"
+    assert b.sub.text() == "(en) hello world"
+    assert b.sub.isVisibleTo(b)
+
+    # 切换后新开的块同样按当前模式渲染
+    win.set_mode(MODE_ZH_ONLY)
+    win.show_segment(_seg(9, start=100.0, text="later", translation="后来"), "乙")
+    _pump(qapp)
+    later = win.entries()[-1]
+    assert later.main.text() == "后来"
+    assert later.sub.text() == ""
+    assert not later.sub.isVisibleTo(later)
+
+
+def test_set_mode_keeps_scroll_position(qapp, win):
+    """滚到中间再切换模式 → 滚动位置基本不动（不跳到底部、不弹回顶部）。"""
+    for i in range(24):
+        win.show_segment(_seg(i, text="long line " * 8,
+                              translation="这是一句很长的中文译文。" * 2), f"说话人{i}")
+    _pump(qapp)
+
+    bar = win.scroll_bar()
+    assert bar.maximum() > 40, "内容应远超可视区，否则测不到滚动位置"
+    mid = bar.maximum() // 3
+    bar.setValue(mid)
+    _pump(qapp)
+    assert bar.value() == mid
+    assert win.auto_scroll is False            # 已离开底部 → 自动跟随暂停
+
+    win.set_mode(MODE_ZH_ONLY)
+    _pump(qapp)
+    assert abs(bar.value() - mid) <= 2, f"切换后位置漂移：{mid} → {bar.value()}"
+
+    # 切回去同样不跳
+    win.set_mode(MODE_BILINGUAL)
+    _pump(qapp)
+    assert abs(bar.value() - mid) <= 2, f"切回后位置漂移：{mid} → {bar.value()}"
+
+
+def test_mode_persisted_in_settings(qapp, win, isolated_mode_settings):
+    """set_mode 写进 QSettings 的 mode 键；新窗口优先用记住的值（压过构造参数）。"""
+    assert win.mode == MODE_BILINGUAL
+    win.set_mode(MODE_ZH_ONLY)
+
+    stored = QSettings(str(isolated_mode_settings),
+                       QSettings.Format.IniFormat).value("mode")
+    assert stored == MODE_ZH_ONLY
+
+    # 构造参数是 bilingual，但记忆里有 zh_only → 以记忆为准
+    w2 = SubtitleWindow(MODE_BILINGUAL)
+    w2.show()
+    try:
+        assert w2.mode == MODE_ZH_ONLY
+        w2.show_segment(_seg(0, start=0.0, text="hello", translation="你好"), "甲")
+        _pump(qapp)
+        assert w2.entries()[0].sub.text() == ""
+        assert not w2.entries()[0].sub.isVisibleTo(w2.entries()[0])
+    finally:
+        w2.hide()
+        w2.deleteLater()
+        _pump(qapp)
+
+
+def test_constructor_mode_and_menu_checks(qapp, isolated_mode_settings):
+    """没记忆值时用构造参数；非法值回落 bilingual；右键菜单两项、当前项打勾。"""
+    w = SubtitleWindow(MODE_ZH_ONLY)
+    w.show()
+    try:
+        assert w.mode == MODE_ZH_ONLY
+        menu = w._build_mode_menu()
+        acts = [a for a in menu.actions() if a.text()]
+        assert [a.text() for a in acts] == ["中文", "中英对照"]
+        assert all(a.isCheckable() for a in acts)
+        assert [a.text() for a in acts if a.isChecked()] == ["中文"]
+
+        # 点菜单项 → 切换 + 持久化（走 triggered → _on_mode_action 真实链路）
+        acts[1].trigger()                       # 中英对照
+        _pump(qapp)
+        assert w.mode == MODE_BILINGUAL
+        stored = QSettings(str(isolated_mode_settings),
+                           QSettings.Format.IniFormat).value("mode")
+        assert stored == MODE_BILINGUAL
+
+        w.set_mode(MODE_BILINGUAL)
+        menu2 = w._build_mode_menu()
+        assert [a.text() for a in menu2.actions() if a.isChecked()] == ["中英对照"]
+        menu.deleteLater()
+        menu2.deleteLater()
+    finally:
+        w.hide()
+        w.deleteLater()
+        _pump(qapp)
+
+    # 非法模式（QSettings 脏值/手写错）安全回落默认，不崩
+    assert subtitle_mod.normalize_mode("zh-only") == MODE_BILINGUAL
+    assert subtitle_mod.normalize_mode(None) == MODE_BILINGUAL
+    assert subtitle_mod.normalize_mode(" ZH_Only ") == MODE_ZH_ONLY
+    w3 = SubtitleWindow("klingon")
+    assert w3.mode == MODE_BILINGUAL
+    w3.deleteLater()
+    _pump(qapp)

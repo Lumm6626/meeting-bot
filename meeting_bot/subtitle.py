@@ -16,17 +16,21 @@
 * 自由拉伸：无边框窗口自绘圆角黑底，8px 边缘/四角命中即改光标拖拽缩放；
   非边缘区域按住左键移动窗口（沿用原实现）；
 * 字号自适配：基础字号 = 窗口宽度 × ``BASE_RATIO``（12~40 钳制），
-  滚轮 / +/- 键调整倍率（0.6~2.2），实际字号 = 基础字号 × 倍率，全部条目同步。
+  滚轮 / +/- 键调整倍率（0.6~2.2），实际字号 = 基础字号 × 倍率，全部条目同步；
+* 显示模式：``bilingual`` 中文段落 + 灰色小字原文（默认）/ ``zh_only`` 只显示中文
+  （原文段整段隐藏、块高度自适应）。右键菜单切换，选择记在 QSettings
+  (``meeting-bot/subtitle``) 的 ``mode`` 键里，下次启动优先用它。
 """
 from __future__ import annotations
 
 from collections.abc import Iterable
 
-from PyQt6.QtCore import QEvent, QPoint, QRectF, QTimer, Qt
-from PyQt6.QtGui import QColor, QPainter
-from PyQt6.QtWidgets import (QFrame, QLabel, QScrollArea, QSizePolicy, QVBoxLayout,
-                             QWidget)
+from PyQt6.QtCore import QEvent, QPoint, QRectF, QSettings, QTimer, Qt
+from PyQt6.QtGui import QActionGroup, QColor, QPainter
+from PyQt6.QtWidgets import (QFrame, QLabel, QMenu, QScrollArea, QSizePolicy,
+                             QVBoxLayout, QWidget)
 
+from .config import SUBTITLE_MODES
 from .transcript import Segment, fmt_ts
 
 # 半透明黑底参数（paintEvent 与样式表共用，避免两处硬编码漂移）
@@ -54,6 +58,53 @@ ZOOM_STEP = 0.1
 BASE_RATIO = 0.022          # 基础字号 = 宽度 × 该比例
 FONT_MIN, FONT_MAX = 12, 40
 ZOOM_BADGE_MS = 3000        # 倍率提示自动隐藏时间
+
+# ---------------------------------------------------------------- 显示模式
+# bilingual：中文段落 + 灰色小字原文段（默认，与既有行为一致）
+# zh_only  ：只显示中文段落，原文段整段隐藏（块高度自适应变矮）
+MODE_BILINGUAL = "bilingual"
+MODE_ZH_ONLY = "zh_only"
+# 右键菜单顺序（标签 → 模式）；勾选态由当前模式决定
+MODE_MENU = ((MODE_ZH_ONLY, "中文"), (MODE_BILINGUAL, "中英对照"))
+
+SETTINGS_ORG = "meeting-bot"     # QSettings 作用域：记忆用户上次的选择
+SETTINGS_APP = "subtitle"
+SETTINGS_MODE_KEY = "mode"
+
+
+def normalize_mode(mode: str | None) -> str:
+    """收敛成合法模式：空值 / 拼错 / None 一律回落 bilingual。
+
+    .env 的合法性由 config.load_settings 严格校验（非法直接 ConfigError）；
+    这里只服务 UI 层（构造参数、QSettings 里的历史脏值），绝不因此崩溃。
+    """
+    m = (mode or "").strip().lower()
+    return m if m in SUBTITLE_MODES else MODE_BILINGUAL
+
+
+def _subtitle_settings() -> QSettings:
+    """QSettings 工厂（独立成函数：测试可 monkeypatch 到临时作用域，不污染注册表）。"""
+    return QSettings(SETTINGS_ORG, SETTINGS_APP)
+
+
+def load_saved_mode() -> str | None:
+    """读上次记住的模式；没记过 / 值非法 / 后端不可用 → None（交给构造参数）。"""
+    try:
+        raw = _subtitle_settings().value(SETTINGS_MODE_KEY, "")
+    except Exception:          # 记忆失败绝不能拖垮字幕窗口
+        return None
+    mode = str(raw or "").strip().lower()
+    return mode if mode in SUBTITLE_MODES else None
+
+
+def save_mode(mode: str) -> None:
+    """把模式写进 QSettings（立即 sync，异常吞掉：只是「记忆」，不是功能）。"""
+    try:
+        settings = _subtitle_settings()
+        settings.setValue(SETTINGS_MODE_KEY, normalize_mode(mode))
+        settings.sync()
+    except Exception:          # 同上：注册表/配置文件不可写时静默忽略
+        pass
 
 SCROLL_STYLE = """
 QScrollArea { background: transparent; border: none; }
@@ -142,13 +193,18 @@ class SubtitleEntry(QWidget):
     副标签整体为空时整行隐藏。
 
     同回合追加语句走 :meth:`add_segment`，原地重建标签文本，控件数量不变。
+
+    显示模式（``mode``）：``bilingual`` 主标签译文 + 副标签原文；
+    ``zh_only`` 副标签整行隐藏（文本也清空 → 不占高），只留中文段落。
     """
 
-    def __init__(self, seg: Segment, display_name: str, parent: QWidget | None = None):
+    def __init__(self, seg: Segment, display_name: str, parent: QWidget | None = None,
+                 *, mode: str = MODE_BILINGUAL):
         super().__init__(parent)
         # 整块不吃鼠标：点击穿透给容器，由窗口统一做移动/缩放
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.display_name = display_name
+        self._mode = normalize_mode(mode)
         self.segments: list[Segment] = []
 
         self.meta = QLabel("")
@@ -188,6 +244,18 @@ class SubtitleEntry(QWidget):
                 return s.speaker
         return ""
 
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def set_mode(self, mode: str) -> None:
+        """切换本块的显示模式并原地重渲染（高度随之变化，不新建/搬动控件）。"""
+        mode = normalize_mode(mode)
+        if mode == self._mode:
+            return
+        self._mode = mode
+        self._rebuild()
+
     def add_segment(self, seg: Segment) -> None:
         """把一条语句并入本回合（顺序追加），原地刷新三个标签。"""
         self.segments.append(seg)
@@ -217,6 +285,7 @@ class SubtitleEntry(QWidget):
         译文段：各句译文连续拼接（缺译文 → 原文占位，译文到达后原地换掉）；
         原文段：只收**真有译文**的句子（无译文/译文==原文的句子已在译文段可见，
         不重复），用空格拼成一小段。两段内都不插入换行或空行。
+        ``zh_only`` 模式下原文段整段隐藏（清空文本 + hide），只渲染译文段。
         """
         mains: list[str] = []
         subs: list[str] = []
@@ -229,6 +298,11 @@ class SubtitleEntry(QWidget):
                 subs.append(txt)
                 sub_langs.append((s.lang or "").strip())
         self.main.setText(join_paragraph(mains, MAIN_JOIN_SEP))
+        if self._mode == MODE_ZH_ONLY:
+            # 只显示中文：原文段整行隐藏，文本一并清空（空 QLabel 高度归零 → 块自适应）
+            self.sub.setText("")
+            self.sub.setVisible(False)
+            return
         self.sub.setText(_format_original_paragraph(subs, sub_langs))
         self.sub.setVisible(bool(subs))
 
@@ -242,8 +316,14 @@ class SubtitleEntry(QWidget):
 
 
 class SubtitleWindow(QWidget):
-    def __init__(self):
+    def __init__(self, mode: str = MODE_BILINGUAL):
+        """``mode`` 默认 bilingual（既有 ``SubtitleWindow()`` 调用行为不变）。
+
+        优先级：QSettings 里记住的值 > 构造参数 > 默认 bilingual。
+        （用户可以右键切换过模式，下次启动要沿用他的选择，而不是 .env 的老值。）
+        """
         super().__init__()
+        self._mode = normalize_mode(load_saved_mode() or mode)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -375,6 +455,35 @@ class SubtitleWindow(QWidget):
         self._stick_timer.start()
         return True
 
+    # ------------------------------------------------------------ 显示模式
+    @property
+    def mode(self) -> str:
+        """当前显示模式：``bilingual``（中英对照）或 ``zh_only``（只中文）。"""
+        return self._mode
+
+    def set_mode(self, mode: str, *, persist: bool = True) -> None:
+        """切换显示模式：已显示的块逐个重渲染，滚动位置尽量不跳。
+
+        位置处理：先记下 scrollbar 的 value 与「是否停在底部」，重渲染后原位恢复
+        （块变矮会让 range 收缩，超出部分由 QScrollBar 自行钳制）；原本停在底部、
+        开着自动跟随的，继续贴底（不打断「跟随最新」的观感）。
+        """
+        mode = normalize_mode(mode)
+        bar = self.scroll_bar()
+        value = bar.value()
+        was_following = self._auto_scroll
+        changed = mode != self._mode
+        self._mode = mode
+        if changed:
+            for entry in self._entries:
+                entry.set_mode(mode)
+            if was_following:
+                self._stick_if_auto()
+            else:
+                bar.setValue(min(value, bar.maximum()))
+        if persist:
+            save_mode(mode)
+
     # ------------------------------------------------------------ 测试辅助
     def entries(self) -> list[SubtitleEntry]:
         """按时间顺序（旧 → 新）返回当前保留的回合块。"""
@@ -445,7 +554,7 @@ class SubtitleWindow(QWidget):
 
     # -------------------------------------------------------------- 块管理
     def _add_block(self, seg: Segment, display_name: str) -> SubtitleEntry:
-        entry = SubtitleEntry(seg, display_name, self._container)
+        entry = SubtitleEntry(seg, display_name, self._container, mode=self._mode)
         entry.set_sizes(self.current_font_size())
         for w in (entry, entry.meta, entry.main, entry.sub):
             w.installEventFilter(self)
@@ -504,6 +613,33 @@ class SubtitleWindow(QWidget):
 
     def _zoom_step(self, direction: int) -> None:
         self.set_zoom(self._zoom + direction * ZOOM_STEP)
+
+    # ------------------------------------------------------------ 右键菜单
+    def _build_mode_menu(self) -> QMenu:
+        """模式菜单：中文 / 中英对照（单选，当前模式打勾）。"""
+        menu = QMenu(self)
+        group = QActionGroup(menu)
+        group.setExclusive(True)                 # 打勾互斥，只亮当前一项
+        for mode, label in MODE_MENU:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(mode == self._mode)
+            act.setData(mode)
+            group.addAction(act)
+        menu.triggered.connect(self._on_mode_action)
+        return menu
+
+    def _on_mode_action(self, act) -> None:
+        mode = act.data()
+        if isinstance(mode, str) and mode:
+            self.set_mode(mode)                  # 切换 + 持久化
+
+    def contextMenuEvent(self, e):
+        """右键弹菜单选显示模式（落点处弹出；子控件的事件由 eventFilter 转来）。"""
+        menu = self._build_mode_menu()
+        menu.exec(e.globalPos())
+        menu.deleteLater()
+        e.accept()
 
     # ------------------------------------------------------------ 窗口事件
     def resizeEvent(self, e):
@@ -641,8 +777,12 @@ class SubtitleWindow(QWidget):
 
     # ---------------------------------------------------------------- 事件过滤
     def eventFilter(self, obj, ev):
-        """子控件上的鼠标/滚轮转发到窗口，保证整窗都能拖动、缩放、调字号。"""
+        """子控件上的鼠标/滚轮/右键转发到窗口：整窗都能拖动、缩放、调字号、切模式。"""
         t = ev.type()
+        if t == QEvent.Type.ContextMenu:
+            # 子控件（滚动区/视口/容器/块）会自己吃掉右键 → 统一转到窗口弹模式菜单
+            self.contextMenuEvent(ev)
+            return True
         if t == QEvent.Type.Wheel:
             return True if self._handle_wheel(ev) else False
         if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove,

@@ -322,7 +322,10 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.setWindowTitle("会议翻译助手")
         self.recorder: Recorder | None = None
-        self.subtitle = SubtitleWindow()
+        # 显示模式默认取 .env 的 SUBTITLE_MODE；用户右键切换过的值由窗口内
+        # QSettings 记住并优先使用（见 SubtitleWindow.__init__）
+        self.subtitle = SubtitleWindow(
+            getattr(self.settings, "subtitle_mode", "bilingual"))
         self.bridge = RecorderBridge()
         self.bridge.segment.connect(self._on_segment)
         self.bridge.update.connect(self._on_update)
