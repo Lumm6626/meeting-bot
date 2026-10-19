@@ -11,6 +11,7 @@
 
 全程离屏 + 假对象：不构造真 Recorder、不启动采集/识别/翻译、不发任何网络请求。
 """
+import dataclasses
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 必须在 import PyQt6 之前
@@ -283,6 +284,161 @@ def test_finish_stop_exception_still_emits_and_restores_buttons(win, qapp, dialo
     assert win.status.text() == "导出失败"
     assert win.start_btn.isEnabled() and not win.stop_btn.isEnabled()   # 可重试
     assert [d[:2] for d in recorded] == [("crit", "导出失败")]
+
+
+# ---------------------------------------------------------------------------
+# b2. 会后离线说话人标注：初版产物先出 → 后台补标注 → 覆盖同名产物
+# ---------------------------------------------------------------------------
+
+class _DiarizableRecorder(FakeRecorder):
+    """带「整场录音」的 recorder 替身：会后标注读它跑 pyannote。"""
+
+    def __init__(self, audio_path, title: str = "会后标注会议"):
+        super().__init__(title=title)
+        self.audio_path = audio_path
+        self.store.add(0.0, 4.0, "hello world", lang="en")
+
+
+def _write_wav(tmp_path) -> Path:
+    """写一秒 16kHz 单声道 wav（真实文件：会后标注线程会去读它）。"""
+    import numpy as np
+    import soundfile as sf
+    path = tmp_path / "rec_test.wav"
+    sf.write(str(path), np.zeros(16000, dtype=np.float32), 16000, subtype="PCM_16")
+    return path
+
+
+def _fake_diarize_tools(monkeypatch, calls):
+    """monkeypatch Diarizer / assign_speakers，记录构造与调用（不加载 torch）。"""
+    class _FakeDiarizer:
+        def __init__(self, settings):
+            calls["init"] = settings
+
+        def label(self, audio, sample_rate=16000):
+            calls["label"] = (len(audio), sample_rate)
+            return [(0.0, 4.0, "SPEAKER_00")]
+
+    def _fake_assign(segs, spans):
+        for seg in segs:
+            seg.speaker = spans[0][2]
+        calls["assigned"] = True
+        return segs
+
+    monkeypatch.setattr(appmod, "Diarizer", _FakeDiarizer)
+    monkeypatch.setattr(appmod, "assign_speakers", _fake_assign)
+
+
+def test_finish_runs_offline_diarize_and_re_exports(win, qapp, dialogs, monkeypatch, tmp_path):
+    """配了 HF_TOKEN：finish 流程先出初版，再后台标注并重新导出（共两次 export_all）。
+
+    断言四条不变量：① 初版 + 标注版各导一次；② 标注线程读到的是整场 wav（16kHz）；
+    ③ 期间状态栏出现「标注」提示；④ bridge.diarized 报告成功。
+    """
+    exports, export_threads, calls, diarized, statuses = [], [], {}, [], []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+
+    win.bridge.diarized.connect(lambda ok, msg: diarized.append((ok, msg)))
+    win.bridge.status.connect(statuses.append)
+
+    win._stop()
+
+    assert _pump_until(qapp, lambda: len(exports) == 2 and bool(diarized), timeout=15.0), (
+        f"会后标注未完成：exports={len(exports)} diarized={diarized} statuses={statuses}")
+    # ① 初版（finish 线程）+ 标注版（会后线程）
+    assert "init" in calls and "assigned" in calls
+    # ② 整场 wav：16000 采样、16000 样本（1 秒）
+    assert calls["label"] == (16000, 16000)
+    # 语句被标上说话人（重新导出时才带得出来）
+    assert recorder.store.segments()[0].speaker == "SPEAKER_00"
+    assert calls["assigned"] is True
+    # ③ 期间提示 + ④ 完成信号
+    assert any("标注" in m for m in statuses), f"状态栏没提示标注中：{statuses}"
+    assert any("0.5~1.5 倍" in m for m in statuses)
+    assert diarized[0][0] is True and "已更新逐字稿" in diarized[0][1]
+    assert "标注" in win.status.text()
+    # 标注是「覆盖同名产物」：两次导出必须拿到同一个 store / title / 时间
+    assert exports[0]["store"] is exports[1]["store"] is recorder.store
+    assert exports[0]["title"] == exports[1]["title"] == win.title_input.text().strip()
+    assert exports[0]["started_at"] == exports[1]["started_at"] == recorder.started_at
+
+
+def test_offline_diarize_skipped_without_hf_token(win, qapp, dialogs, monkeypatch, tmp_path):
+    """没有 HF_TOKEN：只出初版产物，绝不起标注线程（无模型可用）。"""
+    exports, export_threads, calls, diarized = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    win.settings = dataclasses.replace(win.settings, hf_token="")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+
+    win.bridge.diarized.connect(lambda ok, msg: diarized.append((ok, msg)))
+    win._stop()
+
+    assert _pump_until(qapp, lambda: bool(exports) and win.start_btn.isEnabled())
+    # 再给标注线程一段机会（若被误触发，第二次 export 会在这期间出现）
+    deadline = time.time() + 0.5
+    while time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+    assert len(exports) == 1, f"无 token 却触发了会后标注：{len(exports)} 次导出"
+    assert "init" not in calls and not diarized
+
+
+def test_offline_diarize_skipped_without_audio(win, qapp, dialogs, monkeypatch):
+    """配了 token 但没落盘音频（SAVE_AUDIO=false）：跳过并提示一句，不报错。"""
+    exports, export_threads, calls, statuses = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+
+    recorder = _DiarizableRecorder(None)
+    _prepare_recording(win, recorder)
+
+    win.bridge.status.connect(statuses.append)
+    win._stop()
+
+    assert _pump_until(qapp, lambda: bool(exports) and win.start_btn.isEnabled())
+    deadline = time.time() + 0.5
+    while time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+    assert len(exports) == 1
+    assert "init" not in calls
+    assert any("SAVE_AUDIO" in m for m in statuses), f"未提示缺音频：{statuses}"
+
+
+def test_offline_diarize_failure_only_warns(win, qapp, dialogs, monkeypatch, tmp_path):
+    """标注失败（模型起不来等）：只发 diarized(False) 告警，不抛穿线程、不改产物。"""
+    exports, export_threads, diarized = [], [], []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+
+    class _BoomDiarizer:
+        def __init__(self, settings):
+            raise RuntimeError("模型下载失败")
+
+    monkeypatch.setattr(appmod, "Diarizer", _BoomDiarizer)
+    monkeypatch.setattr(appmod, "assign_speakers", lambda segs, spans: segs)
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+
+    win.bridge.diarized.connect(lambda ok, msg: diarized.append((ok, msg)))
+    win._stop()
+
+    assert _pump_until(qapp, lambda: bool(diarized), timeout=15.0)
+    ok, msg = diarized[0]
+    assert ok is False and "模型下载失败" in msg
+    assert len(exports) == 1, "标注失败后不应重新导出（产物保持初版）"
+    assert len(recorder.store.segments()) == 1
 
 
 # ---------------------------------------------------------------------------

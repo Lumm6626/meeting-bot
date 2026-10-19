@@ -31,8 +31,9 @@ from .translator import Translator
 # 实测让「双击快捷方式」到窗口出现的耗时从 ~1 秒涨到 13 秒以上（用户会以为没启动）。
 # 这里留模块级占位名，首次真正需要时由 _ensure_heavy() 填充；测试 monkeypatch
 # 这些名字（非 None）时不会被覆盖。
-Recorder = None        # type: ignore[assignment]
-Diarizer = None        # type: ignore[assignment]
+Recorder = None            # type: ignore[assignment]
+Diarizer = None            # type: ignore[assignment]
+assign_speakers = None     # type: ignore[assignment]
 _heavy_lock = threading.Lock()
 
 
@@ -42,14 +43,47 @@ def _ensure_heavy(preload_diarize: bool = True) -> None:
     实测 ``import recorder`` 要 6 秒左右（torch/faster-whisper/silero），所以窗口
     出现后会先调一次预热（见 MainWindow._preload_engine），点开始时不再等这 6 秒。
     """
-    global Recorder, Diarizer
+    global Recorder, Diarizer, assign_speakers
     with _heavy_lock:
         if Recorder is None:
             from .recorder import Recorder as _Recorder
             Recorder = _Recorder
-        if preload_diarize and Diarizer is None:
-            from .diarization import Diarizer as _Diarizer
+        if preload_diarize:
+            if Diarizer is None:
+                from .diarization import Diarizer as _Diarizer
+                Diarizer = _Diarizer
+            if assign_speakers is None:
+                from .diarization import assign_speakers as _assign_speakers
+                assign_speakers = _assign_speakers
+
+
+def _resolve_diarize_tools():
+    """取 (Diarizer 类, assign_speakers 函数)，必要时惰性加载 .diarization。
+
+    只加载 diarization 模块（torch/pyannote），不连带 recorder/faster-whisper ——
+    会后标注发生在录制结束之后，不该顺带把识别模型再拖进来。
+    """
+    global Diarizer, assign_speakers
+    if Diarizer is None or assign_speakers is None:
+        from .diarization import Diarizer as _Diarizer
+        from .diarization import assign_speakers as _assign_speakers
+        if Diarizer is None:
             Diarizer = _Diarizer
+        if assign_speakers is None:
+            assign_speakers = _assign_speakers
+    return Diarizer, assign_speakers
+
+
+def _read_audio(path: Path):
+    """读整场录音 wav → (float32 单声道波形, 采样率)。
+
+    soundfile 惰性导入：只在会后标注时加载，不拖慢窗口启动。
+    """
+    import soundfile as sf
+    audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=False)
+    if getattr(audio, "ndim", 1) > 1:      # 意外立体声：取左声道（录制侧只写单声道）
+        audio = audio[:, 0]
+    return audio, int(sample_rate)
 
 
 
@@ -75,6 +109,12 @@ PILL_FG = "#A8C7F0"        # 配置胶囊字
 FONT_FAMILY = "Microsoft YaHei UI"
 
 RECORDING_DIR = ".recording"     # <output_dir>/.recording/：边录边落盘的工作区（git 忽略）
+
+# 会后离线说话人标注：初版产物已出，标注在后台补，用户可以继续用电脑
+OFFLINE_DIARIZE_STATUS = ("正在会后标注说话人"
+                          "（约 0.5~1.5 倍会议时长，可继续用电脑）")
+OFFLINE_DIARIZED_DONE = "说话人标注完成，已更新逐字稿"
+OFFLINE_NO_AUDIO = "[提示] 未保存录音（SAVE_AUDIO=false），跳过会后说话人标注"
 
 WINDOW_TITLE = "会议翻译助手"
 WINDOW_TITLE_RECORDING = "会议翻译助手 · 录音中"
@@ -329,6 +369,8 @@ class RecorderBridge(QObject):
     finished = pyqtSignal(bool, str)
     # 崩溃恢复结果（后台线程 → GUI 线程；恢复期间不能阻塞界面）
     recovered = pyqtSignal(bool, str)
+    # 会后离线说话人标注结果（后台线程 → GUI 线程）：ok, 提示文案
+    diarized = pyqtSignal(bool, str)
 
 
 class MainWindow(QMainWindow):
@@ -347,6 +389,7 @@ class MainWindow(QMainWindow):
         self.bridge.status.connect(self._on_status)
         self.bridge.finished.connect(self._on_finished)
         self.bridge.recovered.connect(self._on_recovered)
+        self.bridge.diarized.connect(self._on_diarized)
         # 关窗触发收尾时置 True：导出完成后由 _on_finished 直接退出应用
         self._quit_after_stop = False
 
@@ -751,9 +794,9 @@ class MainWindow(QMainWindow):
             try:
                 recorder.stop()
                 title = title_hint or recorder.title or "未命名会议"
+                started_at = recorder.started_at or datetime.now()
                 transcript_path, minutes_path = export_all(
-                    recorder.store, self.settings, title,
-                    recorder.started_at or datetime.now(),
+                    recorder.store, self.settings, title, started_at,
                     translator=recorder.translator)
                 # 导出成功 = 本场已完整落盘：写 footer 关账，下次启动不再提示恢复
                 self._finish_journal(recorder.store)
@@ -761,8 +804,80 @@ class MainWindow(QMainWindow):
                     f"已生成：\n逐字稿：{transcript_path}\n纪要：{minutes_path}")
             except Exception as e:
                 self.bridge.finished.emit(False, f"导出失败：{e}")
+                return        # 初版产物都没出：不再做会后标注（改不了产物）
+            # 初版产物已落盘 → 再起后台线程补说话人（失败只告警，产物保持原样）
+            self._maybe_offline_diarize(recorder, title, started_at)
 
         threading.Thread(target=finish, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # 会后离线说话人标注：初版产物出完 → 整场音频跑 pyannote → 覆盖导出
+    # ------------------------------------------------------------------
+
+    def _offline_diarize_allowed(self) -> bool:
+        """是否该跑会后标注：需要 HF token，且实时/离线开关至少一个开着。
+
+        开会上实时标注通常是关掉的（.env 里 DIARIZE_ENABLED=false，太慢），所以
+        真正的开关是 OFFLINE_DIARIZE（默认 true）；没有 token 就没有模型，直接跳过。
+        """
+        settings = self.settings
+        if not (getattr(settings, "hf_token", "") or "").strip():
+            return False
+        return bool(getattr(settings, "diarize_enabled", False)
+                    or getattr(settings, "offline_diarize", True))
+
+    def _maybe_offline_diarize(self, recorder, title: str, started_at: datetime) -> None:
+        """初版产物已导出 → 起 daemon 线程补标注（不阻塞 GUI、不阻塞用户）。
+
+        只在 finish() 线程里调用：此时 recorder 已 stop、录音文件已封口。
+        """
+        if not self._offline_diarize_allowed():
+            return
+        audio = getattr(recorder, "audio_path", None)
+        try:
+            has_audio = audio is not None and Path(audio).is_file()
+        except OSError:
+            has_audio = False
+        if not has_audio:
+            self.bridge.status.emit(OFFLINE_NO_AUDIO)
+            return
+        # 先报状态再起线程：标注要跑几十分钟，用户得知道产物还会再更新一次
+        self.bridge.status.emit(OFFLINE_DIARIZE_STATUS)
+        # daemon：程序退出时直接放弃标注（产物是增强项，不值得拦住退出）
+        threading.Thread(target=self._offline_diarize_worker,
+                         args=(recorder, Path(audio), title, started_at),
+                         daemon=True).start()
+
+    def _offline_diarize_worker(self, recorder, audio_path: Path,
+                                title: str, started_at: datetime) -> None:
+        """后台：整场 wav → label() → assign_speakers → 重新导出（覆盖同名产物）。
+
+        任何失败（无 token / 模型下载失败 / 磁盘异常 / 导出异常）只告警：
+        初版产物在导出成功时就已落盘，标注失败不改变它们。
+        """
+        try:
+            diarizer_cls, assign = _resolve_diarize_tools()
+            diarizer = diarizer_cls(self.settings)
+            audio, sample_rate = _read_audio(audio_path)
+            spans = diarizer.label(audio, sample_rate)
+            store = recorder.store
+            # assign_speakers 直接改 seg.speaker（store.segments() 返回同一批实例）
+            assign(store.segments(), spans)
+            for seg in store.segments():
+                if seg.speaker:
+                    store.register_label(seg.speaker)
+            # 覆盖同名产物：逐字稿/纪要现在带说话人
+            export_all(store, self.settings, title, started_at,
+                       translator=getattr(recorder, "translator", None))
+        except Exception as e:
+            self.bridge.diarized.emit(
+                False, f"[警告] 会后说话人标注失败（已导出的产物保持原样）：{e}")
+            return
+        self.bridge.diarized.emit(True, OFFLINE_DIARIZED_DONE)
+
+    def _on_diarized(self, ok: bool, msg: str) -> None:
+        """标注结果回到 GUI 线程：只更新状态栏（不弹窗打断用户）。"""
+        self.status.setText(msg)
 
     def _set_recording_state(self, active: bool) -> None:
         """录制状态同步到「主窗口标题」与「字幕浮窗右上角红点」。"""

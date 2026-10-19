@@ -7,10 +7,12 @@ import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from queue import Queue
 from typing import Callable
 
 import numpy as np
+import soundfile as sf
 
 from .asr import ASREngine, CloudASREngine
 from .capture import SOURCE_BOTH, AudioCapture
@@ -23,6 +25,8 @@ from .vad import UtteranceBuffer
 SegmentEvent = Callable[[Segment], None]
 StatusEvent = Callable[[str], None]
 
+AUDIO_SINK_DIR = ".recording"   # 录音落盘目录（与 JSONL 日志同处，已在 .gitignore）
+AUDIO_SINK_SAMPLE_RATE = 16000  # 与采集/识别/pyannote 统一（wav 内嵌此采样率）
 DIARIZE_INTERVAL = 60.0       # 每 60 秒跑一次说话人聚类
 DIARIZE_WINDOW = 300.0        # 每次只处理最近 5 分钟音频（滑动窗口，避免长会 O(T²) 重算）
 DIARIZE_BUFFER_SECONDS = DIARIZE_WINDOW + 60.0  # 滚动缓冲上限 = 窗口 + 一轮余量（防内存无上限增长）
@@ -161,6 +165,10 @@ class Recorder:
         # 否则 list() 快照与读 _diarize_base 之间被插队 append+trim，base 会多记本次
         # 被裁样本 → 窗口绝对起点每次后移一个块累积漂移（最终复审 N-2）。
         self._diarize_lock = threading.Lock()
+        # --- 录制落盘（SAVE_AUDIO）：会后离线标注说话人需要整场音频 ---
+        # 写失败只降级为「本场不存音频」：磁盘满/权限问题不能反噬录制本身。
+        self._audio_sink: sf.SoundFile | None = None
+        self._audio_path: Path | None = None
         self._started_at: datetime | None = None
         self.title = ""
 
@@ -235,6 +243,63 @@ class Recorder:
     def translator(self) -> Translator | None:
         return self._translator
 
+    @property
+    def audio_path(self) -> Path | None:
+        """本场录音文件（SAVE_AUDIO=false / 写失败 / 未配置目录时为 None）。
+
+        会后离线说话人标注读它跑 pyannote（见 app.py 的 _offline_diarize_worker）。
+        """
+        return self._audio_path
+
+    # --- 录音落盘（SAVE_AUDIO）---
+    def _open_audio_sink(self) -> None:
+        """按 SAVE_AUDIO 打开整场录音 wav（16kHz 单声道 PCM_16）。
+
+        打不开（磁盘只读 / 权限 / 目录异常 / 未配置 output_dir 的测试替身）一律降级：
+        告警一次、本场不落盘，录制照常继续 —— 音频文件是「会后标注」的增强项，
+        不是录制能否进行的前提。
+        """
+        self._audio_path = None
+        if not getattr(self._settings, "save_audio", True):
+            return
+        out = getattr(self._settings, "output_dir", None)
+        if out is None:
+            return                    # 未配置产物目录：无从落盘，静默跳过
+        try:
+            directory = Path(out) / AUDIO_SINK_DIR
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"rec_{datetime.now():%Y%m%d_%H%M%S}.wav"
+            self._audio_sink = sf.SoundFile(
+                str(path), mode="w", samplerate=AUDIO_SINK_SAMPLE_RATE,
+                channels=1, subtype="PCM_16")
+            self._audio_path = path
+        except Exception as e:        # 磁盘满 / 只读 / 无权限 / libsndfile 异常
+            self._close_audio_sink()
+            self._say(f"[警告] 无法保存录音文件（本次不落盘音频，录制继续）：{e}")
+
+    def _write_audio(self, chunk: np.ndarray) -> None:
+        """把一块采集音频追加写入录音文件；失败即关盘告警（只报一次）。"""
+        sink = self._audio_sink
+        if sink is None:
+            return
+        try:
+            audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+            # 采集侧已 clip，这里再兜一次：越界样本写 PCM_16 会被 libsndfile 静默截断
+            sink.write(np.clip(audio, -1.0, 1.0))
+        except Exception as e:
+            self._close_audio_sink()
+            self._say(f"[警告] 录音写入失败（已停止保存本次音频，录制继续）：{e}")
+
+    def _close_audio_sink(self) -> None:
+        """关闭录音文件（幂等）：关盘异常不影响录制收尾。"""
+        sink, self._audio_sink = self._audio_sink, None
+        if sink is None:
+            return
+        try:
+            sink.close()
+        except Exception:
+            pass
+
     def start(self, title: str = "") -> None:
         if self._stop.is_set():
             # stop() 先于 start() 落地（用户点「开始」后立刻点「结束」，start 所在线程晚一步执行）：
@@ -261,6 +326,7 @@ class Recorder:
 
     def _main_loop(self) -> None:
         buf = UtteranceBuffer()
+        self._open_audio_sink()      # 录音落盘：finally 里统一关盘
         try:
             while not self._stop.is_set():
                 try:
@@ -274,6 +340,7 @@ class Recorder:
                     self._diarize_audio.append(chunk)
                     self._diarize_appended += 1
                     self._trim_diarize_buffer()
+                self._write_audio(chunk)      # 整场落盘（失败自动降级）
                 for offset, utterance in buf.push(chunk):
                     self._enqueue_asr(offset, utterance)
             for offset, utterance in buf.flush():
@@ -287,6 +354,9 @@ class Recorder:
             dropped = getattr(self._capture, "dropped_chunks", 0)
             if dropped:
                 self._say(f"[警告] 处理跟不上实时，已丢弃 {dropped} 块音频（约 {dropped * 0.5:.0f} 秒）")
+            # 录音文件先封口再放行 stop()：否则「stop 已返回但 wav 还在写」，
+            # 会后标注线程读到的是截断文件。
+            self._close_audio_sink()
             # 尾部 flush 结束（或主循环异常）才算生产者完结；顺序不能反：
             # 必须先 set(producer_done) 再 clear(running)，否则 stop() 可能跳过等待。
             self._producer_done.set()
@@ -795,3 +865,6 @@ class Recorder:
             diar.join(timeout=DIARIZE_JOIN_TIMEOUT)
             if diar.is_alive():
                 self._say(f"[警告] 说话人标注线程未在 {DIARIZE_JOIN_TIMEOUT:.0f} 秒内退出")
+        # 兜底封口（幂等）：主循环正常退出时已在 finally 关过；此处覆盖「start 被取消」
+        # 或主循环未能运行的路径，确保录音文件不会一直挂着未 flush。
+        self._close_audio_sink()

@@ -59,8 +59,9 @@ class Settings:
     # 本地模式攒批阈值：None = 用 recorder.py 里的模块默认值（30.0 / 35.0）
     asr_batch_seconds: float | None = None
     asr_batch_max_wait: float | None = None
-    # 说话人标注开关：默认 true；本机 CPU 标注慢于实时 1.3~1.8 倍（标签迟到数分钟），
-    # 关掉可省下会议期间的 CPU 占用（.env 设 DIARIZE_ENABLED=false）
+    # 实时说话人标注（录制期间每 60 秒跑一轮）：本机 CPU 慢于实时 1.3~1.8 倍，
+    # 标签会迟到数分钟且全程占用 CPU，故 .env.example 里默认 **关闭**
+    # （DIARIZE_ENABLED=false）。能力保留：置 true 即恢复实时标注。
     diarize_enabled: bool = True
     # 云端识别（Groq）：模型 / 语言提示（空=自动检测）/ 领域词表提示
     groq_asr_model: str = "whisper-large-v3"
@@ -70,6 +71,12 @@ class Settings:
     minutes_template: str = "standard"
     # 字幕显示模式（见 SUBTITLE_MODES）：bilingual 中英对照 | zh_only 只中文
     subtitle_mode: str = "bilingual"
+    # 录制落盘音频（SAVE_AUDIO）：整场 16kHz 单声道 wav 写进 <output_dir>/.recording/，
+    # 约 115MB/小时。会后离线标注说话人要用它；关掉则只能拿实时标注（更慢、更迟）。
+    save_audio: bool = True
+    # 会后离线说话人标注（OFFLINE_DIARIZE）：录制结束、初版产物导出后，再对整场音频
+    # 跑一遍 pyannote 并把「谁说的」补进逐字稿/纪要（耗时约 0.5~1.5 倍会议时长）。
+    offline_diarize: bool = True
 
 
 def _clean_hf_token(raw: str) -> str:
@@ -100,6 +107,14 @@ def _float_env(name: str) -> float | None:
     if value <= 0:
         raise ConfigError(f"{name}={raw} 必须大于 0")
     return value
+
+
+def _bool_env(name: str, default: bool = True) -> bool:
+    """读布尔环境变量：未配置 → default；false/0/no/off（大小写不限）→ False。"""
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("false", "0", "no", "off")
 
 
 def _keyring_get(name: str) -> str:
@@ -209,4 +224,6 @@ def load_settings(env_path: Path | None = None) -> Settings:
         asr_prompt=(os.getenv("ASR_PROMPT") or "").strip(),
         minutes_template=template,
         subtitle_mode=subtitle_mode,
+        save_audio=_bool_env("SAVE_AUDIO", True),
+        offline_diarize=_bool_env("OFFLINE_DIARIZE", True),
     )

@@ -14,7 +14,7 @@ def _clean_env(monkeypatch):
                 "MINUTES_MODEL", "WHISPER_MODEL", "HF_TOKEN", "OUTPUT_DIR",
                 "GROQ_API_KEY", "ASR_PROVIDER",
                 "ASR_BATCH_SECONDS", "ASR_BATCH_MAX_WAIT", "MINUTES_TEMPLATE",
-                "SUBTITLE_MODE"):
+                "SUBTITLE_MODE", "DIARIZE_ENABLED", "SAVE_AUDIO", "OFFLINE_DIARIZE"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -158,6 +158,62 @@ def test_diarize_enabled_flag(tmp_path, monkeypatch):
     monkeypatch.delenv("DIARIZE_ENABLED", raising=False)  # load_dotenv 不覆盖已存在变量
     env.write_text("OPENCODE_API_KEY=sk-test123\n", encoding="utf-8")
     assert load_settings(env).diarize_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# SAVE_AUDIO / OFFLINE_DIARIZE（录制落盘 + 会后离线说话人标注）
+# ---------------------------------------------------------------------------
+
+def test_save_audio_defaults_to_true(tmp_path, monkeypatch):
+    """不写 SAVE_AUDIO 时默认落盘音频：会后离线标注要靠它（老 .env 无需改动）。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123"]), encoding="utf-8")
+    assert load_settings(env).save_audio is True
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("TRUE", True), ("1", True),
+    ("false", False), ("False", False), ("0", False), ("no", False), ("off", False),
+])
+def test_save_audio_parsing(tmp_path, monkeypatch, value, expected):
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123", f"SAVE_AUDIO={value}"]),
+                   encoding="utf-8")
+    assert load_settings(env).save_audio is expected
+
+
+def test_offline_diarize_defaults_to_true(tmp_path, monkeypatch):
+    """不写 OFFLINE_DIARIZE 时默认开启：只有配了 HF_TOKEN 才会真的跑（见 app.py）。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123"]), encoding="utf-8")
+    assert load_settings(env).offline_diarize is True
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("on", True),
+    ("false", False), ("0", False), ("off", False), ("NO", False),
+])
+def test_offline_diarize_parsing(tmp_path, monkeypatch, value, expected):
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123",
+                            f"OFFLINE_DIARIZE={value}"]), encoding="utf-8")
+    assert load_settings(env).offline_diarize is expected
+
+
+def test_offline_diarize_independent_of_realtime_flag(tmp_path, monkeypatch):
+    """两个开关互不影响：实时标注关掉（.env.example 的默认写法）不等于会后也关。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123",
+                            "DIARIZE_ENABLED=false",
+                            "OFFLINE_DIARIZE=true"]), encoding="utf-8")
+    s = load_settings(env)
+    assert s.diarize_enabled is False
+    assert s.offline_diarize is True
 
 
 # ---------------------------------------------------------------------------

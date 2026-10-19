@@ -2633,3 +2633,83 @@ def test_stop_backfill_notifies_update(monkeypatch):
     assert [s.seq for s in updates] == [segs[0].seq], f"补译成功未通知面板：{updates}"
     assert updates[0].translation == "你好世界"
     assert len(events) == 1              # 补译不重复发原文事件
+
+
+# ---------------------------------------------------------------------------
+# SAVE_AUDIO：录制落盘整场 wav（会后离线说话人标注的输入）
+# ---------------------------------------------------------------------------
+
+def _audio_settings(tmp_path, **kwargs):
+    """带真实 output_dir 的 Settings（_settings() 的 output_dir 是 None，不落盘）。"""
+    return Settings("https://x", "sk-test", "m1", "m2", "medium", "",
+                    tmp_path / "会议记录", tmp_path, **kwargs)
+
+
+def test_save_audio_writes_whole_wav(tmp_path, monkeypatch):
+    """SAVE_AUDIO=true：每块音频追加写入 <output_dir>/.recording/*.wav。
+
+    2 块 × 8000 样本 = 1 秒；断言 wav 真实存在、16kHz / 单声道、时长约 1 秒 ——
+    这三项正是会后 pyannote 读文件的前提（采样率错 → 时间轴全错，声道错 → 只标到半边）。
+    """
+    import soundfile as sf
+
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    r = Recorder(_audio_settings(tmp_path, save_audio=True),
+                 capture=FakeCapture(chunks=2), asr=FakeASR(), translator=None)
+
+    r.start("录音落盘会议")
+    r.stop()
+
+    path = r.audio_path
+    assert path is not None, "SAVE_AUDIO=true 却没有录音文件路径"
+    assert path.is_file(), f"录音文件未生成：{path}"
+    assert path.parent.name == ".recording"          # git 忽略目录，与 JSONL 日志同处
+    assert path.suffix == ".wav"
+    info = sf.info(str(path))
+    assert info.samplerate == 16000
+    assert info.channels == 1
+    assert abs(info.frames / 16000 - 1.0) < 0.05, f"时长异常：{info.frames} 样本"
+    # stop() 之后文件必须已封口（会后标注线程才能读全）：能再完整读回 1 秒
+    audio, sr = sf.read(str(path), dtype="float32")
+    assert sr == 16000 and len(audio) == info.frames
+
+
+def test_save_audio_disabled_writes_nothing(tmp_path, monkeypatch):
+    """SAVE_AUDIO=false：完全不落盘（省磁盘），audio_path 为 None。"""
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    r = Recorder(_audio_settings(tmp_path, save_audio=False),
+                 capture=FakeCapture(chunks=2), asr=FakeASR(), translator=None)
+
+    r.start("不落盘会议")
+    r.stop()
+
+    assert r.audio_path is None
+    rec_dir = tmp_path / "会议记录" / ".recording"
+    assert not rec_dir.exists() or not list(rec_dir.glob("*.wav"))
+
+
+def test_save_audio_failure_warns_once_and_keeps_recording(tmp_path, monkeypatch):
+    """落盘失败（目录建不出来）只告警一次，录制/识别照常完成（不能反噬主流程）。"""
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer", FakeVAD)
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    # output_dir 是个「文件」的路径 → .recording 子目录必然建不出来
+    blocker = tmp_path / "不是目录"
+    blocker.write_text("x", encoding="utf-8")
+    settings = Settings("https://x", "sk-test", "m1", "m2", "medium", "",
+                        blocker, tmp_path, save_audio=True)
+
+    r = Recorder(settings, capture=FakeCapture(chunks=2), asr=FakeASR(),
+                 translator=None)
+    statuses = []
+    r.on_status(statuses.append)
+
+    r.start("落盘失败会议")
+    r.stop()
+
+    assert r.audio_path is None
+    warns = [m for m in statuses if "无法保存录音文件" in m]
+    assert len(warns) == 1, f"落盘失败应只告警一次：{statuses}"
+    # 录制本身不受影响：语句照常入库
+    assert len(r.store.segments()) >= 1
