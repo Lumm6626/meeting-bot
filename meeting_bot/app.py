@@ -607,12 +607,29 @@ class MainWindow(QMainWindow):
             journal.close()
 
     def _scan_pending_journals(self) -> list[Path]:
-        """启动时扫描「未完成」的录制日志（无 footer）。异常一律当作没有。"""
+        """启动时扫描「未完成」的录制日志（无 footer）。
+
+        只统计**有实际内容**的日志（至少一条语句）：没有语句的残缺日志（点开始
+        记录后立刻退出、或整场一句没识别出来）恢复出来也是空文件，弹窗询问只会
+        让人困惑 → 直接归档成 .abandoned.jsonl。
+        """
+        pending: list[Path] = []
         try:
-            return [p for p in sorted(self._recording_dir().glob("rec_*.jsonl"))
-                    if p.is_file() and not journal_finished(p)]
+            for path in sorted(self._recording_dir().glob("rec_*.jsonl")):
+                if not path.is_file() or journal_finished(path):
+                    continue
+                try:
+                    has_segment = any('"t": "add"' in line or '"t":"add"' in line
+                                      for line in path.read_text(encoding="utf-8").splitlines())
+                except OSError:
+                    continue
+                if has_segment:
+                    pending.append(path)
+                else:
+                    self._abandon_journal(path)
         except OSError:
             return []
+        return pending
 
     def _check_recovery(self) -> None:
         """询问是否恢复启动快照里的未完成会议（只问一次，且不含本场录制）。"""

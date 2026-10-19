@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from meeting_bot import capture as capture_mod
-from meeting_bot.capture import AudioCapture
+from meeting_bot.capture import MIX_GAIN, AudioCapture
 
 FRAMES = int(16000 * capture_mod.CHUNK_SECONDS)  # 8000
 
@@ -413,7 +413,7 @@ def test_both_mixes_two_sources_into_single_stream(monkeypatch):
     for chunk in chunks:
         assert chunk.dtype == np.float32
         assert chunk.shape == (FRAMES,), f"块长应为 {FRAMES}，实际 {chunk.shape}"
-        assert np.allclose(chunk, 0.3), f"混合结果应逐样本相加为 0.3，实际 {chunk[:5]}"
+        assert np.allclose(chunk, 0.3 * MIX_GAIN), f"混合结果应为 (0.1+0.2)*{MIX_GAIN}，实际 {chunk[:5]}"
 
 
 def test_both_clips_when_sum_exceeds_full_scale(monkeypatch):
@@ -481,7 +481,7 @@ def test_both_one_side_dies_passthrough(monkeypatch):
     mixer.start()
     try:
         first = cap.read(timeout=3.0)
-        assert first is not None and np.allclose(first, 0.3), "两路都在时应混合输出"
+        assert first is not None and np.allclose(first, 0.3 * MIX_GAIN), "两路都在时应混合输出（含防削波缩放）"
 
         cap._side_queues[0].put(None)          # loopback 结束哨兵
         cap._side_queues[1].put(np.full(FRAMES, 0.2, dtype=np.float32))
@@ -617,7 +617,7 @@ def test_both_idle_side_rejoins_mixing(monkeypatch):
         cap._side_queues[0].put(np.full(FRAMES, 0.1, dtype=np.float32))
         cap._side_queues[1].put(np.full(FRAMES, 0.2, dtype=np.float32))
         second = cap.read(timeout=3.0)
-        assert second is not None and np.allclose(second, 0.3), "恢复后应重新双路混音"
+        assert second is not None and np.allclose(second, 0.3 * MIX_GAIN), "恢复后应重新双路混音"
     finally:
         cap._side_queues[0].put(None)
         cap._side_queues[1].put(None)

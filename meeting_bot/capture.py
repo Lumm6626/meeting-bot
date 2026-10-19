@@ -26,7 +26,8 @@ class CaptureError(Exception):
 CHUNK_SECONDS = 0.5
 MIX_TIMEOUT = 0.2            # 混合线程等待新音频的上限（秒）：超时即跳过本轮，不阻塞
 MIX_MAX_BUFFERED_CHUNKS = 3  # 单边缓冲上限：超过即丢最旧的数据（时钟漂移防御）
-MIX_IDLE_GRACE = 3.0         # 单路无数据超过此时长 → 本轮先直通另一路（防 loopback 饿死）
+MIX_IDLE_GRACE = 3.0
+MIX_GAIN = 0.8                # 双路相加后的缩放系数（防削波）         # 单路无数据超过此时长 → 本轮先直通另一路（防 loopback 饿死）
 MIX_IDLE_REPORT = 30.0       # 单路连续无数据超过此时长 → 记一条诊断（真异常才提示）
 
 SOURCE_SPEAKER = "speaker"   # 只录系统扬声器 loopback
@@ -311,8 +312,10 @@ class AudioCapture:
                     return
                 a = self._take(0)
                 b = self._take(1)
-                self._put(self._queue,
-                          np.clip(a + b, -1.0, 1.0).astype(np.float32, copy=False))
+                # 直接相加在「两路都响」时会削波（实测峰值顶到 1.0，削波会毁掉
+                # 识别质量）：先按 0.8 缩放再限幅，保留动态余量。
+                mixed = np.clip((a + b) * MIX_GAIN, -1.0, 1.0)
+                self._put(self._queue, mixed.astype(np.float32, copy=False))
                 continue
             i = 0 if self._side_alive[0] else 1
             if not self._side_alive[i]:        # 两路都结束

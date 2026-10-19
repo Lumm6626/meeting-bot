@@ -2774,3 +2774,45 @@ def test_speaker_renamed_multiple_listeners_and_no_listeners():
     r.emit_speaker_renamed("SPEAKER_00", "张三")
 
     assert a == b == [("SPEAKER_00", "张三")]
+
+
+def test_fallback_allowed_after_stop_when_model_cached(monkeypatch):
+    """回归：短会/说完就按结束时，收尾批也要能回退本地（否则整场零字幕）。"""
+    import numpy as np
+
+    class _BoomCloud:
+        """云端引擎：构造成功，识别时 403（地区封禁）。"""
+
+        def transcribe(self, audio, should_stop=None):
+            from meeting_bot.asr import CloudASRError
+            raise CloudASRError("云端识别请求被拒绝（HTTP 403）")
+
+    class _LocalOK:
+        calls = 0
+
+        def __init__(self, settings):
+            pass
+
+        def transcribe(self, audio, sample_rate=16000):
+            from meeting_bot.transcript import Segment
+            _LocalOK.calls += 1
+            return [Segment(0.0, 1.0, "local text", lang="en")]
+
+    monkeypatch.setattr("meeting_bot.recorder.CloudASREngine", _BoomCloud)
+    monkeypatch.setattr("meeting_bot.recorder.ASREngine", _LocalOK)
+
+    class _Translator:
+        def translate(self, text, lang=""):
+            return "本地译文"
+
+    statuses: list[str] = []
+    r = Recorder(_settings(), translator=_Translator())
+    r.on_status(statuses.append)
+    r._asr_provider = "groq"
+    r._asr = _BoomCloud()
+    r._local_model_cached = lambda: True      # 模型已缓存 → 允许停止后回退
+    r._stop.set()                              # 模拟「已点结束」时的收尾批
+    r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
+    assert _LocalOK.calls == 1, "停止后未回退本地引擎"
+    assert any("已自动切换本地识别" in m for m in statuses)
+    assert r.store.segments()[0].text == "local text"

@@ -462,6 +462,26 @@ class Recorder:
             return self._asr.transcribe(audio, should_stop=self._stop.is_set)
         return self._asr.transcribe(audio)
 
+    def _local_model_cached(self) -> bool:
+        """本地 whisper 模型是否已在缓存里（决定停止后回退要不要加载模型）。"""
+        import os
+        from pathlib import Path
+
+        name = getattr(self._settings, "whisper_model", "small") or "small"
+        roots = []
+        hf_home = os.getenv("HF_HOME")
+        if hf_home:
+            roots.append(Path(hf_home) / "hub")
+        roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+        for root in roots:
+            try:
+                if any(p.is_dir() and p.name.endswith(f"faster-whisper-{name}")
+                       for p in root.glob("models--*faster-whisper-*")):
+                    return True
+            except OSError:
+                continue
+        return False
+
     def _make_asr_engine(self):
         """按当前 provider 惰性构造识别引擎（首批语句到来时调用）。
 
@@ -491,11 +511,11 @@ class Recorder:
         """
         if self._asr_provider != "groq" or self._asr_fallback_used:
             return False
-        if self._stop.is_set():
-            # 已收到停止信号：剩下的只是收尾批，此刻加载本地模型（未缓存时要下载
-            # 数百 MB、几十秒到几分钟）会把「点结束」变成界面卡死，且 stop() 等
-            # 识别线程本就有上限。这类失败按普通丢批处理（同回退前的行为）。
-            # 也顺带避免「用户按结束 → 退避被打断抛 CloudASRError」被误诊成云端挂掉。
+        if self._stop.is_set() and not self._local_model_cached():
+            # 已收到停止信号，且本地模型没缓存：此刻加载要下载数百 MB（几十秒到
+            # 几分钟），会把「点结束」变成界面卡死 → 按普通丢批处理。
+            # 反过来，模型已在本地缓存（加载几秒）时必须允许回退：短会/说完就按结束
+            # 时，收尾批往往是唯一的一批，放弃回退就等于整场没有字幕（线上实测踩到过）。
             return False
         # 先落状态再构造：构造若抛异常，也不能再次进入回退分支（防重复告警/重试）
         self._asr_provider = "local"
