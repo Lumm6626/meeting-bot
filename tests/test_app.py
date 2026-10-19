@@ -1661,3 +1661,13 @@ def test_cloud_banner_shows_retry_hint(win):
     win._on_cloud_status("hidden", "", False)
     assert win.cloud_banner.isHidden()
     assert win.recheck_btn.isHidden()
+
+
+def test_recheck_button_tall_enough_for_text(win, qapp):
+    """回归：提示条按钮曾被写死 30px 高，QSS padding 要 40px → “重新检测”被裁掉。"""
+    win._on_cloud_status("warn", "云端识别不可用：请打开代理", True)
+    qapp.processEvents()
+    btn = win.recheck_btn
+    assert btn.text() == "重新检测"
+    assert btn.height() >= btn.sizeHint().height(), "按钮高度不足，文字会被裁切"
+    assert btn.width() >= btn.fontMetrics().horizontalAdvance("重新检测"), "按钮宽度不足"

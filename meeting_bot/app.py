@@ -14,7 +14,7 @@ from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout,
                              QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-                             QPushButton, QSizePolicy, QSystemTrayIcon, QTableWidget,
+                             QPushButton, QSizePolicy, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .capture import AudioCapture, CaptureError
@@ -568,7 +568,9 @@ class MainWindow(QMainWindow):
         cloud_row.addWidget(self.cloud_banner, 1)
         self.recheck_btn = QPushButton("重新检测")
         self.recheck_btn.setProperty("role", "secondary")
-        self.recheck_btn.setFixedHeight(30)
+        # 不写死高度：次按钮 QSS 的 padding 是 12px，sizeHint 高 40px，
+        # 写死 30px 会把「重新检测」四个字竖向裁掉（实测过）
+        self.recheck_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.recheck_btn.setVisible(False)
         self.recheck_btn.clicked.connect(self._recheck_cloud)
         cloud_row.addWidget(self.recheck_btn, 0, Qt.AlignmentFlag.AlignTop)
