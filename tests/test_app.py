@@ -5,8 +5,7 @@
 该目录不入版本控制），此处固化成常驻回归，防止后续改动悄悄回退：
 
   a. ``_stop()`` 的 finish() 线程内零 Qt 控件访问（Major-1 的线程红线）；
-  b. ``closeEvent``：录制中关窗 = 收进托盘（不停止录制），空闲时才真正退出；
-  b2. 托盘菜单：打开主窗口 / 结束并生成纪要 / 退出（录制中先确认）；
+  b. ``closeEvent``：关闭主窗口 = 退出程序（录制中先确认并保存产物）；
   c. finish() 内 recorder.stop() 抛异常也必须走到 finished(False)（New-6 兜底）。
 
 全程离屏 + 假对象：不构造真 Recorder、不启动采集/识别/翻译、不发任何网络请求。
@@ -837,7 +836,7 @@ def test_brand_row_status_card_and_equal_height_buttons(win):
         assert btn.minimumHeight() == btn.maximumHeight() == 44      # 固定等高
     assert win.start_btn.property("role") == "primary"               # 主按钮（渐变）
     assert win.stop_btn.property("role") == "secondary"              # 次按钮（描边）
-    assert win.footer_hint.text().startswith("录制中关闭窗口将收进托盘")
+    assert win.footer_hint.text().startswith("录制中关闭窗口会先结束录制并保存")
     assert win.elapsed_label.text() == "就绪"
 
 

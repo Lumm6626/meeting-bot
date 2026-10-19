@@ -128,7 +128,7 @@ def probe_groq(api_key: str, timeout: float = 5.0) -> tuple[str, str, bool]:
 
 
 def app_icon() -> QIcon:
-    """应用图标：窗口 / 托盘 / 桌面快捷方式共用 assets/app.ico。"""
+    """应用图标：窗口与桌面快捷方式共用 assets/app.ico。"""
     return QIcon(str(PROJECT_ROOT / "assets" / "app.ico"))
 
 
@@ -583,7 +583,7 @@ class MainWindow(QMainWindow):
         self.speaker_table.setMinimumHeight(140)
         lay.addWidget(self.speaker_table, 1)
 
-        self.footer_hint = QLabel("录制中关闭窗口将收进托盘继续工作 · 托盘图标可随时结束")
+        self.footer_hint = QLabel("录制中关闭窗口会先结束录制并保存产物，然后退出程序")
         self.footer_hint.setObjectName("footer_hint")
         self.footer_hint.setWordWrap(True)
         lay.addWidget(self.footer_hint)
@@ -1276,7 +1276,7 @@ class MainWindow(QMainWindow):
             self._quit_app()
 
     def closeEvent(self, e):
-        """关闭主窗口 = 退出整个程序（不留后台托盘/常驻进程）。
+        """关闭主窗口 = 退出整个程序（不留后台常驻进程）。
 
         录制中关窗：先确认；选「是」→ 后台结束录制、导出产物，完成后再退出，
         避免静默丢数据（导出在后台线程，GUI 不会冻结）。
