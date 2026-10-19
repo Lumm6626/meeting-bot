@@ -270,16 +270,13 @@ def _pill(text: str) -> QLabel:
 
 
 def brand_pixmap(size: int = 48) -> QPixmap:
-    """品牌行图标：assets/app.ico 的 48px 缩略（按屏幕 DPR 取图，HiDPI 下不糊）。"""
-    dpr = 1.0
-    app = QApplication.instance()
-    screen = app.primaryScreen() if app is not None else None
-    if screen is not None:
-        dpr = float(screen.devicePixelRatio() or 1.0)
-    pm = app_icon().pixmap(int(round(size * dpr)), int(round(size * dpr)))
-    if not pm.isNull():
-        pm.setDevicePixelRatio(dpr)
-    return pm
+    """品牌行图标：assets/app.ico 的 48px 缩略。
+
+    注意高 DPI：QIcon.pixmap(size) 内部已经按屏幕缩放返回 ``size * dpr`` 的物理像素
+    并设好 devicePixelRatio，这里**不能再手动乘 dpr** —— 否则逻辑尺寸翻倍，
+    48px 的 QLabel 只能显示左上 1/4（曾在 2x 缩放屏上实测到此问题）。
+    """
+    return app_icon().pixmap(size, size)
 
 
 class RecorderBridge(QObject):

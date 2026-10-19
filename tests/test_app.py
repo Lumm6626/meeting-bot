@@ -701,3 +701,15 @@ def test_title_defaults_to_timestamp_and_refreshes(win):
     win.title_input.setText("手改的名字")
     win._title_edited = True
     assert win.title_input.text() == "手改的名字"    # 手改后不被覆盖
+
+
+def test_brand_pixmap_logical_size_matches_label(win, qapp):
+    """回归：品牌图标逻辑尺寸必须等于控件尺寸（高 DPI 下二次乘 DPR 会只显示左上 1/4）。"""
+    from meeting_bot.app import brand_pixmap
+    pm = brand_pixmap(48)
+    assert not pm.isNull()
+    logical_w = pm.width() / pm.devicePixelRatio()
+    logical_h = pm.height() / pm.devicePixelRatio()
+    assert abs(logical_w - 48) <= 0.5, f"图标逻辑宽 {logical_w} ≠ 48（会被裁切）"
+    assert abs(logical_h - 48) <= 0.5
+    assert win.icon_label.width() == 48 and win.icon_label.height() == 48
