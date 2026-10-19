@@ -212,8 +212,16 @@ class Recorder:
             self._say(f"[警告] 语句事件回调异常：{e}")
 
     def _say(self, msg: str) -> None:
+        """向状态栏投一条消息。
+
+        回调异常一律吞掉：状态栏（UI/日志）出问题绝不能反噬识别线程 —— 回退、
+        收尾等关键切换都紧接着 _say 往下走，异常直穿会让整场字幕停更。
+        """
         for fn in self._status:
-            fn(msg)
+            try:
+                fn(msg)
+            except Exception:
+                continue                      # 状态栏不可用不是录制失败的理由
 
     @property
     def store(self) -> TranscriptStore:
@@ -372,8 +380,19 @@ class Recorder:
         为什么只切一次：云端挂掉时每批都会失败，若每次都重建本地引擎，会把
         WhisperModel 的加载开销（数百 MB）反复付一遍；且「回退后再失败」若仍重试，
         同一批音频会无限循环重试，识别线程等于窒息。
+
+        两道守卫看起来冗余（provider 一改就出不了 groq 分支），但语义不同：
+        provider 决定「往后用哪个引擎」，_asr_fallback_used 记录「这次录制已降级过」。
+        将来若要做「云端恢复后切回 groq」，只有后者能把「最多降级一次」这条契约
+        钉住，故两者都保留。
         """
         if self._asr_provider != "groq" or self._asr_fallback_used:
+            return False
+        if self._stop.is_set():
+            # 已收到停止信号：剩下的只是收尾批，此刻加载本地模型（未缓存时要下载
+            # 数百 MB、几十秒到几分钟）会把「点结束」变成界面卡死，且 stop() 等
+            # 识别线程本就有上限。这类失败按普通丢批处理（同回退前的行为）。
+            # 也顺带避免「用户按结束 → 退避被打断抛 CloudASRError」被误诊成云端挂掉。
             return False
         # 先落状态再构造：构造若抛异常，也不能再次进入回退分支（防重复告警/重试）
         self._asr_provider = "local"
@@ -383,11 +402,14 @@ class Recorder:
         # 一次 —— _asr_fallback_used 已置位，后续批次不会再走本分支。
         self._say(ASR_FALLBACK_MESSAGE)
         try:
-            engine = ASREngine(self._settings)
+            engine = self._make_asr_engine()      # provider 已置 local → 本地引擎
         except Exception as e:
             # 本地模型也起不来（首次下载失败/磁盘满）：保持 self._asr 为 None，
-            # 让后续批次按 provider=local 再试一次构造，失败只走一次性告警路径。
+            # 让后续批次按 provider=local 再试一次构造。这里已经宣判「本场不再有
+            # 字幕」，故先置一次性告警标记：调用方别再拿云端那条异常再报一遍
+            # （那会把原因归错到 key 上，还多刷一条同样的结论）。
             self._asr = None
+            self._asr_engine_error_said = True
             self._say(f"[警告] 本地识别引擎无法启动，本场不再有字幕：{e}")
             return False
         self._asr = engine

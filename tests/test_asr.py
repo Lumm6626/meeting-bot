@@ -281,8 +281,8 @@ def test_cloud_transcribe_auth_error_fails_fast(monkeypatch):
 
     原实现对 4xx 也走 3 次退避重试：key 错了重试 3 次既白耗免费配额（20 req/min），
     又把告警推迟 3 秒；且错误被降级成「本批丢弃」的 CloudASRError，用户看不出
-    根因是配置。现在升格为 CloudASRConfigError（ConfigError 子类）→ Recorder
-    走「识别引擎不可用，本场不再有字幕」的一次性告警。
+    根因是配置。现在升格为 CloudASRConfigError（ConfigError 子类）→ Recorder 据此
+    一次性切到本地识别并只告警一次（不再整场没有字幕）。
     """
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.setattr("meeting_bot.asr.time.sleep", lambda s: None)
