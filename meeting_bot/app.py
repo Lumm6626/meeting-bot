@@ -27,17 +27,32 @@ from .translator import Translator
 # 这些名字（非 None）时不会被覆盖。
 Recorder = None        # type: ignore[assignment]
 Diarizer = None        # type: ignore[assignment]
+_heavy_lock = threading.Lock()
+_heavy_warm = False
 
 
-def _ensure_heavy() -> None:
-    """填充重型依赖（Recorder → faster-whisper/silero；Diarizer → pyannote/torch）。"""
-    global Recorder, Diarizer
-    if Recorder is None:
-        from .recorder import Recorder as _Recorder
-        Recorder = _Recorder
-    if Diarizer is None:
-        from .diarization import Diarizer as _Diarizer
-        Diarizer = _Diarizer
+def _ensure_heavy(preload_diarize: bool = True) -> None:
+    """填充重型依赖（Recorder → faster-whisper/silero；Diarizer → pyannote/torch）。
+
+    实测 ``import recorder`` 要 6 秒左右（torch/faster-whisper/silero），所以窗口
+    出现后会先调一次预热（见 MainWindow._preload_engine），点开始时不再等这 6 秒。
+    """
+    global Recorder, Diarizer, _heavy_warm
+    with _heavy_lock:
+        if Recorder is None:
+            from .recorder import Recorder as _Recorder
+            Recorder = _Recorder
+        if preload_diarize and Diarizer is None:
+            from .diarization import Diarizer as _Diarizer
+            Diarizer = _Diarizer
+        if not _heavy_warm:
+            # 预热 silero VAD（约 0.2s），让首次切句不额外等待
+            try:
+                from .vad import UtteranceBuffer
+                UtteranceBuffer()
+            except Exception:
+                pass
+            _heavy_warm = True
 
 
 def app_icon() -> QIcon:
@@ -404,6 +419,8 @@ class MainWindow(QMainWindow):
         self._refresh_elapsed()
 
         self.setWindowIcon(app_icon())
+        # 后台预热引擎：窗口已出现，用户还在看界面时就把 6 秒的 import 做完
+        threading.Thread(target=self._preload_engine, daemon=True).start()
 
     def _is_recording(self) -> bool:
         """录制 / 收尾中：start 按钮禁用（_start 置位、_on_finished 复位）。"""
@@ -469,7 +486,7 @@ class MainWindow(QMainWindow):
 
         def _boot():
             try:
-                _ensure_heavy()
+                _ensure_heavy(self.settings.diarize_enabled)
                 translator = Translator(self.settings)
             except Exception as e:
                 self.bridge.finished.emit(False, f"启动失败：{e}")
@@ -496,6 +513,13 @@ class MainWindow(QMainWindow):
             self.recorder.start(title)
 
         threading.Thread(target=_boot, daemon=True).start()
+
+    def _preload_engine(self) -> None:
+        """后台预热重型依赖：把「点开始记录」的等待从 ~6 秒压到 ~1 秒。"""
+        try:
+            _ensure_heavy(self.settings.diarize_enabled)
+        except Exception:
+            pass          # 预热失败不影响使用：首次点击时还会再试一次
 
     def _mark_title_edited(self, _text: str = "") -> None:
         """用户手动改过会议名：之后不再用时间自动覆盖。"""
