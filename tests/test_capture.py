@@ -622,3 +622,77 @@ def test_both_idle_side_rejoins_mixing(monkeypatch):
         cap._side_queues[0].put(None)
         cap._side_queues[1].put(None)
         mixer.join(timeout=3.0)
+
+
+def test_mic_auto_gain_boosts_quiet_speech(monkeypatch):
+    """远场小声说话：自动增益把电平拉到可识别范围（约 +x 倍），且不削波。"""
+    from meeting_bot.capture import MIC_MAX_GAIN, MIC_TARGET_RMS, _AutoGain
+    agc = _AutoGain()
+    quiet = np.full(FRAMES, 0.005, dtype=np.float32)      # rms 0.005（远场）
+    out = None
+    for _ in range(5):
+        out = agc.process(quiet)
+    rms = float(np.sqrt(np.mean(out ** 2)))
+    assert rms > 0.02, f"增益后 rms 仍过低：{rms:.4f}"
+    assert agc.gain <= MIC_MAX_GAIN + 1e-6
+    assert np.abs(out).max() <= 1.0
+    assert abs(rms - MIC_TARGET_RMS) < 0.03
+
+
+def test_mic_auto_gain_keeps_loud_and_silence(monkeypatch):
+    """近场大声不放大（增益≈1）；纯静音不放大（避免把底噪推成语音）。"""
+    from meeting_bot.capture import _AutoGain
+    agc = _AutoGain()
+    loud = np.full(FRAMES, 0.5, dtype=np.float32)
+    for _ in range(5):
+        agc.process(loud)
+    assert agc.gain <= 1.05
+    out_loud = agc.process(loud)
+    assert np.allclose(out_loud, loud)
+
+    agc2 = _AutoGain()
+    silence = np.full(FRAMES, 0.0005, dtype=np.float32)   # 低于 gate
+    for _ in range(5):
+        agc2.process(silence)
+    assert agc2.gain <= 1.05, f"静音被放大到 {agc2.gain:.2f} 倍"
+
+
+def test_both_mode_applies_gain_on_mic_side_only(monkeypatch):
+    """双路模式：麦克风那一路走自动增益，系统声音那一路不动。"""
+    from meeting_bot.capture import MIC_MAX_GAIN
+
+    class _QuietRecorder:
+        def __init__(self, value):
+            self.value = value
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def record(self, frames):
+            return np.full(frames, self.value, dtype=np.float32)
+
+    _install_both_devices(
+        monkeypatch,
+        _FakeDevice(lambda: _QuietRecorder(0.005)),    # loopback（系统声音）
+        _FakeDevice(lambda: _QuietRecorder(0.005)),    # 麦克风（远场小声）
+    )
+    cap = AudioCapture()
+    assert cap.source == "both"
+    cap._running.set()
+    cap._side_queues[0].put(np.full(FRAMES, 0.005, dtype=np.float32))   # 系统声音原样
+    cap._side_queues[1].put(cap._mic_gain.process(np.full(FRAMES, 0.005, dtype=np.float32)))
+    mixer = threading.Thread(target=cap._mix_run, daemon=True)
+    mixer.start()
+    try:
+        out = cap.read(timeout=3.0)
+        assert out is not None
+        # 麦克风侧被放大（>0.005），与 0.005 相加后应明显高于 0.01
+        assert float(np.abs(out).max()) > 0.02, "麦克风侧未应用自动增益"
+        assert cap._mic_gain.gain <= MIC_MAX_GAIN + 1e-6
+    finally:
+        cap._side_queues[0].put(None)
+        cap._side_queues[1].put(None)
+        mixer.join(timeout=3.0)

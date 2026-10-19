@@ -35,6 +35,37 @@ SOURCE_BOTH = "both"         # 双路同时采集 + 混合（默认；线上/线
 SOURCES = (SOURCE_SPEAKER, SOURCE_MIC, SOURCE_BOTH)
 
 
+MIC_TARGET_RMS = 0.07     # 麦克风目标电平（对语音约 -23 dBFS，够 VAD/ASR 识别）
+MIC_MAX_GAIN = 20.0       # 最大放大倍数（≈ +26 dB）：远场说话也能拉起来
+MIC_GATE_RMS = 0.0015     # 低于此电平视为静音，不放大（避免把底噪放大成"人声"）
+
+
+class _AutoGain:
+    """麦克风自动增益：把远场/小声的语音拉到可识别电平。
+
+    只对麦克风生效（系统声音已经是满量程）。起音快、释放慢，避免音量泵动；
+    静音段（低于 gate）不放大，防止底噪被推成语音导致 VAD 误触发。
+    """
+
+    def __init__(self, target: float = MIC_TARGET_RMS, max_gain: float = MIC_MAX_GAIN,
+                 gate: float = MIC_GATE_RMS):
+        self._target = target
+        self._max = max_gain
+        self._gate = gate
+        self.gain = 1.0
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) + 1e-9
+        desired = 1.0 if rms < self._gate else min(self._max, self._target / rms)
+        if desired > self.gain:
+            self.gain = desired                      # 起音：立即跟上
+        else:
+            self.gain = 0.7 * self.gain + 0.3 * desired   # 释放：缓慢回落
+        if self.gain <= 1.001:
+            return chunk
+        return np.clip(chunk * self.gain, -1.0, 1.0).astype(np.float32, copy=False)
+
+
 class AudioCapture:
     """音频捕获：统一产出 16kHz 单声道块，走队列交给消费者。
 
@@ -75,6 +106,8 @@ class AudioCapture:
         self._side_alive: list[bool] = []
         self._side_buffers: list[np.ndarray] = []
         self._side_last_data: list[float] = [0.0, 0.0]
+        # 麦克风路的自动增益（系统声音路不需要：已是满量程）
+        self._mic_gain = _AutoGain()
         self._idle_reported: list[bool] = [False, False]
 
         if source == SOURCE_MIC:
@@ -169,7 +202,10 @@ class AudioCapture:
                     except Exception as e:
                         self._set_error(e)   # 不能静默 break：上层要能上报「采集中断」
                         break
-                    self._put(self._queue, self._as_chunk(data))
+                    chunk = self._as_chunk(data)
+                    if self.source == SOURCE_MIC:
+                        chunk = self._mic_gain.process(chunk)
+                    self._put(self._queue, chunk)
         finally:
             # 无论录音器打开/读取/运行期出现任何异常，都必须投递结束哨兵，
             # 否则消费者会永久阻塞在 read() 上。
@@ -189,7 +225,10 @@ class AudioCapture:
                     except Exception as e:
                         self._set_error(e)
                         break
-                    self._put(out, self._as_chunk(data))
+                    chunk = self._as_chunk(data)
+                    if label == "mic":
+                        chunk = self._mic_gain.process(chunk)
+                    self._put(out, chunk)
         except Exception as e:
             self._set_error(e)
         finally:

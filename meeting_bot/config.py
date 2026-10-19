@@ -38,6 +38,10 @@ class Settings:
     # 说话人标注开关：默认 true；本机 CPU 标注慢于实时 1.3~1.8 倍（标签迟到数分钟），
     # 关掉可省下会议期间的 CPU 占用（.env 设 DIARIZE_ENABLED=false）
     diarize_enabled: bool = True
+    # 云端识别（Groq）：模型 / 语言提示（空=自动检测）/ 领域词表提示
+    groq_asr_model: str = "whisper-large-v3"
+    asr_language: str = ""
+    asr_prompt: str = ""
 
 
 def _clean_hf_token(raw: str) -> str:
@@ -105,4 +109,7 @@ def load_settings(env_path: Path | None = None) -> Settings:
         asr_batch_seconds=_float_env("ASR_BATCH_SECONDS"),
         asr_batch_max_wait=_float_env("ASR_BATCH_MAX_WAIT"),
         diarize_enabled=(os.getenv("DIARIZE_ENABLED") or "true").strip().lower() not in ("false", "0", "no", "off"),
+        groq_asr_model=(os.getenv("GROQ_ASR_MODEL") or "whisper-large-v3").strip(),
+        asr_language=(os.getenv("ASR_LANGUAGE") or "").strip(),
+        asr_prompt=(os.getenv("ASR_PROMPT") or "").strip(),
     )

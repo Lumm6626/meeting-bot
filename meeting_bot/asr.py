@@ -100,6 +100,19 @@ def _normalize_lang(lang: str) -> str:
     return table.get(str(lang).strip().lower(), str(lang).strip()[:2].lower() or "")
 
 
+def _is_mostly_cjk(text: str) -> bool:
+    """判断文本是否以中文为主（用于语种混说时决定跳过翻译）。
+
+    Groq 的 verbose_json 只给一个文件级 language：中英混说的会议里英文句会被
+    标成 zh 而跳过翻译。这里按字符占比逐句判定，避免中文会议里的英文不被翻译。
+    """
+    letters = [c for c in text if not c.isspace() and (c.isalpha() or "一" <= c <= "鿿")]
+    if not letters:
+        return False
+    cjk = sum(1 for c in letters if "一" <= c <= "鿿")
+    return cjk / len(letters) >= 0.5
+
+
 def _segments_from_response(resp) -> list[Segment]:
     """verbose_json 响应 → Segment 列表；结构异常一律 CloudASRError。"""
     lang = _normalize_lang(_field(resp, "language", "") or "")
@@ -114,7 +127,15 @@ def _segments_from_response(resp) -> list[Segment]:
             continue                       # 空文本过滤（静音段/呼吸声）
         start = float(_field(s, "start", 0.0) or 0.0)
         end = float(_field(s, "end", start) or start)
-        result.append(Segment(start=start, end=max(start, end), text=text, lang=str(lang)))
+        # 中文句标 zh（跳过翻译）；非中文句不能沿用文件级 zh 标签（否则会漏翻），
+        # 标成空串让下游按"未知语种"处理（照常翻译、不显示语种前缀）
+        if _is_mostly_cjk(text):
+            seg_lang = "zh"
+        elif str(lang) == "zh":
+            seg_lang = ""
+        else:
+            seg_lang = str(lang)
+        result.append(Segment(start=start, end=max(start, end), text=text, lang=seg_lang))
     return result
 
 
@@ -129,7 +150,11 @@ class CloudASREngine:
                               "取 key，填入 .env 的 GROQ_API_KEY")
         self._client = openai.OpenAI(base_url=GROQ_BASE_URL, api_key=key,
                                      timeout=CLOUD_TIMEOUT, max_retries=0)
-        self._model = GROQ_MODEL
+        # 模型/语言/领域提示词都可配：large-v3 比 turbo 更准且实测不更慢；
+        # 指定 language 能避免两三秒短句被误判成其它语种；prompt 喂领域词表提升专名准确率
+        self._model = (getattr(settings, "groq_asr_model", "") or GROQ_MODEL).strip()
+        self._language = (getattr(settings, "asr_language", "") or "").strip()
+        self._prompt = (getattr(settings, "asr_prompt", "") or "").strip()
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000,
                    should_stop: Callable[[], bool] | None = None) -> list[Segment]:
@@ -144,11 +169,17 @@ class CloudASREngine:
         last_error: Exception | None = None
         for attempt in range(CLOUD_MAX_ATTEMPTS):
             try:
-                resp = self._client.audio.transcriptions.create(
+                kwargs: dict = dict(
                     model=self._model,
                     file=("utterance.wav", wav, "audio/wav"),
                     response_format="verbose_json",   # 只有 verbose_json 带 segments/language
+                    temperature=0.0,                  # 减少幻觉式改写
                 )
+                if self._language:
+                    kwargs["language"] = self._language
+                if self._prompt:
+                    kwargs["prompt"] = self._prompt
+                resp = self._client.audio.transcriptions.create(**kwargs)
             except (openai.AuthenticationError, openai.PermissionDeniedError) as e:
                 # 401/403：key 无效或无权限。确定性错误，重试 3 次只是白耗配额
                 # 与 3 倍延迟，用户必须改配置才能恢复 → 交给 ConfigError 路径一次性告警。

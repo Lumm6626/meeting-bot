@@ -156,7 +156,7 @@ def test_cloud_transcribe_maps_segments(monkeypatch):
         (0.0, 1.5, "Hello world.", "en"),
         (1.5, 3.25, "Second line", "en"),
     ]
-    assert tr.calls[0]["model"] == "whisper-large-v3-turbo"
+    assert tr.calls[0]["model"] == "whisper-large-v3"   # 默认模型已换更准的 large-v3
     assert tr.calls[0]["response_format"] == "verbose_json"
 
 
@@ -271,7 +271,7 @@ def test_cloud_transcribe_real_sdk_shapes(monkeypatch):
     assert captured["url"] == "https://api.groq.com/openai/v1/audio/transcriptions"
     assert "multipart/form-data" in captured["content_type"]
     body = captured["body"]
-    assert b"verbose_json" in body and b"whisper-large-v3-turbo" in body
+    assert b"verbose_json" in body and b"whisper-large-v3" in body
     assert b"RIFF" in body                     # 上传的确实是 wav
     assert [(s.start, s.end, s.text, s.lang) for s in segs] == [(0.0, 1.25, "Hello", "en")]
 
@@ -417,3 +417,47 @@ def test_normalize_lang_full_names():
     assert _normalize_lang("English") == "en"
     assert _normalize_lang("Spanish") == "es"
     assert _normalize_lang("") == ""
+
+
+def test_cloud_engine_uses_configurable_model_language_prompt(monkeypatch):
+    """模型/语言/领域提示词来自 Settings（large-v3 更准；language/prompt 提升短句与专名准确率）。"""
+    from meeting_bot.asr import CloudASREngine
+    from meeting_bot.config import Settings as S
+
+    captured = {}
+
+    class _FakeCreate:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return {"language": "English",
+                    "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}]}
+
+    class _FakeClient:
+        def __init__(self, **kw):
+            self.audio = type("A", (), {"transcriptions": _FakeCreate()})()
+
+    monkeypatch.setattr("meeting_bot.asr.openai.OpenAI", lambda **kw: _FakeClient(**kw))
+    s = S("https://x", "sk-test", "m1", "m2", "small", "", None, None,
+          groq_api_key="gsk_test", asr_provider="groq",
+          groq_asr_model="whisper-large-v3", asr_language="en",
+          asr_prompt="allergy clinic, immunotherapy")
+    eng = CloudASREngine(s)
+    eng.transcribe(np.zeros(16000, dtype=np.float32), 16000)
+    assert captured["model"] == "whisper-large-v3"
+    assert captured["language"] == "en"
+    assert captured["prompt"] == "allergy clinic, immunotherapy"
+    assert captured["temperature"] == 0.0
+
+
+def test_mixed_language_segments_use_cjk_detection():
+    """中英混说：英文句不能被标成 zh（否则会跳过翻译），中文句标 zh。"""
+    from meeting_bot.asr import _segments_from_response
+    resp = {"language": "Chinese", "segments": [
+        {"start": 0, "end": 2, "text": "我们先看一下本季度的数据"},
+        {"start": 2, "end": 4, "text": "The Saudi market is growing at 7 percent annually"},
+        {"start": 4, "end": 6, "text": "Distribution partner confirmed the shipment"},
+    ]}
+    segs = _segments_from_response(resp)
+    assert segs[0].lang == "zh"
+    assert segs[1].lang != "zh", "英文句被误判为中文，会跳过翻译"
+    assert segs[2].lang != "zh"
