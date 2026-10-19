@@ -719,9 +719,8 @@ class MainWindow(QMainWindow):
             self.cloud_banner.setVisible(False)
             self.recheck_btn.setVisible(False)
             return
-        suffix = "（打开代理后点「重新检测」或重启程序即可生效）" if can_retry else ""
         self.cloud_banner.setProperty("state", state)
-        self.cloud_banner.setText(text + suffix)
+        self.cloud_banner.setText(text)
         self.cloud_banner.setVisible(True)
         self.recheck_btn.setVisible(bool(can_retry))
         # 改了 state 属性必须重新 polish，QSS 才会套用新配色

@@ -1656,7 +1656,7 @@ def test_cloud_banner_shows_retry_hint(win):
     win._on_cloud_status("warn", "云端识别不可用：请打开代理", True)
     assert not win.cloud_banner.isHidden()      # 父窗口未 show 时 isVisible() 恒 False
     assert not win.recheck_btn.isHidden()
-    assert "重新检测" in win.cloud_banner.text() or "重启" in win.cloud_banner.text()
+    assert "代理" in win.cloud_banner.text()
 
     win._on_cloud_status("hidden", "", False)
     assert win.cloud_banner.isHidden()
