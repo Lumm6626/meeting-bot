@@ -12,10 +12,10 @@ from string import Template
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
-from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
-                             QMainWindow, QMenu, QMessageBox, QPushButton, QSizePolicy,
-                             QSystemTrayIcon, QTableWidget, QTableWidgetItem,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout,
+                             QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+                             QPushButton, QSizePolicy, QSystemTrayIcon, QTableWidget,
+                             QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .capture import AudioCapture, CaptureError
 from .config import (PROJECT_ROOT, ConfigError, Settings, load_settings,
@@ -746,12 +746,25 @@ class MainWindow(QMainWindow):
     def _warn_diarizer_unavailable(self, e: Exception) -> None:
         QMessageBox.warning(self, "说话人功能不可用", f"{e}\n\n将继续记录，但无法区分说话人。")
 
+    def _sync_subtitle_names(self) -> None:
+        """把「名字解析器」接到字幕浮窗上（幂等）：块头行实时走 store.display_name。
+
+        recorder 每场录制新建（store 随之新建），所以不能只在构造窗口时设一次：
+        在每条语句到达时懒同步，改名时再同步一次。两处都在 GUI 线程，改 Qt
+        属性安全。
+        """
+        store = getattr(self.recorder, "store", None)
+        if store is not None:
+            self.subtitle.name_resolver = store.display_name
+
     def _on_segment(self, seg):
+        self._sync_subtitle_names()        # 新块的头行也按最新名字渲染
         name = self.recorder.store.display_name(seg.speaker)
         self.subtitle.show_segment(seg, name)
 
     def _on_update(self, seg):
         """译文到达（第二阶段）：交给面板按 seq 原地替换，不新增块。"""
+        self._sync_subtitle_names()
         name = self.recorder.store.display_name(seg.speaker)
         self.subtitle.update_segment(seg, name)
 
@@ -760,6 +773,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_speakers(self):
         if not self.recorder:
+            return
+        # 用户正在单元格里打字时跳过本轮：重设 item 会把编辑框文本清空（实测
+        # 输入 "张三" → 变空串），下一次提交就成了「把名字清掉」，还会把改名
+        # 事件广播成空名字。宁可晚 5 秒刷新，也不能吃掉用户正在输入的字。
+        if self.speaker_table.state() == QAbstractItemView.State.EditingState:
             return
         self.speaker_table.blockSignals(True)
         speakers = self.recorder.store.speakers()
@@ -770,11 +788,34 @@ class MainWindow(QMainWindow):
         self.speaker_table.blockSignals(False)
 
     def _rename_speaker(self, item):
+        """表格里改名字：写 store → 回填整场已显示的字幕 → 广播给 recorder。
+
+        三件事的顺序有讲究：先落 store（后面两步都以它为准），再重渲染字幕
+        （用户立刻看到「整场都改成新名字」），最后广播改名事件 —— 那是人工确认
+        过的声纹标签归属，声纹学习（A2）要拿它当正样本。
+        """
         if item.column() != 1 or not self.recorder:
             return
         label_item = self.speaker_table.item(item.row(), 0)
-        if label_item:
-            self.recorder.store.set_speaker_name(label_item.text(), item.text())
+        if label_item is None:
+            return
+        label, name = label_item.text(), item.text()
+        store = self.recorder.store
+        before = store.display_name(label)
+        store.set_speaker_name(label, name)
+        if store.display_name(label) == before:
+            # itemChanged 也会因「程序性重设 / 只改格式」触发：名字没变就别白刷新，
+            # 更别给声纹学习喂重复样本
+            return
+        # ① 已显示的块立刻换名字（只重渲染头行：正文、块数、滚动位置都不动）
+        self._sync_subtitle_names()
+        refresh = getattr(self.subtitle, "refresh_names", None)
+        if callable(refresh):
+            refresh()
+        # ② 改名 = 「这个声纹标签就是这个人」，交给 recorder 广播（只广播，不做逻辑）
+        emit = getattr(self.recorder, "emit_speaker_renamed", None)
+        if callable(emit):
+            emit(label, name)
 
     def _stop(self):
         if not self.recorder:

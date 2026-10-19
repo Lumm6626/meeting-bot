@@ -781,3 +781,213 @@ def test_set_recording_is_idempotent(qapp, win):
     win.set_recording(False)
     _pump(qapp)
     assert win.recording is False and not win.recording_pill.isVisible()
+
+
+# ---------------------------------------------------------------------------
+# k. 说话人改名回填：name_resolver + refresh_names
+#
+# 用户在表格里把 SPEAKER_00 改成「张三」后，整场已经显示的块必须立刻换名字，
+# 而且只换名字 —— 正文文本、块数量、滚动位置都不能动（否则等于重画整场面板）。
+# ---------------------------------------------------------------------------
+
+def _names(*pairs):
+    """造一个 resolver：把声纹标签映射成名字，空标签 → 「发言人?」。"""
+    table = dict(pairs)
+
+    def resolve(label: str) -> str:
+        return table.get(label, label) if label else "发言人?"
+
+    return resolve
+
+
+def test_resolver_applies_to_newly_created_blocks(qapp, win):
+    """构造后设置的 resolver 对新块直接生效（不必等改名）。"""
+    win.name_resolver = _names(("SPEAKER_00", "张三"))
+    win.show_segment(_seg(0, speaker="SPEAKER_00"), "SPEAKER_00")
+    _pump(qapp)
+
+    assert win.entries()[0].meta.text() == "[00:00:00]  张三"
+    # 表里没有的标签原样显示（resolver 决定，不是窗口硬编）
+    win.show_segment(_seg(1, speaker="SPEAKER_07"), "SPEAKER_07")
+    _pump(qapp)
+    assert win.entries()[-1].meta.text() == "[00:00:05]  SPEAKER_07"
+
+
+def test_refresh_names_backfills_displayed_blocks(qapp, win):
+    """核心用例：块先按旧标签显示，改名后 refresh_names 让整场已显示块换名字。
+
+    变异自查点：把 refresh_names 实现成空操作（或只在 _add_block 时取 resolver）
+    → 第一块头行仍是 SPEAKER_00 → 断言失败。
+    """
+    win.show_segment(_seg(0, speaker="SPEAKER_00"), "SPEAKER_00")
+    win.show_segment(_seg(1, speaker="SPEAKER_01"), "SPEAKER_01")
+    _pump(qapp)
+    blocks = win.entries()
+    assert blocks[0].meta.text() == "[00:00:00]  SPEAKER_00"
+    main_before = [b.main.text() for b in blocks]
+    sub_before = [b.sub.text() for b in blocks]
+
+    win.name_resolver = _names(("SPEAKER_00", "张三"))   # 相当于用户在表格里改名
+    win.refresh_names()
+    _pump(qapp)
+
+    assert blocks[0].meta.text() == "[00:00:00]  张三"
+    assert blocks[1].meta.text() == "[00:00:05]  SPEAKER_01"   # 没改的保持原样
+    # 只换头行：正文/原文段一个字都没动，块也没新增
+    assert [b.main.text() for b in blocks] == main_before
+    assert [b.sub.text() for b in blocks] == sub_before
+    assert len(win.entries()) == 2
+
+
+def test_refresh_names_without_resolver_keeps_original_label(qapp, win):
+    """resolver 为 None（旧行为）→ 头行沿用入块时的名字，refresh 也不变。"""
+    win.show_segment(_seg(0, speaker="SPEAKER_03"), "SPEAKER_03")
+    win.show_segment(_seg(1, speaker=""), "发言人?")
+    _pump(qapp)
+    blocks = win.entries()
+
+    win.name_resolver = None
+    win.refresh_names()
+    _pump(qapp)
+
+    assert blocks[0].meta.text() == "[00:00:00]  SPEAKER_03"
+    assert blocks[1].meta.text() == "[00:00:05]  发言人?"
+
+
+def test_resolver_empty_speaker_still_shows_placeholder(qapp, win):
+    """空声纹标签（未配 token 的现状）即使接了 resolver 也显示「发言人?」。"""
+    win.name_resolver = _names(("SPEAKER_00", "张三"))   # 空标签由 resolver 兜成占位
+    win.show_segment(_seg(0, speaker=""), "发言人?")
+    _pump(qapp)
+    assert win.entries()[0].meta.text() == "[00:00:00]  发言人?"
+
+
+def test_resolver_returning_empty_falls_back_to_original(qapp, win):
+    """resolver 返回空串/抛异常 → 退回入块时的名字，不让头行空着或崩掉。"""
+    win.show_segment(_seg(0, speaker="SPEAKER_00"), "SPEAKER_00")
+    _pump(qapp)
+    entry = win.entries()[0]
+
+    win.name_resolver = lambda label: ""            # noqa: ARG005 —— 故意返回空
+    win.refresh_names()
+    _pump(qapp)
+    assert entry.meta.text() == "[00:00:00]  SPEAKER_00"
+
+    def boom(label):                                # noqa: ARG001
+        raise RuntimeError("解析器炸了")
+
+    entry.name_resolver = boom                       # 已接线的块：直接换成会炸的
+    win.refresh_names()
+    _pump(qapp)
+    assert entry.meta.text() == "[00:00:00]  SPEAKER_00"
+
+
+def test_refresh_names_keeps_block_count_and_scroll(qapp, win):
+    """滚动位置保持：用户上翻看历史时改名，视口不能跳回底部。"""
+    for i in range(12):
+        win.show_segment(_seg(i), f"说话人{i}")
+    _pump(qapp)
+    bar = win.scroll_bar()
+    assert bar.maximum() > 0, "用例前提：内容超出一屏（否则没有可跳的滚动位置）"
+    bar.setValue(0)
+    _pump(qapp)
+    assert win.auto_scroll is False
+    value_before = bar.value()
+
+    # 名字换成超长串：头行会折行、内容变高 —— 这样「滚动位置没被重置」才是真断言
+    # （恒等映射下版面零变化，任何实现都不会跳）
+    win.name_resolver = lambda label: "很长很长很长很长很长的名字" * 3
+    win.refresh_names()
+    _pump(qapp)
+
+    assert len(win.entries()) == 12        # 不新增、不丢弃
+    assert win.auto_scroll is False, "用户上翻看历史时改名不该恢复自动跟随"
+    assert bar.value() == value_before     # 视口原位（没被拉到底部）
+
+
+def test_refresh_names_while_following_stays_at_bottom(qapp, win):
+    """原本停在底部（跟随最新）→ 改名后继续贴底，不把最新一句藏起来。"""
+    for i in range(12):
+        win.show_segment(_seg(i), f"说话人{i}")
+    _pump(qapp)
+    bar = win.scroll_bar()
+    assert win.auto_scroll is True
+    win.name_resolver = _names()
+    win.refresh_names()
+    _pump(qapp)
+    assert bar.value() == bar.maximum()
+
+    # 之后的新块同样走 resolver（空标签 → 占位名），头行不是死字符串
+    win.show_segment(_seg(12), "说话人12")
+    _pump(qapp)
+    assert win.entries()[-1].meta.text() == "[00:01:00]  发言人?"
+
+
+def test_refresh_names_covers_multi_segment_turn(qapp, win):
+    """一个回合块里有多句：改名只重画一次头行，块内句子数/正文都不变。"""
+    win.show_segment(_seg(0, speaker="SPEAKER_00", start=0.0), "SPEAKER_00")
+    win.show_segment(_seg(1, speaker="SPEAKER_00", start=2.0), "SPEAKER_00")  # 同回合
+    _pump(qapp)
+    entries = win.entries()
+    assert len(entries) == 1 and len(entries[0].segments) == 2
+    main_before = entries[0].main.text()
+
+    win.name_resolver = _names(("SPEAKER_00", "张三"))
+    win.refresh_names()
+    _pump(qapp)
+
+    assert entries[0].meta.text() == "[00:00:00]  张三"     # 头行取回合首句时间
+    assert entries[0].main.text() == main_before            # 正文不动
+    assert len(win.entries()) == 1 and len(entries[0].segments) == 2
+
+
+def test_refresh_names_keeps_seq_mapping(qapp, win):
+    """refresh 后 seq → 块 的映射还在：同 seq 的译文更新仍走原地替换（不新开块）。"""
+    win.show_segment(_seg(0, speaker="SPEAKER_00"), "SPEAKER_00")
+    _pump(qapp)
+    win.name_resolver = _names(("SPEAKER_00", "张三"))
+    win.refresh_names()
+    _pump(qapp)
+
+    updated = Segment(start=0.0, end=3, text="原文", lang="en",
+                      speaker="SPEAKER_00", translation="改过的译文", seq=1)
+    assert win.update_segment(updated, "张三") is True       # 命中原来的块
+    _pump(qapp)
+    assert len(win.entries()) == 1
+    assert win.entries()[0].main.text() == "改过的译文"
+
+
+def test_refresh_names_does_not_rebind_already_resolved_blocks(qapp, win):
+    """跨会议不串名字：已接过线的老块保留上一场的解析器，新块用当前解析器。
+
+    面板跨会议不重建（块一直在），若 refresh 无条件换成当前 store，「张三」会被
+    第二场同标签的「李四」改名翻掉。
+    """
+    win.name_resolver = _names(("SPEAKER_00", "张三"))       # 第一场的 store
+    win.show_segment(_seg(0, speaker="SPEAKER_00"), "SPEAKER_00")
+    _pump(qapp)
+    first = win.entries()[0]
+    assert first.meta.text() == "[00:00:00]  张三"
+
+    win.name_resolver = _names(("SPEAKER_00", "李四"))       # 第二场的 store
+    win.refresh_names()
+    _pump(qapp)
+    assert first.meta.text() == "[00:00:00]  张三", "老块被新一场的 resolver 污染了"
+
+    win.show_segment(_seg(1, speaker="SPEAKER_00"), "SPEAKER_00")   # 新块 → 新 resolver
+    _pump(qapp)
+    assert win.entries()[-1].meta.text() == "[00:00:05]  李四"
+
+
+def test_late_speaker_label_updates_header(qapp, win):
+    """声纹标签延迟出现（pyannote 滑窗打标）：同回合后续句子带上标签时头行要跟上。"""
+    win.name_resolver = _names(("SPEAKER_00", "张三"))
+    win.show_segment(_seg(0, speaker="", start=0.0), "发言人?")
+    _pump(qapp)
+    assert win.entries()[0].meta.text() == "[00:00:00]  发言人?"
+
+    win.show_segment(_seg(1, speaker="SPEAKER_00", start=2.0), "SPEAKER_00")  # 同回合
+    _pump(qapp)
+    entries = win.entries()
+    assert len(entries) == 1, "同回合应合并，不该因为标签后到就切块"
+    assert entries[0].meta.text() == "[00:00:00]  张三"

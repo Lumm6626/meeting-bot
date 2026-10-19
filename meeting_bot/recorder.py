@@ -24,6 +24,9 @@ from .vad import UtteranceBuffer
 
 SegmentEvent = Callable[[Segment], None]
 StatusEvent = Callable[[str], None]
+# 说话人改名事件：(声纹标签, 用户给的名字)。改名是人工确认过的监督信号，
+# 声纹学习（A2）拿它积累「这个标签确实属于这个人」的正样本。
+SpeakerRenameEvent = Callable[[str, str], None]
 
 AUDIO_SINK_DIR = ".recording"   # 录音落盘目录（与 JSONL 日志同处，已在 .gitignore）
 AUDIO_SINK_SAMPLE_RATE = 16000  # 与采集/识别/pyannote 统一（wav 内嵌此采样率）
@@ -121,6 +124,9 @@ class Recorder:
         # 因为同一条语句会先发原文（_events 一次），再发译文更新（_updates）。
         self._updates: list[SegmentEvent] = []
         self._status: list[StatusEvent] = []
+        # 改名事件（UI 线程发、潜在的学习方收）：与 _events/_updates 独立，
+        # 因为它是「人对标签的纠正」，不是语句流的一部分。
+        self._speaker_renamed: list[SpeakerRenameEvent] = []
         self._stop = threading.Event()
         # producer-done：主循环（生产者）已完成尾部 flush，翻译 worker 方可排空退出。
         # 只靠 _stop 会有窗口期：队列一度为空时 worker 退出，之后 flush 的尾部语句无人翻译。
@@ -186,6 +192,33 @@ class Recorder:
 
     def on_status(self, fn: StatusEvent) -> None:
         self._status.append(fn)
+
+    def on_speaker_renamed(self, fn: SpeakerRenameEvent) -> None:
+        """注册「说话人改名」回调（``fn(label, name)``），供声纹学习积累样本。
+
+        本类只负责广播，不做任何学习/落盘逻辑（那是消费方的事）。注意回调是在
+        :meth:`emit_speaker_renamed` 的**调用线程里同步执行**的（改名 → GUI 线程），
+        所以消费方必须非阻塞：要落盘/要训练就自己丢进队列或起后台线程，别在回调
+        里做重活（会直接卡住用户改名字这一步）。
+        """
+        self._speaker_renamed.append(fn)
+
+    def emit_speaker_renamed(self, label: str, name: str) -> None:
+        """广播一次改名事件（UI 在 ``store.set_speaker_name`` 之后调用）。
+
+        空标签直接忽略（没有声纹标签就没有可学的对象）；名字可能是空串（用户把
+        名字清掉），消费方自行判断要不要当样本。回调异常只告警 —— 用户按下回车
+        改个名字，不该因为下游学习/写盘失败而弹错。
+        """
+        label = (label or "").strip()
+        if not label:
+            return
+        name = (name or "").strip()
+        for fn in list(self._speaker_renamed):      # 快照：回调里注册新监听者不影响本轮
+            try:
+                fn(label, name)
+            except Exception as e:          # 学习方异常绝不能反噬 UI
+                self._say(f"[警告] 说话人改名回调异常：{e}")
 
     def _emit(self, seg: Segment) -> None:
         for fn in self._events:

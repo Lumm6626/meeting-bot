@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """字幕浮窗：Teams 会议转录式滚动面板。
 
-设计要点（对外接口只有 ``SubtitleWindow()``、``show_segment(seg, name)`` 与
-``update_segment(seg, name)``——app.py 依赖这三条，不可变更）：
+设计要点（对外接口：``SubtitleWindow(mode, name_resolver=)``、``show_segment(seg,
+name)``、``update_segment(seg, name)`` 与 ``refresh_names()``——前三条 app.py 一直在
+用、不可变更；``name_resolver`` / ``refresh_names`` 是「改名回填整场字幕」新增的
+两条可选接口，默认行为与旧版完全一致）：
 
 * 两阶段显示：识别完即 ``show_segment``（此时无译文 → 主标签显示原文），
   翻译到达后 ``update_segment`` 按 seq 找到同一句，**原地**替换并重渲染该块
@@ -20,10 +22,14 @@
 * 显示模式：``bilingual`` 中文段落 + 灰色小字原文（默认）/ ``zh_only`` 只显示中文
   （原文段整段隐藏、块高度自适应）。右键菜单切换，选择记在 QSettings
   (``meeting-bot/subtitle``) 的 ``mode`` 键里，下次启动优先用它。
+* 说话人名字实时解析（``name_resolver``）：块头行的名字不再固定成「入块那一刻的
+  字符串」，而是每帧按当前解析器算 —— 用户在主窗口表格里把 ``SPEAKER_00`` 改成
+  「张三」后调 :meth:`SubtitleWindow.refresh_names`，整场已显示的块立刻换名字
+  （正文文本、块数量、滚动位置都不动）。
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from PyQt6.QtCore import QEvent, QPoint, QRectF, QSettings, QTimer, Qt
 from PyQt6.QtGui import QActionGroup, QColor, QPainter
@@ -199,14 +205,19 @@ class SubtitleEntry(QWidget):
 
     显示模式（``mode``）：``bilingual`` 主标签译文 + 副标签原文；
     ``zh_only`` 副标签整行隐藏（文本也清空 → 不占高），只留中文段落。
+    ``name_resolver``：把声纹标签实时解析成显示名的函数（见 :meth:`_speaker_name`）。
     """
 
     def __init__(self, seg: Segment, display_name: str, parent: QWidget | None = None,
-                 *, mode: str = MODE_BILINGUAL):
+                 *, mode: str = MODE_BILINGUAL,
+                 name_resolver: Callable[[str], str] | None = None):
         super().__init__(parent)
         # 整块不吃鼠标：点击穿透给容器，由窗口统一做移动/缩放
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.display_name = display_name
+        # 名字解析器（默认 None → 头行沿用 display_name，与旧行为一致）；
+        # 必须先于 add_segment 赋值：构造时就按它渲染头行
+        self.name_resolver = name_resolver
         self._mode = normalize_mode(mode)
         self.segments: list[Segment] = []
 
@@ -259,11 +270,40 @@ class SubtitleEntry(QWidget):
         self._mode = mode
         self._rebuild()
 
+    # -------------------------------------------------------------- 说话人名
+    def _speaker_name(self) -> str:
+        """头行显示的名字：有 resolver 就按当前声纹标签实时解析。
+
+        resolver 为 None（旧行为 / 未接线）→ 直接用构造时传入的 ``display_name``。
+        resolver 抛异常、返回空串时同样退回 ``display_name``：头行渲染绝不能因为
+        「查名字」这一步把整块字幕弄崩（解析的是 UI 数据，不是控制流）。
+        """
+        resolver = self.name_resolver
+        if resolver is None:
+            return self.display_name
+        try:
+            name = resolver(self.speaker)
+        except Exception:               # noqa: BLE001 —— 渲染路径必须兜住任何异常
+            return self.display_name
+        return name or self.display_name
+
+    def _render_meta(self) -> None:
+        """重绘头行（首句时间 + 说话人）；正文两块文本完全不碰。"""
+        self.meta.setText(f"{fmt_ts(self.segments[0].start)}  {self._speaker_name()}")
+
+    def refresh_name(self) -> None:
+        """按当前 resolver 重渲染头行（改名回填用：不动文本、不新增块）。"""
+        if self.segments:
+            self._render_meta()
+
     def add_segment(self, seg: Segment) -> None:
         """把一条语句并入本回合（顺序追加），原地刷新三个标签。"""
+        before = self.speaker
         self.segments.append(seg)
-        if len(self.segments) == 1:
-            self.meta.setText(f"{fmt_ts(seg.start)}  {self.display_name}")
+        # 首句入块 → 必须画头行；标签延迟出现（后面某句才带上声纹标签）也要跟上，
+        # 否则头行会一直停在「发言人?」直到有人改名
+        if len(self.segments) == 1 or self.speaker != before:
+            self._render_meta()
         self._rebuild()
 
     def replace_segment(self, seg: Segment) -> bool:
@@ -277,7 +317,7 @@ class SubtitleEntry(QWidget):
                 self.segments[i] = seg
                 if i == 0:
                     # 头行时间取回合首句，替换首句时一并刷新（换人/改名同理）
-                    self.meta.setText(f"{fmt_ts(seg.start)}  {self.display_name}")
+                    self._render_meta()
                 self._rebuild()
                 return True
         return False
@@ -319,14 +359,21 @@ class SubtitleEntry(QWidget):
 
 
 class SubtitleWindow(QWidget):
-    def __init__(self, mode: str = MODE_BILINGUAL):
+    def __init__(self, mode: str = MODE_BILINGUAL, *,
+                 name_resolver: Callable[[str], str] | None = None):
         """``mode`` 默认 bilingual（既有 ``SubtitleWindow()`` 调用行为不变）。
 
         优先级：QSettings 里记住的值 > 构造参数 > 默认 bilingual。
         （用户可以右键切换过模式，下次启动要沿用他的选择，而不是 .env 的老值。）
+
+        ``name_resolver``：声纹标签 → 显示名（默认 None，头行沿用 ``show_segment``
+        传来的名字）。也可以构造后再赋值（``win.name_resolver = store.display_name``
+        —— recorder 每场新建，app.py 就是这么做的），改名时调 :meth:`refresh_names`
+        让已显示的块立刻跟手。
         """
         super().__init__()
         self._mode = normalize_mode(load_saved_mode() or mode)
+        self.name_resolver = name_resolver      # 新块创建时继承（见 _add_block）
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -513,6 +560,29 @@ class SubtitleWindow(QWidget):
         if persist:
             save_mode(mode)
 
+    # ------------------------------------------------------------ 名字回填
+    def refresh_names(self) -> None:
+        """按当前 ``name_resolver`` 重渲染**所有已显示块**的头行（改名回填）。
+
+        不动正文文本、不新增/搬动块、不重建控件：只把每个块的「时间 + 说话人」
+        这一行重新算一遍。滚动位置与 ``set_mode`` 同一套处理 —— 原本停在底部且
+        开着自动跟随的继续贴底，用户上翻看历史时保持原位不跳。
+        """
+        bar = self.scroll_bar()
+        value = bar.value()
+        was_following = self._auto_scroll
+        for entry in self._entries:
+            if entry.name_resolver is None:
+                # 只给「还没接线」的块补上解析器。已经接过线的块保留自己那一个 ——
+                # 面板跨会议不重建，若一律换成当前 store，上一场的块会被新一场的
+                # 名字污染（同一标签在两场里常常是不同的人）。
+                entry.name_resolver = self.name_resolver
+            entry.refresh_name()
+        if was_following:
+            self._stick_if_auto()
+        else:
+            bar.setValue(min(value, bar.maximum()))
+
     # ---------------------------------------------------------- 录制状态提示
     def set_recording(self, active: bool) -> None:
         """录制中在右上角显示红点 + 「录音中」pill；停止后隐藏（幂等）。"""
@@ -609,7 +679,8 @@ class SubtitleWindow(QWidget):
 
     # -------------------------------------------------------------- 块管理
     def _add_block(self, seg: Segment, display_name: str) -> SubtitleEntry:
-        entry = SubtitleEntry(seg, display_name, self._container, mode=self._mode)
+        entry = SubtitleEntry(seg, display_name, self._container, mode=self._mode,
+                              name_resolver=self.name_resolver)
         entry.set_sizes(self.current_font_size())
         for w in (entry, entry.meta, entry.main, entry.sub):
             w.installEventFilter(self)

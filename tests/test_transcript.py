@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
+import json
 from datetime import datetime
 
-from meeting_bot.transcript import Segment, TranscriptStore, fmt_ts
+from meeting_bot.transcript import (Journal, Segment, TranscriptStore, fmt_ts,
+                                    load_journal)
 
 
 def test_fmt_ts():
@@ -37,3 +39,22 @@ def test_to_markdown():
     assert "Alice" in md
     assert "[00:00:05]" in md
     assert "Good morning everyone." in md
+
+
+def test_set_speaker_name_writes_speaker_event_and_replays(tmp_path):
+    """改名必须落 journal（``{"t":"speaker"}``）——崩了以后回放还能恢复人名的依据。"""
+    journal = Journal(tmp_path / "j.jsonl", title="周会")
+    store = TranscriptStore(journal)
+    seg = store.add(1.0, 3.0, "hello", lang="en")
+    store.update(seg.seq, speaker="SPEAKER_00")
+    store.set_speaker_name("SPEAKER_00", "张三")     # 用户在表格里改名
+    journal.footer()
+    journal.close()
+
+    events = [json.loads(line) for line in
+              (tmp_path / "j.jsonl").read_text(encoding="utf-8").splitlines() if line]
+    speaker_events = [ev for ev in events if ev.get("t") == "speaker"]
+    assert speaker_events == [{"t": "speaker", "label": "SPEAKER_00", "name": "张三"}]
+
+    _title, _started, replayed = load_journal(tmp_path / "j.jsonl")
+    assert replayed.display_name("SPEAKER_00") == "张三"

@@ -260,14 +260,18 @@ class TranscriptStore:
                 return
 
     def register_label(self, label: str) -> None:
-        # 不写日志：标签可由 add 事件里的 speaker 字段推导，多记一行纯属冗余
-        if label and label not in self._speakers:
-            self._speakers[label] = Speaker(label=label)
+        # 不写日志：标签可由 add 事件里的 speaker 字段推导，多记一行纯属冗余。
+        # 用 setdefault 而不是「先查后写」：标注线程（recorder/app）也会注册标签，
+        # 与 GUI 线程的改名并发时，查-写两步之间可能被插入一个空 Speaker，
+        # 把用户刚填的名字覆盖掉。
+        if label:
+            self._speakers.setdefault(label, Speaker(label=label))
 
     def set_speaker_name(self, label: str, name: str) -> None:
-        self.register_label(label)
+        # setdefault 同上：改名与「标签首次出现」并发时不能把名字弄丢
+        speaker = self._speakers.setdefault(label, Speaker(label=label))
         cleaned = name.strip()
-        self._speakers[label].name = cleaned
+        speaker.name = cleaned
         if self._journal is not None:
             self._journal.record_speaker(label, cleaned)
 

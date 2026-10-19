@@ -2713,3 +2713,64 @@ def test_save_audio_failure_warns_once_and_keeps_recording(tmp_path, monkeypatch
     assert len(warns) == 1, f"落盘失败应只告警一次：{statuses}"
     # 录制本身不受影响：语句照常入库
     assert len(r.store.segments()) >= 1
+
+
+# ---------------------------------------------------------------------------
+# 说话人改名事件：改名 = 人工确认的声纹标签归属 → 广播给声纹学习（A2）消费
+# ---------------------------------------------------------------------------
+
+def test_speaker_renamed_callbacks_receive_label_and_name():
+    """注册的 rename 回调在触发时收到 (label, name)，名字已 strip。"""
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1))
+    got: list[tuple[str, str]] = []
+    r.on_speaker_renamed(lambda label, name: got.append((label, name)))
+
+    r.emit_speaker_renamed("SPEAKER_00", " 张三 ")
+    r.emit_speaker_renamed("SPEAKER_01", "李四")
+
+    assert got == [("SPEAKER_00", "张三"), ("SPEAKER_01", "李四")]
+
+
+def test_speaker_renamed_ignores_empty_label():
+    """没有声纹标签 → 没有可学的对象：不广播（避免下游收到空 label）。"""
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1))
+    got: list[tuple[str, str]] = []
+    r.on_speaker_renamed(lambda label, name: got.append((label, name)))
+
+    r.emit_speaker_renamed("", "张三")
+    r.emit_speaker_renamed("   ", "张三")
+
+    assert got == []
+
+
+def test_speaker_renamed_callback_error_does_not_break_ui_path():
+    """学习方回调抛异常 → 只往状态栏告警，改名这条 UI 路径照常走完。"""
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1))
+    statuses: list[str] = []
+    r.on_status(statuses.append)
+    got: list[tuple[str, str]] = []
+
+    def boom(label, name):
+        raise RuntimeError("学习器炸了")
+
+    r.on_speaker_renamed(boom)
+    r.on_speaker_renamed(lambda label, name: got.append((label, name)))
+
+    r.emit_speaker_renamed("SPEAKER_00", "张三")     # 不得抛出去
+
+    assert got == [("SPEAKER_00", "张三")], "一个回调失败不该拖累其它回调"
+    assert statuses and "改名回调异常" in statuses[-1]
+
+
+def test_speaker_renamed_multiple_listeners_and_no_listeners():
+    """多监听者各自收到一次；没人注册时触发也不报错（录制早期/无 UI 场景）。"""
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1))
+    r.emit_speaker_renamed("SPEAKER_00", "张三")      # 无监听者：安全返回
+
+    a: list[tuple[str, str]] = []
+    b: list[tuple[str, str]] = []
+    r.on_speaker_renamed(lambda label, name: a.append((label, name)))
+    r.on_speaker_renamed(lambda label, name: b.append((label, name)))
+    r.emit_speaker_renamed("SPEAKER_00", "张三")
+
+    assert a == b == [("SPEAKER_00", "张三")]

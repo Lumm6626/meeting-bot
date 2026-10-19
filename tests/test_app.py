@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QAbstractItemView, QApplication, QTableWidgetItem
 from PyQt6.QtWidgets import QSystemTrayIcon as _RealTray
 
 import meeting_bot.app as appmod
@@ -1092,3 +1092,196 @@ def test_no_hint_when_secrets_in_keyring(qapp, tmp_path, monkeypatch):
     finally:
         w.recorder = None
         w.hide()
+
+
+# ---------------------------------------------------------------------------
+# h. 说话人改名 → 回填整场字幕 + 广播改名事件（声纹学习的数据来源）
+# ---------------------------------------------------------------------------
+
+class _RenameRecorder(FakeRecorder):
+    """FakeRecorder + 改名事件记录（模拟 A2 声纹学习的消费端）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.renames: list[tuple[str, str]] = []
+        self.rename_listeners: list = []
+
+    def on_speaker_renamed(self, fn):
+        self.rename_listeners.append(fn)
+
+    def emit_speaker_renamed(self, label, name):
+        self.renames.append((label, name))
+        for fn in list(self.rename_listeners):
+            fn(label, name)
+
+
+class _RenameSubtitle:
+    """记录 refresh_names 调用的假字幕面板（name_resolver 只是个可写属性）。"""
+
+    def __init__(self):
+        self.name_resolver = None
+        self.refresh_calls = 0
+        self.refreshed_names: list = []
+
+    def show_segment(self, *_a, **_k):
+        pass
+
+    def update_segment(self, *_a, **_k):
+        return False
+
+    def refresh_names(self):
+        self.refresh_calls += 1
+        # 记录「那一刻 resolver 会显示什么」= 改名是否已经落进 store
+        if callable(self.name_resolver):
+            self.refreshed_names.append(self.name_resolver("SPEAKER_00"))
+
+    def hide(self):
+        pass
+
+
+def _rename_in_table(win, label: str, name: str):
+    """在说话人表格里改名字并触发真实的 _rename_speaker 链路。"""
+    win.speaker_table.blockSignals(True)          # 先静音：只为摆数据，不触发回调
+    win.speaker_table.setRowCount(1)
+    win.speaker_table.setItem(0, 0, QTableWidgetItem(label))
+    item = QTableWidgetItem(name)
+    win.speaker_table.setItem(0, 1, item)
+    win.speaker_table.blockSignals(False)
+    win._rename_speaker(item)                     # 等价于用户按下回车
+    return item
+
+
+def test_rename_speaker_refreshes_subtitle_and_emits_event(win, qapp):
+    """改名一次要触发三件事：落 store、字幕面板重渲染、recorder 广播 (label, name)。"""
+    fake_sub = _RenameSubtitle()
+    win.subtitle = fake_sub
+    rec = _RenameRecorder()
+    rec.store.register_label("SPEAKER_00")
+    win.recorder = rec
+
+    _rename_in_table(win, "SPEAKER_00", "张三")
+    _pump_until(qapp, lambda: True, timeout=0.05)
+
+    assert rec.store.display_name("SPEAKER_00") == "张三"   # ① 落 store
+    assert fake_sub.refresh_calls == 1, "改名后未让字幕面板重渲染已显示的块"  # ②
+    assert fake_sub.refreshed_names == ["张三"], "重渲染时 store 里还是旧名字（顺序错了）"
+    assert fake_sub.name_resolver is not None, "没把 store.display_name 接成解析器"
+    assert rec.renames == [("SPEAKER_00", "张三")]          # ③ 广播给声纹学习
+
+
+def test_rename_speaker_ignores_label_column_and_empty_recorder(win, qapp):
+    """改「声纹标签」列 / 无 recorder 时不做事（不炸、不广播）。"""
+    fake_sub = _RenameSubtitle()
+    win.subtitle = fake_sub
+    win.recorder = None
+    win.speaker_table.blockSignals(True)
+    win.speaker_table.setRowCount(1)
+    win.speaker_table.setItem(0, 0, QTableWidgetItem("SPEAKER_00"))
+    label_item = win.speaker_table.item(0, 0)
+    win.speaker_table.setItem(0, 1, QTableWidgetItem("张三"))
+    win.speaker_table.blockSignals(False)
+
+    win._rename_speaker(label_item)          # 第 0 列：不是名字列
+    assert fake_sub.refresh_calls == 0
+
+    rec = _RenameRecorder()
+    win.recorder = rec
+    win._rename_speaker(win.speaker_table.item(0, 1))   # 有 recorder，正常走一遍
+    assert rec.renames == [("SPEAKER_00", "张三")]
+
+    win.recorder = None                      # 活动结束（recorder 置空）后再改：安全返回
+    win._rename_speaker(win.speaker_table.item(0, 1))
+    assert fake_sub.refresh_calls == 1
+
+
+def test_rename_callback_receives_store_bound_speaker_event(win, qapp):
+    """注册在 recorder 上的回调（A2 的入口）收到改名事件，且带最终名字。"""
+    rec = _RenameRecorder()
+    rec.store.register_label("SPEAKER_01")
+    win.recorder = rec
+    win.subtitle = _RenameSubtitle()
+    seen: list[tuple[str, str]] = []
+    rec.on_speaker_renamed(lambda label, name: seen.append((label, name)))
+
+    _rename_in_table(win, "SPEAKER_01", "李四")
+    assert seen == [("SPEAKER_01", "李四")]
+
+
+def test_rename_updates_real_subtitle_block_header(win, qapp):
+    """端到端：真面板 + 真 store —— 改名前头行是 SPEAKER_00，改名后立刻变「张三」。"""
+    rec = _RenameRecorder()
+    win.recorder = rec
+    seg = rec.store.add(0.0, 2.0, "hello", lang="en")
+    rec.store.update(seg.seq, speaker="SPEAKER_00", translation="你好")
+    seg = rec.store.segments()[0]
+    win.subtitle.name_resolver = None        # 先清干净：下面由 _on_segment 懒接线
+
+    win._on_segment(seg)
+    _pump_until(qapp, lambda: True, timeout=0.05)
+    assert win.subtitle.entries()[0].meta.text() == "[00:00:00]  SPEAKER_00"
+    assert callable(win.subtitle.name_resolver), "_on_segment 未接上 store.display_name"
+
+    _rename_in_table(win, "SPEAKER_00", "张三")
+    _pump_until(qapp, lambda: True, timeout=0.05)
+    # 已显示的块立刻换名字，正文不动
+    assert win.subtitle.entries()[0].meta.text() == "[00:00:00]  张三"
+    assert win.subtitle.entries()[0].main.text() == "你好"
+    assert len(win.subtitle.entries()) == 1
+
+
+def test_rename_to_same_name_does_not_rebroadcast(win, qapp):
+    """同名重复触发（程序性重设 / 只改格式）不白刷新、不给声纹学习喂重复样本。"""
+    fake_sub = _RenameSubtitle()
+    win.subtitle = fake_sub
+    rec = _RenameRecorder()
+    rec.store.register_label("SPEAKER_00")
+    win.recorder = rec
+
+    _rename_in_table(win, "SPEAKER_00", "张三")
+    assert rec.renames == [("SPEAKER_00", "张三")]
+    assert fake_sub.refresh_calls == 1
+
+    _rename_in_table(win, "SPEAKER_00", "张三")      # 名字没变
+    assert rec.renames == [("SPEAKER_00", "张三")], "同名不该再广播一次"
+    assert fake_sub.refresh_calls == 1, "同名不该再重渲染整场字幕"
+
+
+def test_refresh_speakers_skips_while_user_is_editing(win, qapp):
+    """5 秒定时刷新不能重设正在编辑的单元格（重设会把输入框里的字清成空串）。"""
+    rec = _RenameRecorder()
+    rec.store.register_label("SPEAKER_00")
+    win.recorder = rec
+    win.show()
+    win.speaker_table.blockSignals(True)
+    win.speaker_table.setRowCount(1)
+    win.speaker_table.setItem(0, 0, QTableWidgetItem("SPEAKER_00"))
+    name_item = QTableWidgetItem("张三")
+    win.speaker_table.setItem(0, 1, name_item)
+    win.speaker_table.blockSignals(False)
+    _pump_until(qapp, lambda: True, timeout=0.05)
+
+    win.speaker_table.editItem(name_item)            # 用户点进单元格开始改名
+    _pump_until(qapp, lambda: True, timeout=0.05)
+    assert win.speaker_table.state() == QAbstractItemView.State.EditingState
+
+    win._refresh_speakers()                          # 模拟 5 秒定时器
+    assert win.speaker_table.item(0, 1) is name_item, "正在编辑时被重设：用户输入会被清空"
+
+
+def test_refresh_speakers_rebuilds_rows_when_not_editing(win, qapp):
+    """非编辑态照常刷新（跳过逻辑只针对「用户正在打字」那一刻）。"""
+    rec = _RenameRecorder()
+    rec.store.register_label("SPEAKER_00")
+    win.recorder = rec
+    win.speaker_table.blockSignals(True)
+    win.speaker_table.setRowCount(1)
+    win.speaker_table.setItem(0, 0, QTableWidgetItem("旧标签"))
+    old_item = QTableWidgetItem("旧名字")
+    win.speaker_table.setItem(0, 1, old_item)
+    win.speaker_table.blockSignals(False)
+    assert win.speaker_table.state() != QAbstractItemView.State.EditingState
+
+    win._refresh_speakers()                          # 用 store 里的真相重填
+    assert win.speaker_table.item(0, 0).text() == "SPEAKER_00"
+    assert win.speaker_table.item(0, 1).text() == ""             # store 里还没名字
+    assert win.speaker_table.item(0, 1) is not old_item
