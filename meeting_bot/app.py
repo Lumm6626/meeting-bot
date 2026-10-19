@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 from datetime import datetime
+from pathlib import Path
 from string import Template
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
@@ -18,6 +19,8 @@ from .capture import AudioCapture, CaptureError
 from .config import PROJECT_ROOT, ConfigError, Settings, load_settings
 from .export import export_all
 from .subtitle import SubtitleWindow
+from .transcript import (Journal, TranscriptStore, journal_finished, journal_meta,
+                         load_journal, write_footer)
 from .translator import Translator
 
 
@@ -67,6 +70,8 @@ DISABLED = "#3A4052"       # 禁用灰化
 PILL_BG = "#2A2F42"        # 配置胶囊底
 PILL_FG = "#A8C7F0"        # 配置胶囊字
 FONT_FAMILY = "Microsoft YaHei UI"
+
+RECORDING_DIR = ".recording"     # <output_dir>/.recording/：边录边落盘的工作区（git 忽略）
 
 _AUDIO_PILL = {
     "both": "音频 · 自动双路",
@@ -279,6 +284,8 @@ class RecorderBridge(QObject):
     update = pyqtSignal(object)
     status = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
+    # 崩溃恢复结果（后台线程 → GUI 线程；恢复期间不能阻塞界面）
+    recovered = pyqtSignal(bool, str)
 
 
 class MainWindow(QMainWindow):
@@ -293,6 +300,7 @@ class MainWindow(QMainWindow):
         self.bridge.update.connect(self._on_update)
         self.bridge.status.connect(self._on_status)
         self.bridge.finished.connect(self._on_finished)
+        self.bridge.recovered.connect(self._on_recovered)
         # 关窗触发收尾时置 True：导出完成后由 _on_finished 直接退出应用
         self._quit_after_stop = False
 
@@ -410,6 +418,11 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(app_icon())
         # 后台预热引擎：窗口已出现，用户还在看界面时就把 6 秒的 import 做完
         threading.Thread(target=self._preload_engine, daemon=True).start()
+        # 崩溃恢复：只在「启动那一刻」快照待恢复日志，再推迟到下一轮事件循环询问。
+        # 若把扫描放到定时器回调里，用户很快点了「开始记录」时，本场刚建的日志会被
+        # 误判成「上次未完成会议」并弹模态框（实测会卡住自动化测试）。
+        self._pending_journals = self._scan_pending_journals()
+        QTimer.singleShot(0, self._check_recovery)
 
     def _is_recording(self) -> bool:
         """录制 / 收尾中：start 按钮禁用（_start 置位、_on_finished 复位）。"""
@@ -442,6 +455,106 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.quit()
+
+    # ------------------------------------------------------------------
+    # 崩溃恢复：边录边落盘（JSONL）+ 下次启动询问是否恢复
+    # ------------------------------------------------------------------
+
+    def _recording_dir(self) -> Path:
+        """录制工作区：``<output_dir>/.recording/``（隐藏目录，已加进 .gitignore）。"""
+        return Path(self.settings.output_dir) / RECORDING_DIR
+
+    def _new_journal_store(self, title: str) -> TranscriptStore:
+        """为本场录制新建「带日志的 store」。
+
+        日志建不出来（磁盘只读 / 权限 / 目录异常）不得阻断录制：降级成无日志的
+        store 照常录，只是丧失崩溃恢复能力（状态栏告警一次）。
+        """
+        try:
+            path = self._recording_dir() / f"rec_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+            return TranscriptStore(journal=Journal(path, title=title or "未命名会议"))
+        except OSError as e:
+            self.bridge.status.emit(f"[警告] 无法创建录制日志（本次不支持崩溃恢复）：{e}")
+            return TranscriptStore()
+
+    def _finish_journal(self, store) -> None:
+        """给本场日志写 footer 并关闭（导出成功后才调用）。
+
+        只在导出成功后写：导出失败时保持「未完成」状态，下次启动还能再恢复一次。
+        """
+        journal = getattr(store, "journal", None)
+        if journal is None:
+            return
+        try:
+            journal.footer()
+        except OSError:
+            pass
+        finally:
+            journal.close()
+
+    def _scan_pending_journals(self) -> list[Path]:
+        """启动时扫描「未完成」的录制日志（无 footer）。异常一律当作没有。"""
+        try:
+            return [p for p in sorted(self._recording_dir().glob("rec_*.jsonl"))
+                    if p.is_file() and not journal_finished(p)]
+        except OSError:
+            return []
+
+    def _check_recovery(self) -> None:
+        """询问是否恢复启动快照里的未完成会议（只问一次，且不含本场录制）。"""
+        pending = list(getattr(self, "_pending_journals", []))
+        self._pending_journals = []
+        if not pending:
+            return
+        path = pending[0]
+        title, started_at = journal_meta(path)
+        when = f"{started_at:%Y-%m-%d %H:%M}" if started_at else "时间未知"
+        ret = QMessageBox.question(
+            self, "检测到未完成的会议",
+            f"检测到上次会议未正常结束（{title or path.stem} · {when}）。\n是否恢复并生成纪要？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            self._abandon_journal(path)
+            return
+        self.status.setText(f"正在恢复上次会议（{title or path.stem}）…")
+        # 回放 + 纪要生成可能几秒到几十秒（要调翻译接口）：放后台线程，GUI 不冻结
+        threading.Thread(target=self._recover_journal, args=(path,), daemon=True).start()
+
+    def _abandon_journal(self, path: Path) -> None:
+        """用户选择不恢复：改名成 .abandoned.jsonl，之后启动不再提示（原文件保留可找回）。"""
+        try:
+            path.rename(path.with_suffix(".abandoned.jsonl"))
+        except OSError as e:
+            self.status.setText(f"[警告] 无法归档未完成日志：{e}")
+
+    def _recover_journal(self, path: Path) -> None:
+        """后台恢复：回放日志 → 重建 store → 导出逐字稿/纪要 → 写 footer。
+
+        翻译接口不可用（未配置 / 构造失败）降级为占位纪要，逐字稿照常产出 ——
+        恢复的价值主要在会议内容本身，不能因为纪要模型挂了就整场丢掉。
+        """
+        try:
+            title, started_at, store = load_journal(path)
+            try:
+                translator = Translator(self.settings)
+            except Exception:
+                translator = None          # 降级：export_all 会写占位纪要
+            transcript_path, minutes_path = export_all(
+                store, self.settings, title or path.stem, started_at,
+                translator=translator)
+            write_footer(path)             # 恢复完成：标记已落盘，下次启动不再询问
+            self.bridge.recovered.emit(
+                True, f"已恢复上次会议：\n逐字稿：{transcript_path}\n纪要：{minutes_path}")
+        except Exception as e:
+            self.bridge.recovered.emit(False, f"恢复失败：{e}")
+
+    def _on_recovered(self, ok: bool, msg: str) -> None:
+        """恢复结果回到 GUI 线程：更新状态栏 + 提示（弹框只能在主线程）。"""
+        self.status.setText("已恢复上次会议" if ok else "恢复失败")
+        if ok:
+            QMessageBox.information(self, "恢复完成", msg)
+        else:
+            QMessageBox.critical(self, "恢复失败", msg)
 
     def _probe_capture(self) -> AudioCapture | None:
         """按 .env 的 AUDIO_SOURCE（默认 both）探测一次设备，成功返回可复用的实例。
@@ -489,10 +602,12 @@ class MainWindow(QMainWindow):
                     # Qt 槽内异常外冒会直接终止进程（qFatal），不能让它冒出去。
                     self._warn_diarizer_unavailable(e)
             try:
+                store = self._new_journal_store(title)
                 self.recorder = Recorder(
                     self.settings, capture=capture, translator=translator,
                     diarizer=diarizer,
-                    audio_source=getattr(self.settings, "audio_source", "both"))
+                    audio_source=getattr(self.settings, "audio_source", "both"),
+                    store=store)
                 self.recorder.on_segment(self.bridge.segment.emit)
                 self.recorder.on_update(self.bridge.update.emit)
                 self.recorder.on_status(self.bridge.status.emit)
@@ -573,6 +688,8 @@ class MainWindow(QMainWindow):
                     recorder.store, self.settings, title,
                     recorder.started_at or datetime.now(),
                     translator=recorder.translator)
+                # 导出成功 = 本场已完整落盘：写 footer 关账，下次启动不再提示恢复
+                self._finish_journal(recorder.store)
                 self.bridge.finished.emit(True,
                     f"已生成：\n逐字稿：{transcript_path}\n纪要：{minutes_path}")
             except Exception as e:

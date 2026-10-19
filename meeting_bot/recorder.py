@@ -82,7 +82,8 @@ class Recorder:
                  asr: ASREngine | None = None,
                  translator: Translator | None = None,
                  diarizer: Diarizer | None = None,
-                 audio_source: str = SOURCE_BOTH):
+                 audio_source: str = SOURCE_BOTH,
+                 store: TranscriptStore | None = None):
         """audio_source 只在 capture 为 None（自行建捕获）时生效：
 
         - ``"both"``：扬声器 loopback + 默认麦克风混合（默认，线上/线下通用）
@@ -91,6 +92,9 @@ class Recorder:
 
         显式注入 capture 时该参数被忽略 —— 上层（app.py）会先构造探测过的实例
         再传进来，此处不再重复打开设备。
+
+        ``store`` 用于注入「带崩溃恢复日志的 TranscriptStore」（见 Journal）：
+        默认自建一个无日志的 store，保持既有行为。
         """
         self._settings = settings
         self._audio_source = audio_source
@@ -105,7 +109,7 @@ class Recorder:
         self._asr = asr
         self._translator = translator
         self._diarizer = diarizer
-        self._store = TranscriptStore()
+        self._store = store if store is not None else TranscriptStore()
         self._events: list[SegmentEvent] = []
         # 译文填充后的「原地更新」通道（两阶段显示）：与 _events 分离，
         # 因为同一条语句会先发原文（_events 一次），再发译文更新（_updates）。
@@ -445,6 +449,20 @@ class Recorder:
         return "\n".join(
             f"原文：{s.text}\n译文：{s.translation or '（无）'}" for s in picked)
 
+    def _persist_translation(self, seg: Segment) -> None:
+        """把最终译文回写 store —— 顺带触发 Journal 落盘（崩溃恢复后译文不丢）。
+
+        为什么不用 update 做流式刷新：流式每句几十块，逐块写日志会把 JSONL 撑到
+        几十 MB（且中途崩溃时最后一块本就是半句）。译文在 store 里是原地改的，
+        这里在「最终文本定稿」时补一条 update 事件即可。
+        """
+        if not seg.translation:
+            return
+        try:
+            self._store.update(seg.seq, translation=seg.translation)
+        except Exception as e:      # 落盘失败不能影响字幕/纪要
+            self._say(f"[警告] 译文落盘失败：{e}")
+
     def _stream_translate(self, seg: Segment) -> None:
         """流式翻译一条语句：译文逐字上屏，节流刷新，末次必刷。
 
@@ -488,6 +506,7 @@ class Recorder:
         # 尾块被节流挡掉时面板会缺尾巴）；文本已相同说明屏上即最终，无需空重绘。
         if seg.translation and seg.translation != last_text:
             self._notify_update(seg)
+        self._persist_translation(seg)
 
     def _translate_worker(self) -> None:
         try:
@@ -509,6 +528,7 @@ class Recorder:
                         # 中文段无需翻译：一次通知即完成第二阶段（没有流可节流）
                         if seg.translation:
                             self._notify_update(seg)
+                            self._persist_translation(seg)
                     else:
                         # 非中文段走流式：译文逐字上屏（_stream_translate 内部负责
                         # 节流刷新、末次必刷、流中断时把半句回退成原文）
@@ -622,10 +642,15 @@ class Recorder:
                 # label() 成功后的映射 / 分配 / 注册同样不能抛穿：异常会杀死标注线程，
                 # 此后整场会议再无说话人标注，且本轮注册全部丢失（审查 Minor-3）。
                 mapped_spans = self._globalize_spans(spans, base)
+                # assign_speakers 直接改 seg.speaker（不经过 store）：先拍快照，
+                # 只把「本轮真正变了」的标签写进日志，避免每 60 秒重写全部语句
+                before = {seg.seq: seg.speaker for seg in self._store.segments()}
                 assign_speakers(self._store.segments(), mapped_spans)
                 for seg in self._store.segments():
                     if seg.speaker:
                         self._store.register_label(seg.speaker)
+                        if before.get(seg.seq) != seg.speaker:
+                            self._store.update(seg.seq, speaker=seg.speaker)
                 self._say(f"已识别说话人：{len(self._store.speakers())} 人")
             except Exception as e:
                 self._say(f"[警告] 说话人标注失败：{e}")
@@ -670,6 +695,7 @@ class Recorder:
                         backfill_fails = 0          # 成功即清零：偶发失败不累计
                         # 补译成功 → 面板要拿到最终译文（原文阶段早已上屏）
                         self._notify_update(seg)
+                        self._persist_translation(seg)
                     except Exception as e:
                         backfill_fails += 1
                         self._say(f"[警告] 收尾补译失败：{e}")

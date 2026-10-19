@@ -441,7 +441,7 @@ def _install_fake_stack(monkeypatch):
         return cap
 
     def _recorder_factory(settings, capture=None, asr=None, translator=None,
-                          diarizer=None, audio_source=None):
+                          diarizer=None, audio_source=None, store=None):
         rec = _FakeStartedRecorder(settings, capture=capture, audio_source=audio_source)
         made["recorder"].append(rec)
         return rec
@@ -723,3 +723,22 @@ def test_brand_pixmap_logical_size_matches_label(win, qapp):
     assert abs(logical_w - 48) <= 0.5, f"图标逻辑宽 {logical_w} ≠ 48（会被裁切）"
     assert abs(logical_h - 48) <= 0.5
     assert win.icon_label.width() == 48 and win.icon_label.height() == 48
+
+
+@pytest.fixture(autouse=True)
+def _silence_messageboxes(monkeypatch):
+    """兜底：任何用例都不允许弹真实模态框（离屏下会直接卡死整个测试进程）。"""
+    for name, ret in (("information", None), ("critical", None), ("warning", None)):
+        monkeypatch.setattr(appmod.QMessageBox, name, staticmethod(lambda *a, **k: ret))
+    monkeypatch.setattr(appmod.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: appmod.QMessageBox.StandardButton.No))
+
+
+def test_recovery_ignores_journal_created_by_current_session(win, qapp, tmp_path):
+    """回归：本场刚开始录制时，不能把自己刚建的日志误判成「上次未完成会议」弹窗。"""
+    import json
+    w = win
+    # 模拟启动快照为空 → 之后本场录制创建了日志
+    w._pending_journals = []
+    w._check_recovery()          # 不应弹窗、不应恢复
+    assert w._pending_journals == []
