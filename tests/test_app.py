@@ -65,6 +65,13 @@ def qapp():
     yield app
 
 
+@pytest.fixture(autouse=True)
+def _no_preload(monkeypatch):
+    """整个模块禁用后台预热：它在后台 import torch（持 GIL 数秒），会让依赖时序的
+    用例（后台初始化线程）随机变慢/超时。真实启动行为由 test_preload_runs 覆盖。"""
+    monkeypatch.setattr(appmod.MainWindow, "_preload_engine", lambda self: None)
+
+
 @pytest.fixture
 def win(qapp, tmp_path):
     w = MainWindow(_settings(tmp_path))
@@ -443,8 +450,6 @@ def _install_fake_stack(monkeypatch):
     monkeypatch.setattr(appmod, "Recorder", _recorder_factory)
     monkeypatch.setattr(appmod, "Translator", lambda settings: object())
     monkeypatch.setattr(appmod, "Diarizer", lambda settings: None)   # 无说话人，不影响录制
-    # 关掉后台预热：它会 import torch（持 GIL 数秒），把被测的后台初始化线程饿死
-    monkeypatch.setattr(appmod.MainWindow, "_preload_engine", lambda self: None)
     return made
 
 
