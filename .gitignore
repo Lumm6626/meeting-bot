@@ -17,3 +17,5 @@ cache/
 
 # 录制工作区（边录边落盘的 JSONL，异常退出后可恢复）
 .recording/
+.env.*
+!.env.example
