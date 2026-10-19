@@ -4,6 +4,8 @@ torch==2.5.1
 torchaudio==2.5.1
 # 说话人聚类
 pyannote.audio==3.3.2
+# pyannote 3.x 内部仍用 use_auth_token，huggingface_hub>=1.0 已移除该参数
+huggingface_hub==0.26.5
 # 音频捕获（WASAPI loopback）
 soundcard==0.4.3
 # 语音活动检测
