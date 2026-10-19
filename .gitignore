@@ -11,3 +11,6 @@ models/
 _*.log
 _*.txt
 .pw_probe*
+
+# 本地缓存目录（模型/pip 缓存，不提交）
+cache/
