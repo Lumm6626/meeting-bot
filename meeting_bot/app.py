@@ -2,6 +2,8 @@
 """主窗口：开始/结束录制、说话人改名、状态显示。"""
 from __future__ import annotations
 
+import dataclasses
+import re
 import sys
 import threading
 from datetime import datetime
@@ -234,6 +236,32 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 DISABLED=DISABLED, PILL_BG=PILL_BG, PILL_FG=PILL_FG, FONT=FONT_FAMILY)
 
 
+# 术语分隔符：中英文逗号、顿号、分号都认（用户随手敲的，别要求记格式）
+TERM_SEPARATORS = re.compile(r"[,，、;；]+")
+
+
+def merge_asr_prompt(base: str, terms: str) -> str:
+    """本场术语 + .env 的 ASR_PROMPT → 识别提示词（术语在前，逗号连接）。
+
+    - 按中英文逗号/顿号/分号切分、去首尾空白、丢空项；
+    - 大小写不敏感去重（用户重复写、或写了 .env 里已有的词时只留一次，术语在前优先）；
+    - **术语为空时原样返回 base**（行为与线上完全一致，不多加一个空格）；
+    - base 用逗号重新拼接只在有术语时才发生：既保证顺序稳定，也不会让空术语改变提示词。
+    """
+    user_terms = [t.strip() for t in TERM_SEPARATORS.split(terms or "") if t.strip()]
+    if not user_terms:
+        return base or ""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for term in user_terms + [t.strip() for t in (base or "").split(",") if t.strip()]:
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(term)
+    return ", ".join(merged)
+
+
 def asr_pill_text(settings: Settings) -> str:
     """识别徽章：groq → 云端；其余（local）→ 本地 + whisper 模型名。"""
     provider = (getattr(settings, "asr_provider", "local") or "local").strip().lower()
@@ -351,6 +379,12 @@ class MainWindow(QMainWindow):
         self.title_input.textEdited.connect(self._mark_title_edited)
         self.title_input.setText(datetime.now().strftime("%Y-%m-%d %H:%M"))
         lay.addWidget(self.title_input)
+
+        # 本场术语/热词：只影响本次录制的识别提示词（不写回 .env，下次启动为空）
+        self.terms_input = QLineEdit()
+        self.terms_input.setPlaceholderText(
+            "术语/热词（可选，逗号分隔，例：过敏门诊, 复合药房, Jebel Ali）")
+        lay.addWidget(self.terms_input)
 
         # ---- 按钮行：主（渐变）/ 次（描边），等高 44px ----
         row = QHBoxLayout()
@@ -585,18 +619,26 @@ class MainWindow(QMainWindow):
         if not self._title_edited:
             self.title_input.setText(datetime.now().strftime("%Y-%m-%d %H:%M"))
         title = self.title_input.text().strip()
+        # 术语在 GUI 线程读完（控件只能在主线程碰），再换成「本场配置」：其余字段原样，
+        # 只把 asr_prompt 换成合并结果。术语为空 → 直接沿用 self.settings（零行为变化）。
+        terms = self.terms_input.text()
+        base_prompt = getattr(self.settings, "asr_prompt", "") or ""
+        merged_prompt = merge_asr_prompt(base_prompt, terms)
+        run_settings = self.settings
+        if merged_prompt != base_prompt:
+            run_settings = dataclasses.replace(self.settings, asr_prompt=merged_prompt)
 
         def _boot():
             try:
-                _ensure_heavy(self.settings.diarize_enabled)
-                translator = Translator(self.settings)
+                _ensure_heavy(run_settings.diarize_enabled)
+                translator = Translator(run_settings)
             except Exception as e:
                 self.bridge.finished.emit(False, f"启动失败：{e}")
                 return
             diarizer = None
-            if self.settings.diarize_enabled:
+            if run_settings.diarize_enabled:
                 try:
-                    diarizer = Diarizer(self.settings)
+                    diarizer = Diarizer(run_settings)
                 except Exception as e:
                     # 预期内（未配 HF_TOKEN）与非预期（模型下载/网络异常）一律降级继续：
                     # Qt 槽内异常外冒会直接终止进程（qFatal），不能让它冒出去。
@@ -604,9 +646,9 @@ class MainWindow(QMainWindow):
             try:
                 store = self._new_journal_store(title)
                 self.recorder = Recorder(
-                    self.settings, capture=capture, translator=translator,
+                    run_settings, capture=capture, translator=translator,
                     diarizer=diarizer,
-                    audio_source=getattr(self.settings, "audio_source", "both"),
+                    audio_source=getattr(run_settings, "audio_source", "both"),
                     store=store)
                 self.recorder.on_segment(self.bridge.segment.emit)
                 self.recorder.on_update(self.bridge.update.emit)

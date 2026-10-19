@@ -30,7 +30,7 @@ from meeting_bot.app import MainWindow
 from meeting_bot.config import Settings
 from meeting_bot.transcript import Segment, TranscriptStore
 
-WIDGETS = ("title_input", "status", "start_btn", "stop_btn", "speaker_table")
+WIDGETS = ("title_input", "terms_input", "status", "start_btn", "stop_btn", "speaker_table")
 
 
 
@@ -432,8 +432,8 @@ class _FakeStartedRecorder:
 
 
 def _install_fake_stack(monkeypatch):
-    """把 _start 的重型依赖全部换成离屏替身，返回记录容器。"""
-    made = {"capture": [], "recorder": []}
+    """把 _start 的重型依赖全部换成离屏替身，返回记录容器（translator 也记 settings）。"""
+    made = {"capture": [], "recorder": [], "translator": []}
 
     def _capture_factory(source="both", sample_rate=16000):
         cap = _FakeProbeCapture(source=source, sample_rate=sample_rate)
@@ -446,9 +446,13 @@ def _install_fake_stack(monkeypatch):
         made["recorder"].append(rec)
         return rec
 
+    def _translator_factory(settings):
+        made["translator"].append(settings)
+        return object()
+
     monkeypatch.setattr(appmod, "AudioCapture", _capture_factory)
     monkeypatch.setattr(appmod, "Recorder", _recorder_factory)
-    monkeypatch.setattr(appmod, "Translator", lambda settings: object())
+    monkeypatch.setattr(appmod, "Translator", _translator_factory)
     monkeypatch.setattr(appmod, "Diarizer", lambda settings: None)   # 无说话人，不影响录制
     return made
 
@@ -742,3 +746,104 @@ def test_recovery_ignores_journal_created_by_current_session(win, qapp, tmp_path
     w._pending_journals = []
     w._check_recovery()          # 不应弹窗、不应恢复
     assert w._pending_journals == []
+
+
+# ---------------------------------------------------------------------------
+# e. 本场术语/热词：合并进 asr_prompt，只对本次录制生效
+# ---------------------------------------------------------------------------
+
+def _make_terms_win(qapp, tmp_path, **overrides):
+    """带 asr_prompt 的窗口（不经 load_settings，直接 dataclasses.replace）。"""
+    from dataclasses import replace
+
+    w = MainWindow(replace(_settings(tmp_path), **overrides))
+    for timer_name in ("_timer", "_elapsed_timer"):
+        timer = getattr(w, timer_name, None)
+        if timer is not None:
+            timer.stop()
+    return w
+
+
+def test_merge_asr_prompt_unit():
+    """纯函数：分隔符/去空白/去重（大小写不敏感、术语在前）、空术语原样返回。"""
+    assert appmod.merge_asr_prompt("", "过敏门诊，复合药房、Jebel Ali, a;b；c") ==         "过敏门诊, 复合药房, Jebel Ali, a, b, c"
+    # 术语为空：连空格都不动（零行为变化的硬要求）
+    assert appmod.merge_asr_prompt("allergy,pricing", "") == "allergy,pricing"
+    assert appmod.merge_asr_prompt("allergy, pricing", "  、 ，;") == "allergy, pricing"
+    # 用户术语优先保留，.env 里重复的词只留一次
+    assert appmod.merge_asr_prompt("allergy, pricing", "Allergy、过敏门诊") ==         "Allergy, 过敏门诊, pricing"
+
+
+def test_terms_input_widget_present(win):
+    """会议名下方有「术语/热词」输入框，placeholder 说明格式，样式沿用 QLineEdit。"""
+    assert win.terms_input.placeholderText().startswith("术语/热词")
+    assert "逗号分隔" in win.terms_input.placeholderText()
+    assert win.terms_input.text() == ""
+    # 布局顺序：会议名在上、术语在其下方（同一列）
+    layout = win.centralWidget().layout()
+    items = [layout.itemAt(i).widget() for i in range(layout.count())]
+    assert items.index(win.terms_input) == items.index(win.title_input) + 1
+
+
+def test_start_merges_terms_into_asr_prompt(qapp, tmp_path, monkeypatch):
+    """填了术语：Recorder 与 Translator 收到合并后的 asr_prompt（术语在前）。"""
+    made = _install_fake_stack(monkeypatch)
+    monkeypatch.setattr(appmod.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(appmod.QMessageBox, "critical", lambda *a, **k: None)
+    base = "allergy clinic, immunotherapy"
+    w = _make_terms_win(qapp, tmp_path, asr_prompt=base)
+    try:
+        w.terms_input.setText("过敏门诊，复合药房、Jebel Ali")
+        w._start()
+        assert _pump_until(qapp, lambda: bool(made["recorder"]) and w.recorder is not None,
+                           timeout=5.0), "后台初始化未完成"
+
+        expected = "过敏门诊, 复合药房, Jebel Ali, allergy clinic, immunotherapy"
+        rec_settings = made["recorder"][0].settings
+        assert rec_settings.asr_prompt == expected, rec_settings.asr_prompt
+        assert made["translator"][0].asr_prompt == expected, "Translator 没用合并后的配置"
+        assert made["translator"][0] is rec_settings, "Recorder/Translator 必须共用同一个 run_settings"
+        # 其余配置原样（只换 asr_prompt）
+        assert rec_settings.output_dir == w.settings.output_dir
+        assert rec_settings.asr_provider == w.settings.asr_provider
+        # 本场术语不写回全局配置（下一场输入框为空 → 回到 .env 原值）
+        assert w.settings.asr_prompt == base
+    finally:
+        w.recorder = None
+        w.start_btn.setEnabled(True)
+        w.hide()
+
+
+def test_start_without_terms_keeps_settings_object(qapp, tmp_path, monkeypatch):
+    """术语为空：直接沿用 self.settings（不 replace），行为与加功能前完全一致。"""
+    made = _install_fake_stack(monkeypatch)
+    monkeypatch.setattr(appmod.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(appmod.QMessageBox, "critical", lambda *a, **k: None)
+    w = _make_terms_win(qapp, tmp_path, asr_prompt="allergy clinic")
+    try:
+        w._start()
+        assert _pump_until(qapp, lambda: bool(made["recorder"]), timeout=5.0)
+        assert made["recorder"][0].settings is w.settings
+        assert made["translator"][0] is w.settings
+        assert w.settings.asr_prompt == "allergy clinic"
+    finally:
+        w.recorder = None
+        w.start_btn.setEnabled(True)
+        w.hide()
+
+
+def test_start_terms_without_env_prompt(qapp, tmp_path, monkeypatch):
+    """.env 没配 ASR_PROMPT 时，术语本身就该成为识别提示词（不是空串）。"""
+    made = _install_fake_stack(monkeypatch)
+    monkeypatch.setattr(appmod.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(appmod.QMessageBox, "critical", lambda *a, **k: None)
+    w = _make_terms_win(qapp, tmp_path)
+    try:
+        w.terms_input.setText("复合药房, Jebel Ali")
+        w._start()
+        assert _pump_until(qapp, lambda: bool(made["recorder"]), timeout=5.0)
+        assert made["recorder"][0].settings.asr_prompt == "复合药房, Jebel Ali"
+    finally:
+        w.recorder = None
+        w.start_btn.setEnabled(True)
+        w.hide()

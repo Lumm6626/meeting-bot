@@ -9,7 +9,7 @@ def _clean_env(monkeypatch):
     for var in ("OPENCODE_API_KEY", "OPENCODE_BASE_URL", "TRANSLATE_MODEL",
                 "MINUTES_MODEL", "WHISPER_MODEL", "HF_TOKEN", "OUTPUT_DIR",
                 "GROQ_API_KEY", "ASR_PROVIDER",
-                "ASR_BATCH_SECONDS", "ASR_BATCH_MAX_WAIT"):
+                "ASR_BATCH_SECONDS", "ASR_BATCH_MAX_WAIT", "MINUTES_TEMPLATE"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -153,3 +153,45 @@ def test_diarize_enabled_flag(tmp_path, monkeypatch):
     monkeypatch.delenv("DIARIZE_ENABLED", raising=False)  # load_dotenv 不覆盖已存在变量
     env.write_text("OPENCODE_API_KEY=sk-test123\n", encoding="utf-8")
     assert load_settings(env).diarize_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# MINUTES_TEMPLATE（纪要模板：standard / action_first / bilingual）
+# ---------------------------------------------------------------------------
+
+def test_minutes_template_defaults_to_standard(tmp_path, monkeypatch):
+    """不写 MINUTES_TEMPLATE 时默认标准纪要（老 .env 无需改动）。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123\n", encoding="utf-8")
+    assert load_settings(env).minutes_template == "standard"
+
+
+@pytest.mark.parametrize("value", ["standard", "action_first", "bilingual"])
+def test_minutes_template_accepts_legal_values(tmp_path, monkeypatch, value):
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(f"OPENCODE_API_KEY=sk-test123\nMINUTES_TEMPLATE={value}\n",
+                   encoding="utf-8")
+    assert load_settings(env).minutes_template == value
+
+
+def test_minutes_template_case_insensitive(tmp_path, monkeypatch):
+    """大小写不敏感：Action_First 这种手写值不该被判成配置错误。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123\nMINUTES_TEMPLATE=Action_First\n",
+                   encoding="utf-8")
+    assert load_settings(env).minutes_template == "action_first"
+
+
+def test_invalid_minutes_template_raises(tmp_path, monkeypatch):
+    """拼错的模板名必须报错：静默回落标准会让用户以为模板没生效。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123\nMINUTES_TEMPLATE=actionfirst\n",
+                   encoding="utf-8")
+    with pytest.raises(ConfigError) as ei:
+        load_settings(env)
+    assert "MINUTES_TEMPLATE" in str(ei.value)
+    assert "action_first" in str(ei.value)      # 错误信息要带上合法取值

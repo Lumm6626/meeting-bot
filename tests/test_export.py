@@ -21,12 +21,15 @@ def _docx_text(path):
 
 
 class _FakeTranslator:
-    def minutes(self, md):
+    called: list = []          # 记录 export_all 传下来的 template（透传断言用）
+
+    def minutes(self, md, template="standard"):
+        type(self).called.append(template)
         return MinutesResult(title="周会纪要", summary="概要")
 
 
 class _FailTranslator:
-    def minutes(self, md):
+    def minutes(self, md, template="standard"):
         raise TranslationError("接口不可用")
 
 
@@ -246,3 +249,33 @@ def test_meeting_dir_no_duplicated_date_when_title_has_one(tmp_path):
     d = meeting_dir(s, "2026-10-18 18:45", datetime(2026, 10, 18, 18, 45))
     assert d.name == "2026-10-18 18_45"      # ':' 被净化成 '_'
     assert not d.name.startswith("2026-10-18_1845_")
+
+
+# ---------------------------------------------------------------------------
+# 纪要模板：MINUTES_TEMPLATE → translator.minutes(template=…) 必须透传
+# ---------------------------------------------------------------------------
+
+def test_export_all_passes_minutes_template(tmp_path):
+    """settings.minutes_template 原样传给 minutes()（模板选择在 config 层校验过）。"""
+    from dataclasses import replace
+
+    for template in ("standard", "action_first", "bilingual"):
+        s = replace(_settings(tmp_path), minutes_template=template)
+        store = TranscriptStore()
+        store.add(0.0, 2.0, "hello", lang="en")
+        _FakeTranslator.called.clear()
+        export_all(store, s, f"周会-{template}", datetime(2026, 10, 16, 9, 30),
+                   translator=_FakeTranslator())
+        assert _FakeTranslator.called == [template], f"{template} 未透传到 minutes()"
+
+
+def test_export_all_template_defaults_to_standard(tmp_path):
+    """老 Settings（字段被删/替身没写）也必须回落到 standard，不能把 None 传下去。"""
+    from dataclasses import replace
+
+    s = replace(_settings(tmp_path), minutes_template=None)
+    store = TranscriptStore()
+    store.add(0.0, 2.0, "hello", lang="en")
+    _FakeTranslator.called.clear()
+    export_all(store, s, "周会", datetime(2026, 10, 16, 9, 30), translator=_FakeTranslator())
+    assert _FakeTranslator.called == ["standard"]

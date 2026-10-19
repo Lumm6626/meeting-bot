@@ -94,9 +94,12 @@ def export_all(store: TranscriptStore, settings: Settings, title: str,
     directory = meeting_dir(settings, title, started_at)
     md = store.to_markdown(title, started_at)
     transcript_path = write_transcript(store, directory, title, started_at, md_text=md)
+    # 纪要模板（standard / action_first / bilingual）：由 .env 的 MINUTES_TEMPLATE 决定，
+    # 老 Settings（无该字段的测试替身）回落 standard。
+    template = (getattr(settings, "minutes_template", "standard") or "standard").strip().lower()
     if translator is not None:
         try:
-            minutes = translator.minutes(md)
+            minutes = translator.minutes(md, template=template)
         except TranslationError:
             # 纪要失败不阻断导出：逐字稿已落盘，纪要降级为占位内容
             minutes = MinutesResult(title=_safe_title(title), summary=MINUTES_FAILED_SUMMARY)

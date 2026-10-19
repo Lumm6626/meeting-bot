@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 ASR_PROVIDERS = ("local", "groq")
+# 纪要模板：standard 标准（现有顺序）| action_first 行动项优先 | bilingual 中英双语
+MINUTES_TEMPLATES = ("standard", "action_first", "bilingual")
 
 
 class ConfigError(Exception):
@@ -42,6 +44,8 @@ class Settings:
     groq_asr_model: str = "whisper-large-v3"
     asr_language: str = ""
     asr_prompt: str = ""
+    # 纪要模板（见 MINUTES_TEMPLATES）：决定 minutes() 用哪套 prompt
+    minutes_template: str = "standard"
 
 
 def _clean_hf_token(raw: str) -> str:
@@ -90,6 +94,11 @@ def load_settings(env_path: Path | None = None) -> Settings:
     if provider not in ASR_PROVIDERS:
         raise ConfigError(f"ASR_PROVIDER={provider} 不合法：可选值 {'|'.join(ASR_PROVIDERS)}")
 
+    template = (os.getenv("MINUTES_TEMPLATE") or "standard").strip().lower()
+    if template not in MINUTES_TEMPLATES:
+        raise ConfigError(f"MINUTES_TEMPLATE={template} 不合法："
+                          f"可选值 {'|'.join(MINUTES_TEMPLATES)}")
+
     output_dir = os.getenv("OUTPUT_DIR") or "会议记录"
     if not Path(output_dir).is_absolute():
         output_dir = PROJECT_ROOT / output_dir
@@ -112,4 +121,5 @@ def load_settings(env_path: Path | None = None) -> Settings:
         groq_asr_model=(os.getenv("GROQ_ASR_MODEL") or "whisper-large-v3").strip(),
         asr_language=(os.getenv("ASR_LANGUAGE") or "").strip(),
         asr_prompt=(os.getenv("ASR_PROMPT") or "").strip(),
+        minutes_template=template,
     )

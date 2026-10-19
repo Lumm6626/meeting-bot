@@ -370,3 +370,60 @@ def test_minutes_truncates_long_transcript(monkeypatch):
     prompt = calls[0]["messages"][1]["content"]
     assert len(prompt) < 200000
     assert prompt.endswith("TAIL")
+
+
+# ---------------------------------------------------------------------------
+# 纪要模板：standard / action_first / bilingual 三套 prompt
+# ---------------------------------------------------------------------------
+
+def _minutes_prompt(monkeypatch, template: str) -> str:
+    """跑一次 minutes(template=…)，返回发给模型的 user prompt。"""
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse('{"title": "t", "summary": "s"}')
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    Translator(_settings()).minutes("# 会议逐字稿：周会\n原文：hello", template=template)
+    return calls[0]["messages"][1]["content"]
+
+
+def test_minutes_default_template_is_standard(monkeypatch):
+    """不传 template → 与旧 prompt 逐字节一致（零行为变化）。"""
+    from meeting_bot.translator import MINUTES_PROMPT
+    prompt = _minutes_prompt(monkeypatch, "standard")
+    assert prompt == MINUTES_PROMPT.replace("{transcript}", "# 会议逐字稿：周会\n原文：hello")
+
+
+def test_minutes_action_first_prompt_puts_actions_first(monkeypatch):
+    """action_first：明确要求先输出行动项，且字段顺序把 action_items 提前。"""
+    prompt = _minutes_prompt(monkeypatch, "action_first")
+    assert "先输出行动项" in prompt
+    assert prompt.index('"action_items"') < prompt.index('"summary"'), "字段顺序没提前"
+    assert '"open_questions"' in prompt            # JSON 结构不变，parse_minutes 照样能解析
+    assert "双语" not in prompt
+
+
+def test_minutes_bilingual_prompt_asks_for_two_languages(monkeypatch):
+    """bilingual：要求每个字段「中文 / English」并列。"""
+    prompt = _minutes_prompt(monkeypatch, "bilingual")
+    assert "双语" in prompt and "English" in prompt
+    assert " / " in prompt                          # 双语分隔符示例
+    assert "先输出行动项" not in prompt
+
+
+def test_minutes_standard_prompt_has_no_other_template_keywords(monkeypatch):
+    """standard 不得混入另两套模板的指令（模板之间必须互相排斥）。"""
+    prompt = _minutes_prompt(monkeypatch, "standard")
+    assert "先输出行动项" not in prompt
+    assert "双语" not in prompt
+    assert "English" not in prompt
+
+
+def test_minutes_unknown_template_falls_back_to_standard(monkeypatch):
+    """未知模板名（配置被绕过/替身传 None）回落标准，不炸、不静默变成双语。"""
+    from meeting_bot.translator import MINUTES_PROMPT
+    for bad in ("", None, "Action-Items", "english"):
+        prompt = _minutes_prompt(monkeypatch, bad)
+        assert prompt == MINUTES_PROMPT.replace("{transcript}", "# 会议逐字稿：周会\n原文：hello")

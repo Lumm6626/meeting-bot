@@ -95,6 +95,59 @@ MINUTES_PROMPT = """你是资深会议记录助理。根据下面的会议逐字
 {transcript}"""
 
 
+# action_first：JSON 字段与 standard 完全相同，只调「顺序 + 侧重」——先输出行动项，
+# 且行动项必须写成可执行动作（谁 + 做什么 + 何时），避免被讨论要点吞掉。
+MINUTES_ACTION_FIRST_PROMPT = """你是资深会议记录助理。根据下面的会议逐字稿，生成会议纪要。
+严格输出 JSON，不要输出其他内容，格式（注意字段顺序：先输出行动项）：
+{"title": "会议主题",
+ "action_items": [{"task": "任务", "owner": "责任人", "due": "截止时间（无则留空）"}],
+ "summary": "3-5句概要",
+ "key_points": ["讨论要点1"],
+ "decisions": ["结论1"],
+ "open_questions": ["待跟进问题1"]}
+
+要求：
+1) 先输出行动项（action_items），逐条写清做什么、谁负责（owner，逐字稿没提到的留空）、
+   截止时间（due，没提到的留空）；
+2) 行动项只写具体的可执行动作（谁做什么、何时要），不要把讨论要点或结论写进行动项；
+3) summary 只概括结论与影响，不重复行动项；
+4) 逐字稿没有行动项时输出空数组 []，不要编造。
+
+逐字稿：
+{transcript}"""
+
+
+# bilingual：JSON 结构与 standard 相同（parse_minutes 不感知模板），但每个字段的
+# 文本本身是「中文 / English」双语，方便外方参会人直接读纪要。
+MINUTES_BILINGUAL_PROMPT = """你是资深会议记录助理。根据下面的会议逐字稿，生成中英双语（中文 / English）的会议纪要。
+严格输出 JSON，不要输出其他内容，格式：
+{"title": "会议主题 / Meeting topic",
+ "summary": "3-5句概要 / 3-5 sentence summary",
+ "key_points": ["讨论要点1 / Key point 1"],
+ "decisions": ["结论1 / Decision 1"],
+ "action_items": [{"task": "任务 / Task", "owner": "责任人", "due": "截止时间（无则留空）"}],
+ "open_questions": ["待跟进问题1 / Open question 1"]}
+
+要求：
+1) 每个字段的内容都输出双语文本：先中文，再英文（English），用 " / " 分隔（例：
+   "已确认下周发货 / Shipment confirmed for next week"）；
+2) title 同样双语，标题里的分隔符也用 " / "；
+3) action_items 的 task 用双语，owner 与 due 保持原语言（人名、日期不翻译）；
+4) 中英文必须一一对应：英文是逐条对应的英文表达，不增删信息、不改写原意；
+5) 英文用简洁自然的商务英语，专有名词保留原文写法。
+
+逐字稿：
+{transcript}"""
+
+
+# 模板名 → prompt。未知模板回落 standard（配置层已校验，这里只做防御）。
+MINUTES_PROMPTS = {
+    "standard": MINUTES_PROMPT,
+    "action_first": MINUTES_ACTION_FIRST_PROMPT,
+    "bilingual": MINUTES_BILINGUAL_PROMPT,
+}
+
+
 class Translator:
     def __init__(self, settings: Settings):
         self._settings = settings
@@ -236,13 +289,19 @@ class Translator:
         if not "".join(parts).strip():
             raise TranslationError("接口返回空内容")
 
-    def minutes(self, transcript_md: str) -> MinutesResult:
+    def minutes(self, transcript_md: str, template: str = "standard") -> MinutesResult:
+        """生成纪要。``template`` 取 standard / action_first / bilingual（见 .env 的
+        MINUTES_TEMPLATE）；未知值回落 standard。三种模板共用同一套 JSON 结构，
+        parse_minutes 无需区分。
+        """
         # 不能用 str.format：模板内的 JSON 字面量（{"title": …}）会被当成占位符，
         # 直接抛 KeyError: '"title"'，纪要功能全线不可用。用 replace 注入逐字稿。
+        prompt = MINUTES_PROMPTS.get((template or "standard").strip().lower(),
+                                     MINUTES_PROMPT)
         messages = [
             {"role": "system", "content": "你是资深会议记录助理，输出严格 JSON。"},
-            {"role": "user", "content": MINUTES_PROMPT.replace("{transcript}",
-                                                               transcript_md[-180000:])},
+            {"role": "user", "content": prompt.replace("{transcript}",
+                                                       transcript_md[-180000:])},
         ]
         raw = self._chat(messages, max_tokens=8000, model=self._settings.minutes_model)
         return parse_minutes(raw)
