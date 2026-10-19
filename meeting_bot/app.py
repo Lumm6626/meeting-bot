@@ -90,6 +90,43 @@ def _read_audio(path: Path):
 
 
 
+def probe_groq(api_key: str, timeout: float = 5.0) -> tuple[str, str, bool]:
+    """探测 Groq 是否可用：返回 (state, 文案, 是否可重试)。
+
+    - 200  → 云端识别可用
+    - 401  → key 无效（确定性错误，重试无意义）
+    - 403  → 地区封禁（国内直连常见）→ 提示开代理
+    - 超时/连不上 → 网络问题 → 提示检查网络或代理
+    """
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if int(getattr(resp, "status", 200)) == 200:
+                return "ok", "云端识别（Groq）可用，字幕延迟约 3~5 秒。", False
+            return "warn", f"云端识别返回 HTTP {resp.status}，当前将使用本地识别。", True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return ("error",
+                    "GROQ_API_KEY 无效或已过期：当前使用本地识别。"
+                    "到 console.groq.com 重新生成 key 并更新配置。", False)
+        if e.code == 403:
+            return ("warn",
+                    "云端识别不可用：Groq 对当前地区限制访问（HTTP 403）。"
+                    "请打开代理后重启程序；不打开代理也能用，"
+                    "但会回退本地识别（延迟 30~55 秒）。", True)
+        return ("warn",
+                f"云端识别不可用（HTTP {e.code}）：当前回退本地识别（较慢）。", True)
+    except Exception as e:
+        return ("warn",
+                f"无法连接云端识别服务（{type(e).__name__}）："
+                "请检查网络或打开代理；当前回退本地识别（延迟 30~55 秒）。", True)
+
+
 def app_icon() -> QIcon:
     """应用图标：窗口 / 托盘 / 桌面快捷方式共用 assets/app.ico。"""
     return QIcon(str(PROJECT_ROOT / "assets" / "app.ico"))
@@ -169,6 +206,26 @@ QLabel#status {
 QLabel#elapsed {
     font-size: 9pt;
     color: $MUTED;
+}
+QLabel#cloud_banner {
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 9.5pt;
+}
+QLabel#cloud_banner[state="warn"] {
+    background-color: #3A2F1E;
+    color: #FFCF7A;
+    border: 1px solid #6B5628;
+}
+QLabel#cloud_banner[state="error"] {
+    background-color: #3A2024;
+    color: #FF9AA2;
+    border: 1px solid #6B2F36;
+}
+QLabel#cloud_banner[state="ok"] {
+    background-color: #1E3A2E;
+    color: #8FE3B0;
+    border: 1px solid #2C5A45;
 }
 QLabel#footer_hint {
     font-size: 8.5pt;
@@ -380,6 +437,8 @@ class RecorderBridge(QObject):
     # 声纹库认出的「熟人」建议（后台线程 → GUI 线程）：{label: (姓名, 分数)}
     # 单独一个信号而不是塞进 diarized：认人要弹模态框问用户，必须由主线程做
     speaker_suggestions = pyqtSignal(object)
+    # 云端识别自检结果（state, 提示文案, 是否可重试）
+    cloud_status = pyqtSignal(str, str, bool)
 
 
 class MainWindow(QMainWindow):
@@ -400,6 +459,7 @@ class MainWindow(QMainWindow):
         self.bridge.recovered.connect(self._on_recovered)
         self.bridge.diarized.connect(self._on_diarized)
         self.bridge.speaker_suggestions.connect(self._on_speaker_suggestions)
+        self.bridge.cloud_status.connect(self._on_cloud_status)
         # 声纹库（本地 声纹库.json）：会后认「熟人」，改名即学习。IO 异常由库自己吞掉。
         self._voiceprints = VoiceprintLibrary()
         self._reset_voiceprints()
@@ -497,6 +557,23 @@ class MainWindow(QMainWindow):
         card_lay.addWidget(self.elapsed_label)
         lay.addWidget(card)
 
+        # ---- 云端识别自检提示条：启动时后台探测 Groq 可用性，结果在这里常驻提示 ----
+        self.cloud_banner = QLabel("")
+        self.cloud_banner.setObjectName("cloud_banner")
+        self.cloud_banner.setWordWrap(True)
+        self.cloud_banner.setVisible(False)
+        self.cloud_banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cloud_row = QHBoxLayout()
+        cloud_row.setSpacing(8)
+        cloud_row.addWidget(self.cloud_banner, 1)
+        self.recheck_btn = QPushButton("重新检测")
+        self.recheck_btn.setProperty("role", "secondary")
+        self.recheck_btn.setFixedHeight(30)
+        self.recheck_btn.setVisible(False)
+        self.recheck_btn.clicked.connect(self._recheck_cloud)
+        cloud_row.addWidget(self.recheck_btn, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addLayout(cloud_row)
+
         self.speaker_table = QTableWidget(0, 2)
         self.speaker_table.setHorizontalHeaderLabels(["声纹标签", "名字"])
         self.speaker_table.setAlternatingRowColors(True)
@@ -537,6 +614,8 @@ class MainWindow(QMainWindow):
         # 误判成「上次未完成会议」并弹模态框（实测会卡住自动化测试）。
         self._pending_journals = self._scan_pending_journals()
         QTimer.singleShot(0, self._check_recovery)
+        # 云端自检：Groq 在国内直连常被 403 地区封禁 → 界面常驻提醒开代理
+        QTimer.singleShot(300, self._start_cloud_check)
 
     def _is_recording(self) -> bool:
         """录制 / 收尾中：start 按钮禁用（_start 置位、_on_finished 复位）。"""
@@ -605,6 +684,55 @@ class MainWindow(QMainWindow):
             pass
         finally:
             journal.close()
+
+    # ------------------------------------------------------------------
+    # 云端识别自检（Groq）：启动时探测，结果常驻界面提示条
+    # ------------------------------------------------------------------
+
+    def _start_cloud_check(self) -> None:
+        """后台探测云端识别可用性（不阻塞界面，约 1~5 秒）。"""
+        threading.Thread(target=self._cloud_check_worker, daemon=True).start()
+
+    def _cloud_check_worker(self) -> None:
+        state, text, can_retry = self._probe_cloud()
+        self.bridge.cloud_status.emit(state, text, can_retry)
+
+    def _probe_cloud(self) -> tuple[str, str, bool]:
+        """探测 Groq 可达性：返回 (state, 提示文案, 是否允许重试)。
+
+        只在 groq 模式下探测；local 模式没有云端依赖，直接返回隐藏提示。
+        """
+        settings = self.settings
+        if (getattr(settings, "asr_provider", "local") or "local") != "groq":
+            return "hidden", "", False
+        key = (getattr(settings, "groq_api_key", "") or "").strip()
+        if not key:
+            return ("error",
+                    "未配置 GROQ_API_KEY：当前使用本地识别（较慢）。"
+                    "想用低延迟云端识别：到 console.groq.com 免费注册，"
+                    "把 key 填入配置后重启程序。", False)
+        return probe_groq(key)
+
+    def _on_cloud_status(self, state: str, text: str, can_retry: bool) -> None:
+        """自检结果回到 GUI 线程：更新提示条（可重试时补一句操作提示）。"""
+        if state == "hidden" or not text:
+            self.cloud_banner.setVisible(False)
+            self.recheck_btn.setVisible(False)
+            return
+        suffix = "（打开代理后点「重新检测」或重启程序即可生效）" if can_retry else ""
+        self.cloud_banner.setProperty("state", state)
+        self.cloud_banner.setText(text + suffix)
+        self.cloud_banner.setVisible(True)
+        self.recheck_btn.setVisible(bool(can_retry))
+        # 改了 state 属性必须重新 polish，QSS 才会套用新配色
+        self.cloud_banner.style().unpolish(self.cloud_banner)
+        self.cloud_banner.style().polish(self.cloud_banner)
+
+    def _recheck_cloud(self) -> None:
+        """「重新检测」入口：清掉旧提示后重新探测。"""
+        self.cloud_banner.setVisible(False)
+        self.recheck_btn.setVisible(False)
+        self._start_cloud_check()
 
     def _scan_pending_journals(self) -> list[Path]:
         """启动时扫描「未完成」的录制日志（无 footer）。

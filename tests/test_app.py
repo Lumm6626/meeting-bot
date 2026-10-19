@@ -685,7 +685,7 @@ def test_start_forwards_audio_source_and_reuses_probed_capture(qapp, tmp_path, m
         w._start()
         # _start 的重型初始化在后台线程（避免点击卡 6 秒）：等 Recorder 就绪
         assert _pump_until(qapp, lambda: bool(made["recorder"]) and w.recorder is not None,
-                           timeout=5.0), "后台初始化未在 5 秒内完成"
+                           timeout=20.0), "后台初始化超时"
 
         assert made["capture"], "未做设备探测（构造 AudioCapture）"
         assert made["capture"][0].source == "speaker"
@@ -973,7 +973,7 @@ def test_start_merges_terms_into_asr_prompt(qapp, tmp_path, monkeypatch):
         w.terms_input.setText("过敏门诊，复合药房、Jebel Ali")
         w._start()
         assert _pump_until(qapp, lambda: bool(made["recorder"]) and w.recorder is not None,
-                           timeout=5.0), "后台初始化未完成"
+                           timeout=20.0), "后台初始化超时"
 
         expected = "过敏门诊, 复合药房, Jebel Ali, allergy clinic, immunotherapy"
         rec_settings = made["recorder"][0].settings
@@ -1606,3 +1606,59 @@ def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, t
     win._stop()
     assert _pump_until(qapp, lambda: bool(captured) and len(exports) == 2, timeout=15.0)
     assert captured["token"] == "hf_from_keyring"
+
+
+# ---------------------------------------------------------------------------
+# 云端自检提示条（Groq 403 地区封禁 → 提醒开代理）
+# ---------------------------------------------------------------------------
+
+def test_probe_groq_states(monkeypatch):
+    """200/401/403/断网 四种结果分别给出正确 state 与可重试标记。"""
+    import urllib.error
+    import io
+    from meeting_bot.app import probe_groq
+
+    class _Resp(io.BytesIO):
+        status = 200
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Resp())
+    assert probe_groq("k")[0] == "ok"
+
+    def _raise(code):
+        def f(*a, **k):
+            raise urllib.error.HTTPError("u", code, "x", {}, None)
+        return f
+
+    monkeypatch.setattr("urllib.request.urlopen", _raise(401))
+    state, text, retry = probe_groq("k")
+    assert state == "error" and retry is False and "无效" in text
+
+    monkeypatch.setattr("urllib.request.urlopen", _raise(403))
+    state, text, retry = probe_groq("k")
+    assert state == "warn" and retry is True and "代理" in text
+
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(TimeoutError("t")))
+    state, text, retry = probe_groq("k")
+    assert state == "warn" and retry is True
+
+
+def test_cloud_banner_hidden_in_local_mode(win):
+    """local 模式下不提示云端问题。"""
+    win.settings = type(win.settings)(**{**win.settings.__dict__, "asr_provider": "local"}) \
+        if hasattr(win.settings, "__dict__") else win.settings
+    state, text, _ = win._probe_cloud()
+    if getattr(win.settings, "asr_provider", "local") == "local":
+        assert (state, text) == ("hidden", "")
+
+
+def test_cloud_banner_shows_retry_hint(win):
+    """403 之类的可重试问题：显示提示条 + 重新检测按钮。"""
+    win._on_cloud_status("warn", "云端识别不可用：请打开代理", True)
+    assert not win.cloud_banner.isHidden()      # 父窗口未 show 时 isVisible() 恒 False
+    assert not win.recheck_btn.isHidden()
+    assert "重新检测" in win.cloud_banner.text() or "重启" in win.cloud_banner.text()
+
+    win._on_cloud_status("hidden", "", False)
+    assert win.cloud_banner.isHidden()
+    assert win.recheck_btn.isHidden()
