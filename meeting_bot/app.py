@@ -90,41 +90,41 @@ def _read_audio(path: Path):
 
 
 
-def probe_groq(api_key: str, timeout: float = 5.0) -> tuple[str, str, bool]:
+def probe_groq(api_key: str, timeout: float = 6.0) -> tuple[str, str, bool]:
     """探测 Groq 是否可用：返回 (state, 文案, 是否可重试)。
 
-    - 200  → 云端识别可用
-    - 401  → key 无效（确定性错误，重试无意义）
-    - 403  → 地区封禁（国内直连常见）→ 提示开代理
-    - 超时/连不上 → 网络问题 → 提示检查网络或代理
-    """
-    import urllib.error
-    import urllib.request
+    必须走**和真实识别完全相同的 SDK 链路**（openai + httpx）：早期用 urllib 探测，
+    它发的 User-Agent 是 "Python-urllib/3.x"，会被 Groq 的 WAF 当成爬虫直接 403，
+    而真正识别（openai SDK）完全正常 —— 于是自检误报「地区限制，请开代理」。
 
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"})
+    - 成功 → ("ok", 可用)
+    - 401  → key 无效（确定性错误，重试无意义）
+    - 403  → 真的被拒绝（地区/权限）
+    - 其它 → 网络/服务问题（可重试）
+    """
+    import openai
+
+    client = openai.OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=api_key,
+        timeout=timeout,
+        max_retries=0,
+    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if int(getattr(resp, "status", 200)) == 200:
-                return "ok", "云端识别（Groq）可用，字幕延迟约 3~5 秒。", False
-            return "warn", f"云端识别返回 HTTP {resp.status}，当前将使用本地识别。", True
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            return ("error",
-                    "GROQ_API_KEY 无效或已过期：当前使用本地识别。"
-                    "到 console.groq.com 重新生成 key 并更新配置。", False)
-        if e.code == 403:
-            return ("warn",
-                    "云端识别不可用：Groq 对当前地区限制访问（HTTP 403）。"
-                    "请打开代理后重启程序；不打开代理也能用，"
-                    "但会回退本地识别（延迟 30~55 秒）。", True)
+        client.models.list()          # 最轻量的鉴权+连通性检查
+        return "ok", "云端识别（Groq）可用，字幕延迟约 3~5 秒。", False
+    except openai.AuthenticationError:
+        return ("error",
+                "GROQ_API_KEY 无效或已过期：当前使用本地识别。"
+                "到 console.groq.com 重新生成 key 并更新配置。", False)
+    except openai.PermissionDeniedError:
         return ("warn",
-                f"云端识别不可用（HTTP {e.code}）：当前回退本地识别（较慢）。", True)
-    except Exception as e:
+                "云端识别被拒绝（HTTP 403）：如果开了代理，请改用全局/TUN 模式；"
+                "否则当前回退本地识别（延迟 30~55 秒）。", True)
+    except Exception as e:            # 网络/超时/5xx
         return ("warn",
                 f"无法连接云端识别服务（{type(e).__name__}）："
-                "请检查网络或打开代理；当前回退本地识别（延迟 30~55 秒）。", True)
+                "请检查网络或代理；当前回退本地识别（延迟 30~55 秒）。", True)
 
 
 def app_icon() -> QIcon:

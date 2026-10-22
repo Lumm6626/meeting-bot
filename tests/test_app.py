@@ -1612,32 +1612,55 @@ def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, t
 # ---------------------------------------------------------------------------
 
 def test_probe_groq_states(monkeypatch):
-    """200/401/403/断网 四种结果分别给出正确 state 与可重试标记。"""
-    import urllib.error
-    import io
+    """成功/401/403/断网 四种结果分别给出正确 state 与可重试标记。
+
+    探测必须走 openai SDK（与真实识别同链路）；urllib 的默认 UA 会被 WAF 403。
+    """
+    import openai
     from meeting_bot.app import probe_groq
 
-    class _Resp(io.BytesIO):
-        status = 200
+    def _client_raising(exc):
+        class _Models:
+            @staticmethod
+            def list():
+                raise exc
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Resp())
+        class _Client:
+            def __init__(self, **kw):
+                self.models = _Models()
+
+        return _Client
+
+    def _resp(code):
+        return type("R", (), {"status_code": code, "request": None, "headers": {}})()
+
+    # 1) 成功
+    class _OkModels:
+        @staticmethod
+        def list():
+            return []
+
+    class _OkClient:
+        def __init__(self, **kw):
+            self.models = _OkModels()
+
+    monkeypatch.setattr("openai.OpenAI", _OkClient)
     assert probe_groq("k")[0] == "ok"
 
-    def _raise(code):
-        def f(*a, **k):
-            raise urllib.error.HTTPError("u", code, "x", {}, None)
-        return f
-
-    monkeypatch.setattr("urllib.request.urlopen", _raise(401))
+    # 2) key 无效 → 不可重试
+    monkeypatch.setattr("openai.OpenAI", _client_raising(
+        openai.AuthenticationError("bad", response=_resp(401), body=None)))
     state, text, retry = probe_groq("k")
     assert state == "error" and retry is False and "无效" in text
 
-    monkeypatch.setattr("urllib.request.urlopen", _raise(403))
+    # 3) 403 → 可重试
+    monkeypatch.setattr("openai.OpenAI", _client_raising(
+        openai.PermissionDeniedError("no", response=_resp(403), body=None)))
     state, text, retry = probe_groq("k")
-    assert state == "warn" and retry is True and "代理" in text
+    assert state == "warn" and retry is True and "403" in text
 
-    monkeypatch.setattr("urllib.request.urlopen",
-                        lambda *a, **k: (_ for _ in ()).throw(TimeoutError("t")))
+    # 4) 断网/超时 → 可重试
+    monkeypatch.setattr("openai.OpenAI", _client_raising(TimeoutError("t")))
     state, text, retry = probe_groq("k")
     assert state == "warn" and retry is True
 
