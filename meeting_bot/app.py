@@ -14,7 +14,8 @@ from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout,
                              QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-                             QPushButton, QSizePolicy, QTableWidget,
+                             QPushButton, QSizePolicy, QSystemTrayIcon,
+                             QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .capture import AudioCapture, CaptureError
@@ -164,6 +165,15 @@ WINDOW_TITLE_RECORDING = "会议翻译助手 · 录音中"
 # 密钥仍是 .env 明文时启动给一条轻提示（不弹窗、不打断）
 PLAINTEXT_SECRETS_HINT = ("提示：密钥存放在 .env 明文文件中，"
                           "可运行 setup_env.py 迁到 Windows 凭据管理器")
+
+# 托盘常驻（CLOSE_TO_TRAY=true，默认）：关闭窗口只是把界面收起来 —— 录音、会后
+# 整理、说话人标注继续在后台跑；真正的退出只在托盘菜单里（见 MainWindow._tray_quit）。
+TRAY_TOOLTIP = "会议翻译助手"
+TRAY_RECORDING_HINT = "录音继续中，点托盘图标可恢复窗口"
+TRAY_QUIT_CONFIRM = ("退出将中止正在进行的后台任务（录音/标注/纪要生成）。"
+                     "确定退出吗？")
+# 托盘退出时等 recorder.stop() 收尾的上限（秒）：等不到就放弃（收尾线程是 daemon）
+QUIT_STOP_TIMEOUT = 10.0
 
 _AUDIO_PILL = {
     "both": "音频 · 自动双路",
@@ -403,6 +413,19 @@ def translate_pill_text(settings: Settings) -> str:
     return f"翻译 · {model}"
 
 
+def _notice_line(msg: str) -> str:
+    """托盘气泡正文：取「第一行带路径的产物信息」，没有就取第一行。
+
+    气泡只有几十个字宽，多行提示会被截断；产物路径（逐字稿/纪要）是用户最需要
+    看到的（知道去哪儿找文件），所以优先挑带路径分隔符的那一行。
+    """
+    lines = [ln.strip() for ln in (msg or "").splitlines() if ln.strip()]
+    for line in lines:
+        if "/" in line or "\\" in line:
+            return line
+    return lines[0] if lines else ""
+
+
 def _pill(text: str) -> QLabel:
     """配置胶囊：只读小徽章（样式见 DARK_QSS 的 QLabel[role="pill"]）。"""
     lab = QLabel(text)
@@ -464,7 +487,12 @@ class MainWindow(QMainWindow):
         self._voiceprints = VoiceprintLibrary()
         self._reset_voiceprints()
         # 关窗触发收尾时置 True：导出完成后由 _on_finished 直接退出应用
+        # （只有 CLOSE_TO_TRAY=false 的旧语义会走到这里）
         self._quit_after_stop = False
+        # 托盘「退出」已确认：排队中的 finished/diarized 回槽不再弹窗、不再发气泡
+        self._quitting = False
+        # 「录制继续中」的托盘气泡只发一次（窗口恢复后重置，下次收起还能再提示）
+        self._tray_hint_shown = False
 
         central = QWidget()
         central.setObjectName("central")
@@ -585,7 +613,9 @@ class MainWindow(QMainWindow):
         self.speaker_table.setMinimumHeight(140)
         lay.addWidget(self.speaker_table, 1)
 
-        self.footer_hint = QLabel("录制中关闭窗口会先结束录制并保存产物，然后退出程序")
+        self.footer_hint = QLabel(
+            "关闭窗口会收进托盘，录音 / 会后整理继续在后台进行；"
+            "托盘图标可恢复窗口或退出")
         self.footer_hint.setObjectName("footer_hint")
         self.footer_hint.setWordWrap(True)
         lay.addWidget(self.footer_hint)
@@ -618,6 +648,72 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._check_recovery)
         # 云端自检：Groq 在国内直连常被 403 地区封禁 → 界面常驻提醒开代理
         QTimer.singleShot(300, self._start_cloud_check)
+        # 托盘放在最后：菜单槽会读写 start_btn / stop_btn / subtitle，必须等它们就绪
+        self._setup_tray()
+
+    # ------------------------------------------------------------------
+    # 系统托盘：关窗 ≠ 退出（后台继续录音 / 整理 / 标注）
+    # ------------------------------------------------------------------
+
+    def _setup_tray(self) -> None:
+        """系统托盘：把「关窗」与「退出」解耦（关窗只收起界面，后台任务照旧跑）。"""
+        self.tray_menu = QMenu(self)
+        self.tray_show_action = self.tray_menu.addAction("打开主窗口")
+        self.tray_show_action.triggered.connect(self._show_window)
+        self.tray_stop_action = self.tray_menu.addAction("结束并生成纪要")
+        self.tray_stop_action.triggered.connect(self._tray_stop)
+        # 「标注说话人」由后续任务实现：实现好 _label_speakers_last_session 即自动接线，
+        # 还没实现就置灰（点一个什么都不做的菜单项比置灰更糟）
+        self.tray_label_action = self.tray_menu.addAction("标注说话人")
+        label_handler = getattr(self, "_label_speakers_last_session", None)
+        if callable(label_handler):
+            self.tray_label_action.triggered.connect(label_handler)
+        else:
+            self.tray_label_action.setEnabled(False)
+        self.tray_quit_action = self.tray_menu.addAction("退出")
+        self.tray_quit_action.triggered.connect(self._tray_quit)
+
+        # 图标用同一份 ico：窗口 / 托盘 / 快捷方式视觉一致
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip(TRAY_TOOLTIP)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        """单击 / 双击托盘图标 → 还原主窗口（收进托盘后点得回来）。"""
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._show_window()
+
+    def _show_window(self) -> None:
+        """把窗口从托盘里放回来（置前并激活）。"""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def showEvent(self, e) -> None:
+        """窗口重新出现（点托盘 / 点任务栏）：重新武装「录制继续中」的托盘提示。"""
+        self._tray_hint_shown = False
+        super().showEvent(e)
+
+    def _tray_notify(self, title: str, msg: str) -> None:
+        """托盘气泡：窗口收起来之后唯一「看得见」的提示通道（不可用则静默跳过）。"""
+        tray = getattr(self, "tray", None)
+        if tray is None or not msg or self._quitting:
+            return
+        try:
+            if not tray.isVisible():      # 无系统托盘（远程会话 / 桌面 shell 重启）
+                return
+            tray.showMessage(title, msg)
+        except Exception:
+            pass          # 托盘异常也不能影响主流程：界面状态栏仍会更新
+
+    def _hide_tray(self) -> None:
+        """收掉托盘图标：避免进程退出后残留「幽灵图标」。"""
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.hide()
 
     def _is_recording(self) -> bool:
         """录制 / 收尾中：start 按钮禁用（_start 置位、_on_finished 复位）。"""
@@ -644,8 +740,54 @@ class MainWindow(QMainWindow):
             label.setText(text)
         return text
 
+    def _tray_stop(self) -> None:
+        """托盘「结束并生成纪要」：复用 _stop() 的后台收尾；空闲时无事可做。
+
+        收尾中 stop_btn 已禁用 —— 再点一次不能再起一个 stop()（会重复补译 + 重复导出）。
+        """
+        if self._is_recording() and self.stop_btn.isEnabled():
+            self._stop()
+
+    def _tray_quit(self) -> None:
+        """托盘「退出」：唯一真正的退出入口（先确认 → 收录音 → 收托盘 → quit）。
+
+        退出会中止后台任务（录音 / 标注 / 纪要生成），所以必须显式确认；确认后先
+        给录音一个收尾机会（最多 QUIT_STOP_TIMEOUT 秒），再收掉托盘图标并退出。
+        """
+        ret = QMessageBox.question(
+            self, "退出确认", TRAY_QUIT_CONFIRM,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        # 置位后：排队中的 finished / diarized 回槽不再弹窗、不再发气泡（正在退出）
+        self._quitting = True
+        if self._is_recording():
+            self._stop_before_quit()
+        self._quit_app()
+
+    def _stop_before_quit(self) -> None:
+        """退出前的录音收尾：stop() 放后台线程跑，GUI 最多等 QUIT_STOP_TIMEOUT 秒。
+
+        等不到就放弃 —— 收尾线程与标注 / 纪要线程都是 daemon，退出不再被它们拖住
+        （初版产物在导出成功时就已落盘，放弃的只是增强项）。
+        """
+        recorder = self.recorder
+        if recorder is None:
+            return
+
+        def _safe_stop() -> None:
+            try:
+                recorder.stop()
+            except Exception:
+                pass          # 收尾失败也不能阻断退出（退出路径不能把用户锁死）
+
+        worker = threading.Thread(target=_safe_stop, daemon=True)
+        worker.start()
+        worker.join(QUIT_STOP_TIMEOUT)
+
     def _quit_app(self) -> None:
-        """退出应用：先收浮窗，避免隐藏窗口把进程留住。"""
+        """退出应用：先收托盘 / 浮窗，避免残留图标与隐藏窗口把进程留住。"""
+        self._hide_tray()
         self.subtitle.hide()
         app = QApplication.instance()
         if app is not None:
@@ -1085,8 +1227,15 @@ class MainWindow(QMainWindow):
         self.bridge.diarized.emit(True, OFFLINE_DIARIZED_DONE)
 
     def _on_diarized(self, ok: bool, msg: str) -> None:
-        """标注结果回到 GUI 线程：只更新状态栏（不弹窗打断用户）。"""
+        """标注结果回到 GUI 线程：只更新状态栏（不弹窗打断用户）。
+
+        窗口若已收进托盘，再补一条托盘气泡：标注要跑几十分钟，用户多半已经忘了
+        这回事，「逐字稿更新了」得让他看得见。
+        """
         self.status.setText(msg)
+        if not self.isVisible():
+            self._tray_notify("说话人标注完成" if ok else "说话人标注失败",
+                              _notice_line(msg))
 
     # ------------------------------------------------------------------
     # 说话人记忆（声纹库）：会后认「熟人」+ 改名即学习
@@ -1267,17 +1416,40 @@ class MainWindow(QMainWindow):
         self._set_recording_state(False)
         self.status.setText("完成" if ok else "导出失败")
         self._refresh_elapsed()          # 计时行立刻回到「就绪」（不必等下一秒的定时器）
-        if ok:
-            QMessageBox.information(self, "完成", msg)
-        else:
-            QMessageBox.critical(self, "导出失败", msg)
+        if not self._quitting:
+            if ok:
+                QMessageBox.information(self, "完成", msg)
+            else:
+                QMessageBox.critical(self, "导出失败", msg)
+            # 窗口可能已收进托盘：不强行 show()（会打断用户），弹窗本身仍会显示；
+            # 再补一条托盘气泡（带产物路径），免得用户没看到弹窗以为还没结束。
+            if not self.isVisible() and msg:
+                self._tray_notify("纪要已生成" if ok else "导出失败",
+                                  _notice_line(msg))
         if self._quit_after_stop:
-            # 关窗时选了「结束并保存后退出」：导出完成即彻底退出
+            # 关窗时选了「结束并保存后退出」（CLOSE_TO_TRAY=false）：导出完成即彻底退出
             self._quit_after_stop = False
             self._quit_app()
 
     def closeEvent(self, e):
-        """关闭主窗口 = 退出整个程序（不留后台常驻进程）。
+        """关闭窗口：**总是** 收进托盘（录音 / 整理 / 标注继续在后台跑）。
+
+        真正退出只有一条路：托盘菜单「退出」（见 _tray_quit）。开会时「关窗」的真实
+        意图几乎都是「窗口挡住屏幕了」，而不是「这次会议不要了」。
+        ``CLOSE_TO_TRAY=false`` 时恢复旧语义（关闭即退出，见 _close_with_exit）。
+        """
+        if getattr(self.settings, "close_to_tray", True):
+            e.ignore()
+            self.hide()
+            if (self._is_recording() and not self._tray_hint_shown
+                    and not self._quitting):
+                self._tray_hint_shown = True
+                self._tray_notify("录制继续中", TRAY_RECORDING_HINT)
+            return
+        self._close_with_exit(e)
+
+    def _close_with_exit(self, e) -> None:
+        """旧语义（CLOSE_TO_TRAY=false）：关闭主窗口 = 退出整个程序。
 
         录制中关窗：先确认；选「是」→ 后台结束录制、导出产物，完成后再退出，
         避免静默丢数据（导出在后台线程，GUI 不会冻结）。

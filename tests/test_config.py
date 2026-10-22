@@ -15,7 +15,7 @@ def _clean_env(monkeypatch):
                 "GROQ_API_KEY", "ASR_PROVIDER",
                 "ASR_BATCH_SECONDS", "ASR_BATCH_MAX_WAIT", "MINUTES_TEMPLATE",
                 "SUBTITLE_MODE", "DIARIZE_ENABLED", "SAVE_AUDIO", "OFFLINE_DIARIZE",
-                "VOICEPRINT_ENABLED", "VOICEPRINT_THRESHOLD"):
+                "VOICEPRINT_ENABLED", "VOICEPRINT_THRESHOLD", "CLOSE_TO_TRAY"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -215,6 +215,30 @@ def test_offline_diarize_independent_of_realtime_flag(tmp_path, monkeypatch):
     s = load_settings(env)
     assert s.diarize_enabled is False
     assert s.offline_diarize is True
+
+
+# ---------------------------------------------------------------------------
+# CLOSE_TO_TRAY（关闭窗口收进托盘，后台继续整理 / 标注）
+# ---------------------------------------------------------------------------
+
+def test_close_to_tray_defaults_to_true(tmp_path, monkeypatch):
+    """不写 CLOSE_TO_TRAY 时默认收进托盘：关窗不再中断会后整理（老 .env 无需改动）。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123" + NL, encoding="utf-8")
+    assert load_settings(env).close_to_tray is True
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("on", True),
+    ("false", False), ("0", False), ("off", False), ("NO", False),
+])
+def test_close_to_tray_parsing(tmp_path, monkeypatch, value, expected):
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text(NL.join(["OPENCODE_API_KEY=sk-test123",
+                            f"CLOSE_TO_TRAY={value}"]), encoding="utf-8")
+    assert load_settings(env).close_to_tray is expected
 
 
 # ---------------------------------------------------------------------------

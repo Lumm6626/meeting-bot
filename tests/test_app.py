@@ -5,7 +5,7 @@
 该目录不入版本控制），此处固化成常驻回归，防止后续改动悄悄回退：
 
   a. ``_stop()`` 的 finish() 线程内零 Qt 控件访问（Major-1 的线程红线）；
-  b. ``closeEvent``：关闭主窗口 = 退出程序（录制中先确认并保存产物）；
+  b. ``closeEvent``：关闭窗口 = 收进托盘（CLOSE_TO_TRAY=false 时才退出程序）；
   c. finish() 内 recorder.stop() 抛异常也必须走到 finished(False)（New-6 兜底）。
 
 全程离屏 + 假对象：不构造真 Recorder、不启动采集/识别/翻译、不发任何网络请求。
@@ -50,6 +50,45 @@ class _FakeSignal:
             slot(*args)
 
 
+class FakeTray:
+    """QSystemTrayIcon 替身：离屏环境没有系统托盘，用本类记录可见性与气泡。
+
+    ``ActivationReason`` / ``MessageIcon`` 转发真枚举，app.py 里的枚举比较照常成立。
+    """
+
+    ActivationReason = _RealTray.ActivationReason
+    MessageIcon = _RealTray.MessageIcon
+    instances: list["FakeTray"] = []
+
+    def __init__(self, icon=None, parent=None):
+        self.icon = icon
+        self.parent = parent
+        self.tooltip = ""
+        self.menu = None
+        self.messages: list[tuple[str, str]] = []
+        self.visible = False
+        self.activated = _FakeSignal()
+        FakeTray.instances.append(self)
+
+    def setToolTip(self, text):
+        self.tooltip = text
+
+    def setContextMenu(self, menu):
+        self.menu = menu
+
+    def show(self):
+        self.visible = True
+
+    def hide(self):
+        self.visible = False
+
+    def isVisible(self):
+        return self.visible
+
+    def showMessage(self, title, msg, *args, **kwargs):
+        self.messages.append((title, msg))
+
+
 
 # ---------------------------------------------------------------------------
 # 基础设施
@@ -65,6 +104,18 @@ def qapp():
     """离屏 QApplication（整模块复用；无事件循环，需要时手动 processEvents）。"""
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+@pytest.fixture(autouse=True)
+def fake_tray(monkeypatch):
+    """全模块统一用 FakeTray 顶替 QSystemTrayIcon（真实托盘在离屏下不可用）。
+
+    autouse：本文件所有 MainWindow 构造点都会经过它，避免个别用例意外创建真实
+    托盘对象（会打印 QSystemTrayIcon 警告并污染全局状态）。
+    """
+    FakeTray.instances.clear()
+    monkeypatch.setattr(appmod, "QSystemTrayIcon", FakeTray)
+    yield FakeTray
 
 
 @pytest.fixture(autouse=True)
@@ -453,7 +504,7 @@ def test_offline_diarize_failure_only_warns(win, qapp, dialogs, monkeypatch, tmp
 
 
 # ---------------------------------------------------------------------------
-# c. closeEvent：关闭主窗口 = 退出整个程序（录制中先确认并保存）
+# c. closeEvent：关闭 = 收进托盘（后台继续跑），真正退出只在托盘「退出」
 # ---------------------------------------------------------------------------
 
 class _FakeApp:
@@ -479,9 +530,68 @@ def fake_app(monkeypatch):
     return _AppClass._inst
 
 
-def test_close_event_idle_quits(win, dialogs):
-    """未录制：直接关闭，不弹确认；字幕浮窗一并收起（否则进程退不掉）。"""
+def test_close_hides_to_tray_when_enabled(win, dialogs):
+    """CLOSE_TO_TRAY=true（默认）：关窗只收进托盘，录制不中断，气泡提示一次。"""
     recorded, _ = dialogs
+    recorder = FakeRecorder()
+    _prepare_recording(win, recorder)
+    win.show()
+
+    assert win.close() is False            # e.ignore()：窗口没关，只是隐藏
+    assert not win.isVisible()
+    assert recorder.stop_calls == 0        # 关键：录制继续（音频 / 字幕不中断）
+    assert win._quit_after_stop is False
+    assert not win.start_btn.isEnabled()   # 录制状态保持
+    assert [d for d in recorded if d[0] == "question"] == []    # 不再弹确认框
+    assert win.tray.messages == [("录制继续中", "录音继续中，点托盘图标可恢复窗口")]
+
+
+def test_close_hides_to_tray_idle_has_no_bubble(win, dialogs):
+    """未录制时关窗：同样收进托盘（进程不退），但不打扰用户（不发气泡、不弹框）。"""
+    recorded, _ = dialogs
+    win.recorder = None
+    win.start_btn.setEnabled(True)
+    win.show()
+    win.subtitle.show()
+
+    assert win.close() is False
+    assert not win.isVisible()
+    assert win.tray.visible                # 托盘还在：窗口点得回来
+    assert win.tray.messages == []
+    assert [d for d in recorded if d[0] == "question"] == []
+
+
+def test_close_hides_to_tray_notifies_once_per_restore(win, dialogs):
+    """「录制继续中」气泡每次「收起 → 恢复」只发一条（不刷屏，恢复后可再提示）。"""
+    _prepare_recording(win, FakeRecorder())
+    win.show()
+    win.close()
+    assert len(win.tray.messages) == 1
+
+    win.show()                              # 用户点托盘 / 任务栏回来了
+    win.close()                             # 再次收起
+    assert len(win.tray.messages) == 2
+
+
+def test_tray_restores_window(win):
+    """托盘单击 / 双击 → 主窗口恢复（showNormal + 置前）。"""
+    win.show()
+    assert win.close() is False
+    assert not win.isVisible()
+
+    win.tray.activated.emit(FakeTray.ActivationReason.Trigger)
+    assert win.isVisible()
+
+    win.close()
+    assert not win.isVisible()
+    win.tray.activated.emit(FakeTray.ActivationReason.DoubleClick)
+    assert win.isVisible()
+
+
+def test_close_exits_when_disabled(win, dialogs):
+    """CLOSE_TO_TRAY=false：恢复旧语义——未录制时关闭即退出，不弹确认。"""
+    recorded, _ = dialogs
+    win.settings = dataclasses.replace(win.settings, close_to_tray=False)
     win.recorder = None
     win.start_btn.setEnabled(True)
     win.show()
@@ -489,13 +599,14 @@ def test_close_event_idle_quits(win, dialogs):
 
     assert win.close() is True
     assert not win.isVisible()
-    assert not win.subtitle.isVisible()
+    assert not win.subtitle.isVisible()     # 浮窗一并收起，否则进程退不掉
     assert [d for d in recorded if d[0] == "question"] == []
 
 
 def test_close_event_recording_cancel_keeps_running(win, dialogs):
-    """录制中关窗 → 确认框；选「否」留在窗口里，录制不受影响。"""
+    """CLOSE_TO_TRAY=false + 录制中关窗 → 确认框；选「否」留在窗口里，录制不受影响。"""
     recorded, answer = dialogs
+    win.settings = dataclasses.replace(win.settings, close_to_tray=False)
     recorder = FakeRecorder()
     _prepare_recording(win, recorder)
     win.show()
@@ -508,10 +619,11 @@ def test_close_event_recording_cancel_keeps_running(win, dialogs):
 
 
 def test_close_event_recording_yes_exports_then_quits(win, qapp, dialogs, fake_app, monkeypatch):
-    """录制中关窗选「是」：后台结束录制并导出，完成后再彻底退出（GUI 不冻结）。"""
+    """CLOSE_TO_TRAY=false + 录制中关窗选「是」：后台收尾导出，完成后再彻底退出。"""
     exports, export_threads, finished = [], [], []
     monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
     _, answer = dialogs
+    win.settings = dataclasses.replace(win.settings, close_to_tray=False)
     recorder = FakeRecorder()
     _prepare_recording(win, recorder)
     win.show()
@@ -526,8 +638,9 @@ def test_close_event_recording_yes_exports_then_quits(win, qapp, dialogs, fake_a
 
 
 def test_close_event_finishing_quits_immediately(win, dialogs, fake_app):
-    """正在生成纪要时关窗：确认后立即退出（不再二次 stop）。"""
+    """CLOSE_TO_TRAY=false + 正在生成纪要时关窗：确认后立即退出（不再二次 stop）。"""
     recorded, answer = dialogs
+    win.settings = dataclasses.replace(win.settings, close_to_tray=False)
     recorder = FakeRecorder()
     _prepare_recording(win, recorder)
     win.stop_btn.setEnabled(False)         # 收尾中：stop 已禁用
@@ -541,13 +654,204 @@ def test_close_event_finishing_quits_immediately(win, dialogs, fake_app):
 
 
 def test_on_finished_quits_when_close_requested(win, dialogs, fake_app):
-    """关窗触发的收尾完成 → 弹窗提示后彻底退出。"""
+    """关窗触发的收尾完成 → 弹窗提示后彻底退出（旧语义路径）。"""
     recorder = FakeRecorder()
     _prepare_recording(win, recorder)
     win._quit_after_stop = True
     win._on_finished(True, "已生成：x.md")
     assert fake_app.quits == 1
     assert win._quit_after_stop is False
+
+
+# ---------------------------------------------------------------------------
+# c-1. 托盘菜单：结束并生成纪要 / 标注说话人（占位）/ 退出（退出前确认）
+# ---------------------------------------------------------------------------
+
+def test_app_icon_and_tray_wiring(win):
+    """图标资源可被 Qt 加载，窗口 / 托盘共用同一份，托盘菜单四项齐备。"""
+    ico = appmod.PROJECT_ROOT / "assets" / "app.ico"
+    assert ico.is_file()
+    assert not appmod.app_icon().isNull()
+    assert not win.windowIcon().isNull()
+    assert isinstance(win.tray, FakeTray)
+    assert win.tray.tooltip == "会议翻译助手"
+    assert [a.text() for a in win.tray_menu.actions()] == [
+        "打开主窗口", "结束并生成纪要", "标注说话人", "退出"]
+    assert [a.text() for a in win.tray.menu.actions()] == [
+        "打开主窗口", "结束并生成纪要", "标注说话人", "退出"]
+
+
+def test_tray_label_action_is_greyed_until_implemented(win):
+    """「标注说话人」是占位：_label_speakers_last_session 还没实现时必须置灰。"""
+    implemented = callable(getattr(win, "_label_speakers_last_session", None))
+    assert win.tray_label_action.isEnabled() is implemented
+
+
+def test_tray_menu_stop_runs_finish_and_guards_double_trigger(win, qapp, dialogs, monkeypatch):
+    """托盘「结束并生成纪要」→ 复用 _stop() 的后台收尾；收尾中再点不重复停止/导出。"""
+    exports, export_threads, finished = [], [], []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    recorder = FakeRecorder()
+    _prepare_recording(win, recorder)
+    win.bridge.finished.connect(lambda ok_, msg: finished.append((ok_, msg)))
+
+    win.tray_stop_action.trigger()
+    assert not win.stop_btn.isEnabled()      # 已进入收尾（stop 按钮禁用）
+    win.tray_stop_action.trigger()           # 第二次点击必须被挡掉
+
+    assert _pump_until(qapp, lambda: bool(finished)), "托盘结束未走 _stop 收尾"
+    assert _pump_until(qapp, lambda: win.start_btn.isEnabled())
+    qapp.processEvents()
+    assert recorder.stop_calls == 1
+    assert recorder.stop_thread is not threading.current_thread()
+    assert len(exports) == 1
+    assert len(finished) == 1
+
+
+def test_tray_menu_stop_idle_is_noop(win, dialogs, monkeypatch):
+    """空闲时点「结束并生成纪要」：不得重复收尾 / 重复导出。"""
+    recorded, _ = dialogs
+    calls = []
+    monkeypatch.setattr(appmod, "export_all",
+                        lambda *a, **k: calls.append(a) or (Path("a"), Path("b")))
+    win.recorder = None
+    win.start_btn.setEnabled(True)
+
+    win.tray_stop_action.trigger()
+
+    assert calls == []
+    assert [d for d in recorded if d[0] in ("info", "crit")] == []
+
+
+def test_tray_quit_confirms_and_stops_recording(win, qapp, dialogs, fake_app):
+    """托盘「退出」：先确认；Yes → 后台 stop 录音（不在 GUI 线程）→ 真正退出。"""
+    recorded, answer = dialogs
+    recorder = FakeRecorder()
+    _prepare_recording(win, recorder)
+    win.show()
+    tray = win.tray
+
+    # --- No：什么都不做，留在托盘里继续录 ---
+    answer["ret"] = appmod.QMessageBox.StandardButton.No
+    win.tray_quit_action.trigger()
+    assert recorded[-1][0] == "question"
+    assert recorded[-1][1] == "退出确认"
+    assert "退出将中止正在进行的后台任务" in recorded[-1][2]
+    assert recorder.stop_calls == 0
+    assert fake_app.quits == 0
+    assert tray.visible
+    assert win._quitting is False
+
+    # --- Yes：后台收尾（≤ QUIT_STOP_TIMEOUT）后退出，托盘图标收掉 ---
+    answer["ret"] = appmod.QMessageBox.StandardButton.Yes
+    t0 = time.monotonic()
+    win.tray_quit_action.trigger()
+    assert time.monotonic() - t0 < appmod.QUIT_STOP_TIMEOUT
+    assert recorder.stop_calls == 1
+    assert recorder.stop_thread is not threading.current_thread()   # 收尾不在 GUI 线程
+    assert fake_app.quits == 1
+    assert not tray.visible                  # 退出前收掉托盘图标（不留幽灵图标）
+    assert win._quitting is True
+    assert not win.subtitle.isVisible()
+
+
+def test_tray_quit_gives_up_after_timeout(win, dialogs, fake_app, monkeypatch):
+    """收尾卡住时退出不能被卡死：最多等 QUIT_STOP_TIMEOUT 秒就放弃（线程是 daemon）。"""
+    _, answer = dialogs
+    released = threading.Event()
+
+    class _SlowStop(FakeRecorder):
+        def stop(self):
+            released.wait(timeout=5)         # 模拟卡住的收尾（真实可长达数分钟）
+            super().stop()
+
+    recorder = _SlowStop()
+    _prepare_recording(win, recorder)
+    win.show()
+    monkeypatch.setattr(appmod, "QUIT_STOP_TIMEOUT", 0.2)
+    answer["ret"] = appmod.QMessageBox.StandardButton.Yes
+
+    t0 = time.monotonic()
+    win.tray_quit_action.trigger()
+    elapsed = time.monotonic() - t0
+    # 下界只要求「等过一小会儿」（join 的计时精度不保证刚好 0.2s），上界才是重点
+    assert 0.1 <= elapsed < 2.0, f"未按上限放弃（等了 {elapsed:.2f}s）"
+    assert fake_app.quits == 1               # 收尾卡住也照样退出
+    released.set()
+
+
+def test_tray_quit_idle_does_not_stop_but_still_confirms(win, dialogs, fake_app):
+    """空闲时托盘「退出」：仍要确认（会中止后台标注/整理），确认后直接退出。"""
+    recorded, answer = dialogs
+    win.recorder = None
+    win.start_btn.setEnabled(True)
+    answer["ret"] = appmod.QMessageBox.StandardButton.Yes
+
+    win.tray_quit_action.trigger()
+
+    assert [d for d in recorded if d[0] == "question"] != []
+    assert fake_app.quits == 1
+    assert not win.tray.visible
+
+
+# ---------------------------------------------------------------------------
+# c-2. 窗口收进托盘时的完成通知（纪要 / 说话人标注）
+# ---------------------------------------------------------------------------
+
+def test_hidden_window_gets_tray_bubbles_on_finish_and_diarize(win, dialogs):
+    """窗口收进托盘后：纪要生成 / 说话人标注完成都补一条托盘气泡（带产物路径）。"""
+    win.show()
+    assert win.close() is False
+    assert not win.isVisible()
+
+    win._on_finished(True, "已生成：" + chr(10) + "逐字稿：D:/x/逐字稿.md"
+                     + chr(10) + "纪要：D:/x/纪要.docx")
+    assert win.tray.messages[-1] == ("纪要已生成", "逐字稿：D:/x/逐字稿.md")
+    assert not win.isVisible()               # 不强行把窗口弹出来打断用户
+
+    win._on_finished(False, "导出失败：磁盘满了")
+    assert win.tray.messages[-1] == ("导出失败", "导出失败：磁盘满了")
+
+    win._on_diarized(True, appmod.OFFLINE_DIARIZED_DONE)
+    assert win.tray.messages[-1] == ("说话人标注完成", appmod.OFFLINE_DIARIZED_DONE)
+
+    win._on_diarized(False, "[警告] 会后说话人标注失败（已导出的产物保持原样）：boom")
+    assert win.tray.messages[-1][0] == "说话人标注失败"
+
+
+def test_visible_window_does_not_get_tray_bubbles(win, dialogs):
+    """窗口就在眼前时不再发气泡（弹窗/状态栏已经够了）。"""
+    win.show()
+    win._on_finished(True, "已生成：x.md")
+    win._on_diarized(True, appmod.OFFLINE_DIARIZED_DONE)
+    assert win.tray.messages == []
+
+
+def test_quitting_suppresses_dialogs_and_bubbles(win, dialogs):
+    """退出后到达的回槽（收尾完成 / 标注完成）不得再弹窗、再发气泡。"""
+    recorded, _ = dialogs
+    win.show()
+    win.close()
+    before = list(win.tray.messages)
+    win._quitting = True
+
+    win._on_finished(True, "已生成：x.md")
+    win._on_diarized(True, appmod.OFFLINE_DIARIZED_DONE)
+
+    assert win.tray.messages == before
+    assert [d for d in recorded if d[0] in ("info", "crit")] == []
+
+
+def test_tray_notify_silently_skips_without_tray(win, dialogs):
+    """托盘不可用时静默跳过气泡（不能因为「提示不了」把主流程带崩）。"""
+    win.show()
+    win.close()
+    win.tray.hide()                       # 托盘没了（远程会话 / shell 重启）
+    win.tray.messages.clear()
+
+    win._on_finished(True, "已生成：x.md")
+
+    assert win.tray.messages == []
 
 
 def test_app_icon_loads(win):
@@ -836,7 +1140,7 @@ def test_brand_row_status_card_and_equal_height_buttons(win):
         assert btn.minimumHeight() == btn.maximumHeight() == 44      # 固定等高
     assert win.start_btn.property("role") == "primary"               # 主按钮（渐变）
     assert win.stop_btn.property("role") == "secondary"              # 次按钮（描边）
-    assert win.footer_hint.text().startswith("录制中关闭窗口会先结束录制并保存")
+    assert win.footer_hint.text().startswith("关闭窗口会收进托盘")
     assert win.elapsed_label.text() == "就绪"
 
 

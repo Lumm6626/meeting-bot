@@ -75,6 +75,10 @@ class Settings:
     minutes_template: str = "standard"
     # 字幕显示模式（见 SUBTITLE_MODES）：bilingual 中英对照 | zh_only 只中文
     subtitle_mode: str = "bilingual"
+    # 关闭窗口的语义（CLOSE_TO_TRAY）：true（默认）= 收进托盘，录音 / 会后整理 /
+    # 说话人标注继续在后台跑，真正退出只在托盘菜单；false = 旧行为（关闭即退出，
+    # 录制中先确认并保存产物）
+    close_to_tray: bool = True
     # 录制落盘音频（SAVE_AUDIO）：整场 16kHz 单声道 wav 写进 <output_dir>/.recording/，
     # 约 115MB/小时。会后离线标注说话人要用它；关掉则只能拿实时标注（更慢、更迟）。
     save_audio: bool = True
@@ -257,6 +261,7 @@ def load_settings(env_path: Path | None = None) -> Settings:
         asr_prompt=(os.getenv("ASR_PROMPT") or "").strip(),
         minutes_template=template,
         subtitle_mode=subtitle_mode,
+        close_to_tray=_bool_env("CLOSE_TO_TRAY", True),
         save_audio=_bool_env("SAVE_AUDIO", True),
         offline_diarize=_bool_env("OFFLINE_DIARIZE", True),
         voiceprint_enabled=_bool_env("VOICEPRINT_ENABLED", True),
