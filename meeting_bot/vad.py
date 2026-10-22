@@ -9,7 +9,9 @@ from silero_vad import load_silero_vad
 SAMPLE_RATE = 16000
 FRAME = 512                      # silero 单帧样本数 @16k
 MIN_SPEECH_FRAMES = 10           # ~0.32s 起算一句
-MIN_SILENCE_FRAMES = 15          # ~0.48s 静音断句
+MIN_SILENCE_FRAMES = 10          # ~0.32s 静音断句（帧=512样本@16k≈32ms）
+                                 # 从 15 帧(0.48s)降到 10 帧(0.32s)：更快出字幕，
+                                 # 代价是句中停顿较久时可能被切成两句（可用 VAD_SILENCE_MS 调回）
 MAX_UTTERANCE_FRAMES = 600       # 最长 19s 强制断句
 
 
@@ -48,8 +50,10 @@ class UtteranceBuffer:
     起始样本偏移是相对录制起点的绝对偏移，由内部维护的丢弃计数保证。
     """
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE):
+    def __init__(self, sample_rate: int = SAMPLE_RATE,
+                 min_silence_frames: int = MIN_SILENCE_FRAMES):
         self.sample_rate = sample_rate
+        self._min_silence = max(3, int(min_silence_frames))
         self._model = load_silero_vad()
         self._frames: list[np.ndarray] = []   # 未决帧，每帧 FRAME 样本
         self._probs: list[float] = []
@@ -72,12 +76,12 @@ class UtteranceBuffer:
 
     def _emit(self) -> list[tuple[int, np.ndarray]]:
         probs = np.asarray(self._probs, dtype=np.float32)
-        bounds = utterance_bounds(probs)
+        bounds = utterance_bounds(probs, min_silence=self._min_silence)
         if not bounds:
             if probs.size and probs[-1] >= 0.5:
                 return []   # 正在说话，缓冲不能丢弃
             # 静音中：只保留最近一段静音上下文
-            keep = max(0, len(probs) - MIN_SILENCE_FRAMES * 2)
+            keep = max(0, len(probs) - self._min_silence * 2)
             self._drop(keep)
             return []
         last_start, last_end = bounds[-1]

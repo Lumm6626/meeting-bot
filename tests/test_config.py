@@ -480,3 +480,26 @@ def test_secrets_source_none(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("", encoding="utf-8")
     assert secrets_source(env) == "none"
+
+
+def test_latency_tuning_defaults_and_overrides(tmp_path, monkeypatch):
+    """延迟调优项：默认 VAD 320ms / 上文 2 句 / 快速模型留空。"""
+    _clean_env(monkeypatch)
+    env = tmp_path / ".env"
+    env.write_text("OPENCODE_API_KEY=sk-test123\n", encoding="utf-8")
+    s = load_settings(env)
+    assert s.vad_silence_ms == 320
+    assert s.translate_context_segments == 2
+    assert s.translate_model_fast == ""
+
+    monkeypatch.delenv("VAD_SILENCE_MS", raising=False)
+    monkeypatch.delenv("TRANSLATE_CONTEXT_SEGMENTS", raising=False)
+    monkeypatch.delenv("TRANSLATE_MODEL_FAST", raising=False)
+    env.write_text(
+        "OPENCODE_API_KEY=sk-test123\nVAD_SILENCE_MS=480\n"
+        "TRANSLATE_CONTEXT_SEGMENTS=4\nTRANSLATE_MODEL_FAST=deepseek-v4-flash\n",
+        encoding="utf-8")
+    s = load_settings(env)
+    assert s.vad_silence_ms == 480
+    assert s.translate_context_segments == 4
+    assert s.translate_model_fast == "deepseek-v4-flash"

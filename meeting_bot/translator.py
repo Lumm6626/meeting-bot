@@ -159,6 +159,10 @@ class Translator:
             default_headers=session_headers(),
         )
         self._thinking_disabled_ok: bool | None = None
+        # 字幕（实时流式）专用模型：TRANSLATE_MODEL_FAST 为空时与 translate_model 相同。
+        # 想再快一点可在 .env 设 deepseek-v4-flash（首 token 略快、质量略降）；
+        # 收尾补译与纪要仍用 translate_model / minutes_model，不受影响。
+        self._live_model = (getattr(settings, "translate_model_fast", "") or "").strip()             or settings.translate_model
 
     def _chat(self, messages: list[dict], max_tokens: int = 512, model: str | None = None) -> str:
         extra = {"thinking": {"type": "disabled"}} if self._thinking_disabled_ok is not False else None
@@ -236,7 +240,7 @@ class Translator:
         stream = None
         for attempt in range(3):
             try:
-                kwargs = dict(model=self._settings.translate_model,
+                kwargs = dict(model=self._live_model,
                               messages=messages, max_tokens=512, temperature=0.0,
                               stream=True)
                 if extra is not None:

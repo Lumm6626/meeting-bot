@@ -182,7 +182,7 @@ class FakeDiarizer:
 class FakeVAD:
     """替换真实 silero：第一次 push 返回一条偏移 16000 样本（1 秒）的语句。"""
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         self.pushed = 0
 
     def push(self, chunk):
@@ -198,7 +198,7 @@ class FakeVAD:
 class FakeVADFlushOnly:
     """push 只缓存不产出，flush 时一次性吐出每块音频（尾部 flush 路径）。"""
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         self._chunks = []
 
     def push(self, chunk):
@@ -214,7 +214,7 @@ class FakeVADFlushOnly:
 class FakeVADPerChunk:
     """每块音频产出一条语句（多句流水线场景）。"""
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         self._n = 0
 
     def push(self, chunk):
@@ -655,11 +655,13 @@ def test_context_passed_to_translate(monkeypatch):
     ctx_of = dict(tr.calls)          # 同一句只翻一次 → 用原文当 key 安全
     assert ctx_of["line 1"] == ""                  # 首句没有上文
     ctx4 = ctx_of["line 4"]
-    for prev in ("line 1", "line 2", "line 3"):
+    # 延迟调优后默认只带最近 2 句（TRANSLATE_CONTEXT_SEGMENTS=2）
+    for prev in ("line 2", "line 3"):
         assert prev in ctx4, prev
     assert "line 4" not in ctx4, "待译句自己不得进上文（模型会照抄自己）"
+    assert "line 1" not in ctx4, "默认只带最近 2 句（可配 TRANSLATE_CONTEXT_SEGMENTS）"
     assert "原文：" in ctx4 and "译文：" in ctx4
-    assert "译:line 1" in ctx4                     # 优先带已有译文（术语锚点）
+    assert "译:line 2" in ctx4                     # 优先带已有译文（术语锚点）
 
 
 class FakeTranslatorFailsInWorker:
@@ -772,7 +774,7 @@ class FakeCaptureStaged:
 class FakeVADTwoUtterances:
     """一次 push 吐出两条语句（偏移 0 与 16000 样本）→ 单块音频内首尾各一句。"""
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         self.pushed = False
 
     def push(self, chunk):
@@ -1755,7 +1757,7 @@ def test_offsets_preserved_in_batch(monkeypatch):
     """
     def _run(offsets):
         monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer",
-                            lambda: FakeVADOffsets(offsets))
+                            lambda *a, **k: FakeVADOffsets(offsets))
         asr = FakeASRRelative()
         rec = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=asr,
                        translator=None, diarizer=None)
@@ -1807,7 +1809,7 @@ def test_batch_preserves_inter_utterance_gaps(monkeypatch):
     变异自查点：去掉 to_abs()/spans 映射（改回 base + s.start）→ 本用例断言失败。
     """
     monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer",
-                        lambda: FakeVADOffsets([0, 11 * 16000]))
+                        lambda *a, **k: FakeVADOffsets([0, 11 * 16000]))
     asr = FakeASRGapTwoSegs()
     r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=asr,
                  translator=None, diarizer=None)
@@ -1862,7 +1864,7 @@ def test_batch_segment_end_on_boundary(monkeypatch):
     """
     def _run(offsets, segs):
         monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer",
-                            lambda: FakeVADOffsets(offsets, samples=16000))
+                            lambda *a, **k: FakeVADOffsets(offsets, samples=16000))
         asr = FakeASRBoundarySegs(segs)
         rec = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=asr,
                        translator=None, diarizer=None)
@@ -2816,3 +2818,19 @@ def test_fallback_allowed_after_stop_when_model_cached(monkeypatch):
     assert _LocalOK.calls == 1, "停止后未回退本地引擎"
     assert any("已自动切换本地识别" in m for m in statuses)
     assert r.store.segments()[0].text == "local text"
+
+
+def test_recent_context_respects_configured_limit(monkeypatch):
+    """上文参考条数走配置（默认 2）：TRANSLATE_CONTEXT_SEGMENTS=2 时只带最近 2 句。"""
+    class _Trans:
+        def translate(self, text, lang="", context=""):
+            return "译文"
+
+    r = Recorder(_settings(), translator=_Trans(), capture=FakeCapture(chunks=0))
+    # Settings 默认 translate_context_segments=2（frozen dataclass，不改实例）
+    for i in range(5):
+        seg = r.store.add(float(i), float(i) + 1, f"line {i}", lang="en")
+        r.store.update(seg.seq, translation=f"译{i}")
+    ctx = r._recent_context(r.store.segments()[-1])   # 最后一句是 line 4，上文取最近 2 条
+    assert "line 2" in ctx and "line 3" in ctx
+    assert "line 0" not in ctx and "line 1" not in ctx

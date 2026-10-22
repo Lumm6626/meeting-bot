@@ -38,9 +38,10 @@ PRODUCER_DONE_TIMEOUT = 10.0  # stop() 等主循环完成尾部 flush 的上限
 TRANSLATE_DRAIN_TIMEOUT = 20.0  # stop() 等翻译 worker 排空退出的上限
 TRANSLATE_POLL_TIMEOUT = 0.5  # 翻译 worker 队列轮询间隔
 BACKFILL_MAX_CONSECUTIVE_FAILS = 3  # stop() 补译连续失败上限（超过则放弃补译，防无界重试）
-STREAM_UPDATE_INTERVAL = 0.5  # 流式译文刷新间隔（秒）：0.5s 一次是「均匀打字」的手感，再密
+STREAM_UPDATE_INTERVAL = 0.3  # 流式译文刷新间隔（秒）：0.3s 更连贯（0.5s 偏慢），再密
                               # 就是 token 碎片闪屏（用户反馈的拼接感），再疏则像卡住不掉字
-CONTEXT_RECENT_SEGMENTS = 4   # 翻译上文参考取最近几条语句（统一术语/人名 + 纠口音错字）
+CONTEXT_RECENT_SEGMENTS = 2   # 翻译上文参考取最近几条语句（实测 4→2 省 ~0.3s 首 token；
+                              # 想更强纠错可调回 4，或改 .env 的 TRANSLATE_CONTEXT_SEGMENTS）
 ASR_BATCH_SECONDS = 30.0      # 攒够 30 秒音频触发一批识别
 ASR_BATCH_MAX_WAIT = 35.0     # 静默会议兜底：最老语句积压 35 秒墙钟也强制识别
 ASR_POLL_TIMEOUT = 0.5        # 识别 worker 轮询间隔（无新语句也要醒来查 max-wait）
@@ -358,7 +359,10 @@ class Recorder:
         self._main_loop()
 
     def _main_loop(self) -> None:
-        buf = UtteranceBuffer()
+        # VAD 断句阈值可配（VAD_SILENCE_MS，默认 320ms）：越短出字幕越快，
+        # 但句中长停顿会被切成两句 → 帧数 = 毫秒 / 32（512 样本 @16k）
+        silence_frames = max(3, int(getattr(self._settings, "vad_silence_ms", 320) or 320) // 32)
+        buf = UtteranceBuffer(min_silence_frames=silence_frames)
         self._open_audio_sink()      # 录音落盘：finally 里统一关盘
         try:
             while not self._stop.is_set():
@@ -648,7 +652,9 @@ class Recorder:
         if not prev:
             return ""
         translated = [s for s in prev if (s.translation or "").strip()]
-        picked = (translated or prev)[-CONTEXT_RECENT_SEGMENTS:]
+        limit = int(getattr(self._settings, "translate_context_segments",
+                            CONTEXT_RECENT_SEGMENTS) or CONTEXT_RECENT_SEGMENTS)
+        picked = (translated or prev)[-max(1, limit):]
         return "\n".join(
             f"原文：{s.text}\n译文：{s.translation or '（无）'}" for s in picked)
 

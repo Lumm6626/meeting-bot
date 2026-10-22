@@ -64,3 +64,18 @@ def test_push_keeps_tail_samples_between_chunks(monkeypatch):
     assert len(recorded) == stream.size // FRAME == 31
     assert np.array_equal(np.concatenate(recorded), stream[:31 * FRAME])
     assert len(buf._pending) == stream.size % FRAME == 128
+
+
+def test_utterance_buffer_respects_custom_silence():
+    """静音阈值可配：自定义 5 帧静音即断句（默认 10 帧），验证 VAD_SILENCE_MS 生效路径。"""
+    from meeting_bot.vad import UtteranceBuffer
+    probs = _prob_array([(0, 30), (35, 60)], 80)   # 中间 5 帧静音
+    bounds = utterance_bounds(probs, min_speech=5, min_silence=5)
+    assert bounds == [(0, 30), (35, 60)]
+
+
+def test_utterance_buffer_accepts_min_silence_param():
+    """UtteranceBuffer(min_silence_frames=...) 构造不报错且内部生效。"""
+    from meeting_bot.vad import UtteranceBuffer
+    buf = UtteranceBuffer(min_silence_frames=5)
+    assert buf._min_silence == 5
