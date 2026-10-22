@@ -2347,12 +2347,11 @@ def test_missing_groq_key_falls_back_to_local(monkeypatch):
 
 
 def test_fallback_skipped_after_stop(monkeypatch):
-    """已收到停止信号时云端失败不回退：不得在关闭路径里加载数百 MB 本地模型。
+    """停止后、且本地模型**未缓存**时回退：不在关闭路径里下载数百 MB。
 
-    回归场景：用户点「结束」时正好赶上云端 429/断网，或退避睡眠被停止信号打断
-    （asr.py 抛 CloudASRError("识别被停止")）。此时若照常回退，会在 stop() 等待
-    识别线程收尾的窗口里去加载/下载本地模型 → 「点结束」变界面卡死，且状态栏
-    给出「云端识别不可用」这种误诊。这类失败按普通丢批处理即可。
+    回归场景：用户点「结束」时正好赶上云端故障，若此时去下载本地模型，会把
+    「点结束」变成界面卡死。这类失败按普通丢批处理即可。
+    （模型已缓存时相反 —— 必须回退，见 test_fallback_allowed_after_stop_when_model_cached）
     """
     from meeting_bot.asr import CloudASRError
 
@@ -2373,6 +2372,7 @@ def test_fallback_skipped_after_stop(monkeypatch):
                  translator=None, diarizer=None)
     statuses: list[str] = []
     r.on_status(statuses.append)
+    r._local_model_cached = lambda: False          # 本地模型没缓存 → 不该下载
 
     r._stop.set()                                  # 模拟 stop() 已置位
     r._transcribe_batch([(0, np.zeros(16000, dtype=np.float32))])
