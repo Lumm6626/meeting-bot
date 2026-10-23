@@ -23,10 +23,18 @@ class Diarizer:
             use_auth_token=settings.hf_token,
         )
 
-    def label(self, audio: np.ndarray, sample_rate: int = 16000) -> list[tuple[float, float, str]]:
-        """返回 [(start, end, label), ...]，时间以秒为单位。"""
+    def label(self, audio: np.ndarray, sample_rate: int = 16000,
+              num_speakers: int | None = None) -> list[tuple[float, float, str]]:
+        """返回 [(start, end, label), ...]，时间以秒为单位。
+
+        ``num_speakers``：已知本场有几个人时传进来，pyannote 不再猜人数，聚类更准
+        （尤其短会/人少时）；None = 自动检测。
+        """
         waveform = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0)
-        result = self._pipeline({"waveform": waveform, "sample_rate": sample_rate})
+        kwargs = {}
+        if num_speakers and int(num_speakers) > 0:
+            kwargs["num_speakers"] = int(num_speakers)
+        result = self._pipeline({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
         spans = []
         for turn, _, label in result.itertracks(yield_label=True):
             spans.append((float(turn.start), float(turn.end), str(label)))

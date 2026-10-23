@@ -1998,3 +1998,75 @@ def test_recheck_button_tall_enough_for_text(win, qapp):
     assert btn.text() == "重新检测"
     assert btn.height() >= btn.sizeHint().height(), "按钮高度不足，文字会被裁切"
     assert btn.width() >= btn.fontMetrics().horizontalAdvance("重新检测"), "按钮宽度不足"
+
+
+# ---------------------------------------------------------------------------
+# 「标注说话人」独立动作
+# ---------------------------------------------------------------------------
+
+def test_find_last_recording_picks_latest_wav(tmp_path):
+    """重启后补标注：按 mtime 取最新且有语句的录制。"""
+    import json, os, time
+    from meeting_bot.app import MainWindow
+
+    d = tmp_path / ".recording"
+    d.mkdir(parents=True)
+    old_wav = d / "rec_old.wav"; old_wav.write_bytes(b"RIFF")
+    old_j = d / "rec_old.jsonl"
+    old_j.write_text(json.dumps({"t": "header", "title": "old"}) + "\n"
+                     + json.dumps({"t": "add", "seq": 1, "text": "hi"}) + "\n",
+                     encoding="utf-8")
+    time.sleep(0.05)
+    new_wav = d / "rec_new.wav"; new_wav.write_bytes(b"RIFF")
+    new_j = d / "rec_new.jsonl"
+    new_j.write_text(json.dumps({"t": "header", "title": "new"}) + "\n"
+                     + json.dumps({"t": "add", "seq": 1, "text": "yo"}) + "\n",
+                     encoding="utf-8")
+
+    class _S:
+        output_dir = tmp_path
+
+    class _W:
+        settings = _S()
+        _recording_dir = MainWindow._recording_dir
+
+    found = MainWindow._find_last_recording(_W())
+    assert found is not None and found[0].name == "rec_new.wav"
+
+
+def test_label_num_speakers_passed_to_diarizer(win, monkeypatch):
+    """「标注说话人」把用户填的人数透传给 Diarizer.label(num_speakers=...)。"""
+    import numpy as np
+    calls = {}
+
+    class _Diar:
+        def __init__(self, settings):
+            pass
+
+        def label(self, audio, sample_rate=16000, num_speakers=None):
+            calls["num"] = num_speakers
+            return [(0.0, 5.0, "SPEAKER_00")]
+
+    monkeypatch.setattr("meeting_bot.app._resolve_diarize_tools",
+                        lambda: (_Diar, __import__("meeting_bot.diarization",
+                                                   fromlist=["assign_speakers"]).assign_speakers))
+    monkeypatch.setattr("meeting_bot.app._read_audio", lambda p: (np.zeros(16000, dtype=np.float32), 16000))
+    monkeypatch.setattr("meeting_bot.app.export_all", lambda *a, **k: (Path("t.md"), Path("m.docx")))
+    monkeypatch.setattr("meeting_bot.app.QInputDialog.getInt",
+                        staticmethod(lambda *a, **k: (3, True)))
+    monkeypatch.setattr("meeting_bot.app.OFFLINE_DIARIZED_DONE", "done")
+    monkeypatch.setattr(win, "_collect_voiceprints", lambda *a, **k: None)
+
+    wav = win.settings.output_dir / "x.wav"
+    wav.parent.mkdir(parents=True, exist_ok=True)
+    wav.write_bytes(b"RIFF")
+    win._last_session = {"audio": wav, "store": win.recorder.store if win.recorder else None}
+    # 没有 recorder 时用临时 store
+    win._last_session["store"] = None
+    from meeting_bot.transcript import TranscriptStore
+    win._last_session["store"] = TranscriptStore()
+    seg = win._last_session["store"].add(0.0, 4.0, "hello", lang="en")
+
+    win._label_worker(wav, win._last_session["store"], "测试", __import__("datetime").datetime.now(), 3, None)
+    assert calls["num"] == 3
+    assert win._last_session["store"].segments()[0].speaker == "SPEAKER_00"

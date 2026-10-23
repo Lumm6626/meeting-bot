@@ -13,7 +13,8 @@ from string import Template
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout,
-                             QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+                             QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
+                             QMessageBox,
                              QPushButton, QSizePolicy, QSystemTrayIcon,
                              QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
@@ -560,8 +561,16 @@ class MainWindow(QMainWindow):
         self.stop_btn.setFixedHeight(44)
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_btn.setEnabled(False)
+        # 「标注说话人」独立动作：会后（或重启后对上一场）随时可重跑，可指定人数
+        self.label_btn = QPushButton("标注说话人")
+        self.label_btn.setProperty("role", "secondary")
+        self.label_btn.setFixedHeight(44)
+        self.label_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.label_btn.setToolTip("对本场录音重新跑说话人标注（可指定人数提高准确率）")
+        self.label_btn.setEnabled(False)
         row.addWidget(self.start_btn, 1)
         row.addWidget(self.stop_btn, 1)
+        row.addWidget(self.label_btn, 0)
         lay.addLayout(row)
 
         # ---- 状态卡片：状态文本（加粗白）+ 录制计时 ----
@@ -626,6 +635,7 @@ class MainWindow(QMainWindow):
 
         self.start_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
+        self.label_btn.clicked.connect(self._label_speakers)
         self.speaker_table.itemChanged.connect(self._rename_speaker)
 
         self._timer = QTimer(self)
@@ -648,6 +658,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._check_recovery)
         # 云端自检：Groq 在国内直连常被 403 地区封禁 → 界面常驻提醒开代理
         QTimer.singleShot(300, self._start_cloud_check)
+        # 上一场如果没标注（或上次提前关程序），启动即允许补标注
+        QTimer.singleShot(400, self._enable_label_for_last_recording)
         # 托盘放在最后：菜单槽会读写 start_btn / stop_btn / subtitle，必须等它们就绪
         self._setup_tray()
 
@@ -832,6 +844,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 云端识别自检（Groq）：启动时探测，结果常驻界面提示条
     # ------------------------------------------------------------------
+
+    def _enable_label_for_last_recording(self) -> None:
+        """启动时若发现上一场录音还没标注，启用「标注说话人」按钮。"""
+        try:
+            found = self._find_last_recording()
+        except Exception:
+            found = None
+        if found and not self._is_recording():
+            self.label_btn.setEnabled(True)
+            self.label_btn.setToolTip(f"检测到上一场录音：{found[0].name}，可补标注")
 
     def _start_cloud_check(self) -> None:
         """后台探测云端识别可用性（不阻塞界面，约 1~5 秒）。"""
@@ -1026,6 +1048,10 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.bridge.finished.emit(False, f"启动失败：{e}")
                 return
+            # 只记引用，audio/started_at 在 start() 之后才存在 → 用的时候再取
+            self._last_session = {"store": store, "title": title,
+                                  "recorder": self.recorder, "translator": translator}
+            self.bridge.status.emit("开始录制（等待语音…）")
             self.recorder.start(title)
 
         threading.Thread(target=_boot, daemon=True).start()
@@ -1192,6 +1218,103 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._offline_diarize_worker,
                          args=(recorder, Path(audio), title, started_at),
                          daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # 说话人标注（独立动作）：可随时重跑、可指定人数、重启后能补上一场
+    # ------------------------------------------------------------------
+
+    def _find_last_recording(self) -> tuple[Path, Path] | None:
+        """找最近一场的 (wav, jsonl)：用于「重启后补标注」。没有则 None。"""
+        try:
+            wavs = sorted(self._recording_dir().glob("rec_*.wav"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return None
+        for wav in wavs:
+            journal = wav.with_suffix(".jsonl")
+            if not journal.is_file():
+                continue
+            try:
+                if any('"t": "add"' in line or '"t":"add"' in line
+                       for line in journal.read_text(encoding="utf-8").splitlines()):
+                    return wav, journal
+            except OSError:
+                continue
+        return None
+
+    def _label_speakers(self) -> None:
+        """按钮/托盘入口：提问人数 → 后台重跑标注（幂等，可反复执行）。"""
+        session = getattr(self, "_last_session", None)
+        audio_guess = getattr(session.get("recorder"), "audio_path", None) if session else None
+        if audio_guess and Path(audio_guess).is_file():
+            recorder = session["recorder"]
+            audio_path, store = Path(audio_guess), session["store"]
+            title = session.get("title") or getattr(recorder, "title", "") or "未命名会议"
+            started_at = getattr(recorder, "started_at", None) or datetime.now()
+        else:
+            found = self._find_last_recording()
+            if not found:
+                self.status.setText("没有可标注的录音（需要先录一场会议）")
+                return
+            wav, journal = found
+            try:
+                title, started_at, store = load_journal(journal)
+            except Exception as e:
+                self.status.setText(f"读取上次录制日志失败：{e}")
+                return
+            audio_path = wav
+        num, ok = QInputDialog.getInt(
+            self, "说话人数量", "本场有几个人说话？（0 = 自动检测）", 0, 0, 12)
+        if not ok:
+            return
+        self.label_btn.setEnabled(False)
+        self.label_btn.setText("标注中…")
+        self.status.setText("正在标注说话人（约 0.5~1.5 倍会议时长，可关闭窗口后台继续）…")
+        threading.Thread(target=self._label_worker,
+                         args=(audio_path, store, title, started_at,
+                               num or None, (session or {}).get("translator")),
+                         daemon=True).start()
+
+    def _label_worker(self, audio_path: Path, store, title: str,
+                      started_at: datetime, num_speakers: int | None,
+                      translator=None) -> None:
+        """后台：整场 wav → label() → 回填 store（并写入日志）→ 覆盖产物。"""
+        suggestions = None
+        try:
+            diarizer_cls, assign = _resolve_diarize_tools()
+            diarizer = diarizer_cls(self.settings)
+            audio, sample_rate = _read_audio(audio_path)
+            spans = diarizer.label(audio, sample_rate, num_speakers=num_speakers)
+            changed: list[int] = []
+            for seg in store.segments():
+                before = seg.speaker
+                assign([seg], spans)
+                if seg.speaker != before:
+                    changed.append(seg.seq)
+            # 回写日志：崩溃恢复/再次导出时标注不丢（store.update 会写 journal 事件）
+            for seq in changed:
+                for seg in store.segments():
+                    if seg.seq == seq:
+                        store.update(seq, speaker=seg.speaker)
+                        break
+            for seg in store.segments():
+                if seg.speaker:
+                    store.register_label(seg.speaker)
+            suggestions = self._collect_voiceprints(store, audio, sample_rate, spans)
+            export_all(store, self.settings, title, started_at,
+                       translator=translator or self._journal_translator(store))
+        except Exception as e:
+            self.bridge.diarized.emit(False, f"[警告] 说话人标注失败（产物保持原样）：{e}")
+            return
+        if suggestions is not None:
+            self.bridge.speaker_suggestions.emit(suggestions)
+        self.bridge.diarized.emit(True, OFFLINE_DIARIZED_DONE)
+
+    def _journal_translator(self, store):
+        session = getattr(self, "_last_session", None)
+        if session and session.get("store") is store:
+            return session.get("translator")
+        return None
 
     def _offline_diarize_worker(self, recorder, audio_path: Path,
                                 title: str, started_at: datetime) -> None:
@@ -1426,6 +1549,10 @@ class MainWindow(QMainWindow):
             if not self.isVisible() and msg:
                 self._tray_notify("纪要已生成" if ok else "导出失败",
                                   _notice_line(msg))
+        session = getattr(self, "_last_session", None)
+        audio_guess = getattr(session.get("recorder"), "audio_path", None) if session else None
+        if audio_guess and Path(audio_guess).is_file():
+            self.label_btn.setEnabled(True)
         if self._quit_after_stop:
             # 关窗时选了「结束并保存后退出」（CLOSE_TO_TRAY=false）：导出完成即彻底退出
             self._quit_after_stop = False
