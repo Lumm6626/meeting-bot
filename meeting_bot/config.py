@@ -69,6 +69,8 @@ class Settings:
     translate_model_fast: str = ""
     # 中文发言润色：修正同音错字、补标点（开启后中文段约 1~2 秒后原地替换为整理版）
     polish_zh: bool = True
+    # 识别自动学习：会后从逐字稿挖掘术语注入识别提示词（全自动，本地存储）
+    auto_terms: bool = True
     # 云端识别（Groq）：模型 / 语言提示（空=自动检测）/ 领域词表提示
     groq_asr_model: str = "whisper-large-v3"
     asr_language: str = ""
@@ -259,6 +261,7 @@ def load_settings(env_path: Path | None = None) -> Settings:
         translate_context_segments=int(os.getenv("TRANSLATE_CONTEXT_SEGMENTS") or 2),
         translate_model_fast=(os.getenv("TRANSLATE_MODEL_FAST") or "").strip(),
         polish_zh=(os.getenv("POLISH_ZH") or "true").strip().lower() not in ("false", "0", "no", "off"),
+        auto_terms=(os.getenv("AUTO_TERMS") or "true").strip().lower() not in ("false", "0", "no", "off"),
         groq_asr_model=(os.getenv("GROQ_ASR_MODEL") or "whisper-large-v3").strip(),
         asr_language=(os.getenv("ASR_LANGUAGE") or "").strip(),
         asr_prompt=(os.getenv("ASR_PROMPT") or "").strip(),

@@ -672,6 +672,31 @@ class Recorder:
         except Exception as e:      # 落盘失败不能影响字幕/纪要
             self._say(f"[警告] 译文落盘失败：{e}")
 
+    # ------------------------------------------------------------------
+    # 识别自动学习：纠错表（原始识别 vs 润色后 的差异 → 多次确认 → 自动替换）
+    # ------------------------------------------------------------------
+
+    def _apply_learned_corrections(self, text: str) -> str:
+        """对识别原文应用纠错表（≥2 次确认的规则），零成本。"""
+        table = getattr(self._settings, "_correction_table", None)
+        if table is None or not text:
+            return text
+        try:
+            return table.apply(text)
+        except Exception:
+            return text
+
+    def _learn_corrections(self, raw: str, polished: str) -> None:
+        """把本句的「识别 vs 润色」差异学进纠错表（达到 2 次确认才生效）。"""
+        table = getattr(self._settings, "_correction_table", None)
+        if table is None:
+            return
+        try:
+            if table.learn_from_diff(raw, polished):
+                table.save()
+        except Exception:
+            pass
+
     def _polish_on(self) -> bool:
         """中文润色开关（POLISH_ZH，默认开）。"""
         return bool(getattr(self._settings, "polish_zh", True))
@@ -739,15 +764,19 @@ class Recorder:
                     if seg.lang == "zh":
                         # 中文段：原文即刻上屏（不做任何等待），随后若开启润色，
                         # 用 LLM 整理（纠同音错字/补标点）后**原位替换**。
-                        raw = seg.text
-                        seg.translation = raw
+                        raw = self._apply_learned_corrections(seg.text)
+                        if raw != seg.text:
+                            seg.text = raw        # 已确认的纠错直接修正识别原文
+                        seg.translation = seg.text
                         self._notify_update(seg)
                         self._persist_translation(seg)
                         if self._polish_on():
                             try:
                                 polished = self._translator.polish(
-                                    raw, context=self._recent_context(seg))
-                                if polished and polished.strip() != raw.strip():
+                                    seg.text, context=self._recent_context(seg))
+                                if polished and polished.strip() != seg.text.strip():
+                                    # 学习：从「识别原文 vs 润色后」差异里抽纠错候选
+                                    self._learn_corrections(seg.text, polished.strip())
                                     seg.translation = polished.strip()
                                     self._notify_update(seg)
                                     self._persist_translation(seg)

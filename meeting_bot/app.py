@@ -129,6 +129,34 @@ def probe_groq(api_key: str, timeout: float = 6.0) -> tuple[str, str, bool]:
                 "请检查网络或代理；当前回退本地识别（延迟 30~55 秒）。", True)
 
 
+MINING_PROMPT = """你是会议术语挖掘助手。从下面的会议逐字稿中，提取可能影响语音识别
+准确率的术语：产品名、公司/客户名、人名、行业缩写、专有名词。
+要求：1) 每个术语一行，只输出术语本身，不要编号/解释/空行；2) 2~16 个字符；
+3) 中英文都行（英文缩写保留原样）；4) 宁缺毋滥，没有就输出空。
+逐字稿：
+{transcript}"""
+
+
+def mine_terms(translator, transcript_md: str) -> list[str]:
+    """LLM 读逐字稿 → 术语列表（已去重、清洗）。任何失败返回 []。"""
+    from .translator import TranslationError
+    try:
+        raw = translator._chat([
+            {"role": "system", "content": "你是会议术语挖掘助手，只输出术语列表。"},
+            {"role": "user", "content": MINING_PROMPT.format(
+                transcript=transcript_md[-12000:])},
+        ], max_tokens=600)
+    except (TranslationError, Exception):
+        return []
+    seen, out = set(), []
+    for line in raw.splitlines():
+        term = line.strip().strip("-·*1234567890. )(")
+        if 2 <= len(term) <= 16 and term not in seen:
+            seen.add(term)
+            out.append(term)
+    return out[:50]
+
+
 def app_icon() -> QIcon:
     """应用图标：窗口与桌面快捷方式共用 assets/app.ico。"""
     return QIcon(str(PROJECT_ROOT / "assets" / "app.ico"))
@@ -613,6 +641,13 @@ class MainWindow(QMainWindow):
         cloud_row.addWidget(self.recheck_btn, 0, Qt.AlignmentFlag.AlignTop)
         lay.addLayout(cloud_row)
 
+        self.speaker_hint = QLabel(
+            "说话人命名：会议结束后点「标注说话人」→ 这里会出现 SPEAKER_00/01 →\n"
+            "双击「名字」列输入姓名即可（整场回填 + 存入声纹库，下次自动认人）")
+        self.speaker_hint.setObjectName("footer_hint")
+        self.speaker_hint.setWordWrap(True)
+        lay.addWidget(self.speaker_hint)
+
         self.speaker_table = QTableWidget(0, 2)
         self.speaker_table.setHorizontalHeaderLabels(["声纹标签", "名字"])
         self.speaker_table.setAlternatingRowColors(True)
@@ -845,6 +880,52 @@ class MainWindow(QMainWindow):
     # 云端识别自检（Groq）：启动时探测，结果常驻界面提示条
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 术语自动学习：会后挖掘 + 会前注入
+    # ------------------------------------------------------------------
+
+    def _glossary(self):
+        """惰性创建术语库（首次访问才读文件）。"""
+        lib = getattr(self, "_glossary_lib", None)
+        if lib is None:
+            from .glossary import GlossaryLibrary
+            lib = GlossaryLibrary()
+            self._glossary_lib = lib
+        return lib
+
+    def _auto_terms_text(self) -> str:
+        """术语库 top N 拼成提示词片段（自动学习那部分；空库返回空串）。"""
+        try:
+            top = self._glossary().top(30)
+        except Exception:
+            return ""
+        return "，".join(top)
+
+    def _mine_terms_after_meeting(self, store, title: str) -> None:
+        """会后后台挖掘术语：LLM 读逐字稿 → 候选术语 → 计入术语库（自动学习）。"""
+        if not getattr(self.settings, "auto_terms", True):
+            return
+        translator = None
+        session = getattr(self, "_last_session", None)
+        if session is not None:
+            translator = session.get("translator")
+        if translator is None:
+            return
+        md = store.to_markdown(title, datetime.now())
+
+        def work():
+            try:
+                candidates = mine_terms(translator, md)
+                lib = self._glossary()
+                lib.add_many(candidates)
+                if lib.save() and candidates:
+                    self.bridge.status.emit(
+                        f"术语库已自动更新（+{len(candidates)} 个候选术语，下次会议自动启用）")
+            except Exception:
+                pass          # 学习失败不影响任何主流程
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _enable_label_for_last_recording(self) -> None:
         """启动时若发现上一场录音还没标注，启用「标注说话人」按钮。"""
         try:
@@ -1016,6 +1097,14 @@ class MainWindow(QMainWindow):
         terms = self.terms_input.text()
         base_prompt = getattr(self.settings, "asr_prompt", "") or ""
         merged_prompt = merge_asr_prompt(base_prompt, terms)
+        if getattr(self.settings, "auto_terms", True):
+            merged_prompt = merge_asr_prompt(merged_prompt, self._auto_terms_text())
+        # 纠错表挂到本场配置上（Recorder 的 _apply_learned_corrections 从这取）
+        from .glossary import CorrectionTable
+        try:
+            setattr(run_settings, "_correction_table", CorrectionTable())
+        except Exception:
+            pass
         run_settings = self.settings
         if merged_prompt != base_prompt:
             run_settings = dataclasses.replace(self.settings, asr_prompt=merged_prompt)
@@ -1100,6 +1189,10 @@ class MainWindow(QMainWindow):
         self.status.setText(msg)
 
     def _refresh_speakers(self):
+        # 命名指引：有标签就隐藏，没有就显示（放在最前，不受后面提前返回影响）
+        if getattr(self, "speaker_hint", None) is not None:
+            self.speaker_hint.setVisible(
+                not self.recorder or not self.recorder.store.speakers())
         if not self.recorder:
             return
         # 用户正在单元格里打字时跳过本轮：重设 item 会把编辑框文本清空（实测
@@ -1175,6 +1268,12 @@ class MainWindow(QMainWindow):
                     f"已生成：\n逐字稿：{transcript_path}\n纪要：{minutes_path}")
             except Exception as e:
                 self.bridge.finished.emit(False, f"导出失败：{e}")
+                return
+            # 会后自动学习：从逐字稿挖掘术语（后台线程，不影响任何流程）
+            try:
+                self._mine_terms_after_meeting(recorder.store, title)
+            except Exception:
+                pass
                 return        # 初版产物都没出：不再做会后标注（改不了产物）
             # 初版产物已落盘 → 再起后台线程补说话人（失败只告警，产物保持原样）
             self._maybe_offline_diarize(recorder, title, started_at)

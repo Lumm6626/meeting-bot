@@ -2070,3 +2070,37 @@ def test_label_num_speakers_passed_to_diarizer(win, monkeypatch):
     win._label_worker(wav, win._last_session["store"], "测试", __import__("datetime").datetime.now(), 3, None)
     assert calls["num"] == 3
     assert win._last_session["store"].segments()[0].speaker == "SPEAKER_00"
+
+
+def test_speaker_hint_visibility_tracks_labels(win):
+    """表格为空时显示「说话人命名」指引；有标签后隐藏。"""
+    assert not win.speaker_hint.isHidden()
+    from meeting_bot.transcript import TranscriptStore
+    win.recorder = type("R", (), {
+        "store": TranscriptStore(),
+        "started_at": None,
+        "title": "",
+    })()
+    win.recorder.store.register_label("SPEAKER_00")
+    win._refresh_speakers()
+    assert win.speaker_hint.isHidden()
+
+
+def test_auto_terms_injected_into_prompt(monkeypatch, qapp, tmp_path):
+    """AUTO_TERMS 开启时：术语库 top 词自动拼进本场 asr_prompt。"""
+    from meeting_bot.glossary import GlossaryLibrary
+    lib = GlossaryLibrary(tmp_path / "术语库.json")
+    lib.add_many(["过敏门诊", "复合药房"])
+    lib.save()
+
+    made = _install_fake_stack(monkeypatch)
+    monkeypatch.setattr(appmod.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(appmod.QMessageBox, "critical", lambda *a, **k: None)
+    w = _make_win(qapp, tmp_path, "speaker")
+    w._glossary_lib = lib
+    w._start()
+    assert _pump_until(qapp, lambda: bool(made["recorder"]) and w.recorder is not None,
+                       timeout=20.0)
+    rec_settings = made["recorder"][0].settings
+    assert "过敏门诊" in rec_settings.asr_prompt
+    assert "复合药房" in rec_settings.asr_prompt
