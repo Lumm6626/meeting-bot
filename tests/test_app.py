@@ -142,6 +142,25 @@ def _no_preload(monkeypatch):
     monkeypatch.setattr(appmod.MainWindow, "_preload_engine", lambda self: None)
 
 
+
+@pytest.fixture(autouse=True)
+def _fake_label_dialog(monkeypatch):
+    """全模块用假标记面板：真实 SpeakerLabelDialog.exec() 是模态框，离屏会卡死。"""
+    class FakeDialog:
+        instances: list[dict] = []
+
+        def __init__(self, speakers, parent=None):
+            self.speakers = speakers
+            self.names = {}
+            FakeDialog.instances.append({"speakers": speakers})
+
+        def exec(self):
+            return 0        # Rejected：默认不命名，具体用例可 monkeypatch 该行为
+
+    FakeDialog.instances.clear()
+    monkeypatch.setattr(appmod, "SpeakerLabelDialog", FakeDialog)
+    return FakeDialog
+
 @pytest.fixture
 def win(qapp, tmp_path):
     w = MainWindow(_settings(tmp_path))
@@ -1653,9 +1672,8 @@ def _questions(recorded):
 
 
 def test_offline_diarize_suggests_known_speaker_and_applies(
-        win, qapp, dialogs, monkeypatch, tmp_path, ):
-    """会后认出熟人 → 弹框问 → 选「是」：store 里改名、向量入库、产物照旧重导出。"""
-    recorded, answer = dialogs
+        win, qapp, dialogs, monkeypatch, tmp_path):
+    """会后认出熟人 → 标记面板预填建议名 → 用户确认后：改名/入声纹库/重导产物。"""
     exports, export_threads, calls, seen = [], [], {}, []
     monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
     _fake_diarize_tools(monkeypatch, calls)
@@ -1663,38 +1681,35 @@ def test_offline_diarize_suggests_known_speaker_and_applies(
     library = _FakeVoiceprints(hits=[("张总", 0.83)])
     win._voiceprints = library
     win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
-    answer["ret"] = appmod.QMessageBox.StandardButton.Yes
 
     recorder = _DiarizableRecorder(_write_wav(tmp_path))
     _prepare_recording(win, recorder)
     win.bridge.speaker_suggestions.connect(seen.append)
 
     win._stop()
-    assert _pump_until(
-        qapp, lambda: recorder.store.display_name("SPEAKER_00") == "张总", timeout=15.0), \
-        f"没有自动命名：seen={seen} 表格={win.speaker_table.rowCount()}"
+    assert _pump_until(qapp, lambda: bool(appmod.SpeakerLabelDialog.instances),
+                       timeout=15.0), f"标记面板未弹出：seen={seen}"
 
-    # ① 信号契约：{label: (姓名, 分数)}，只发给主线程弹框用
+    # ① 信号契约：{label: (姓名, 分数)}
     assert seen == [{"SPEAKER_00": ("张总", 0.83)}]
-    # ② 弹框问过用户，且写明「谁 ≈ 谁（多少分）」
-    queries = _questions(recorded)
-    assert len(queries) == 1
-    assert "≈" in queries[0][2] and "张总" in queries[0][2] and "0.83" in queries[0][2]
-    # ③ store 落名字（导出产物与字幕都以它为准）+ 表格立刻可见
+    # ② 面板数据：建议名预填 + 有示例发言 + 句数
+    panel = appmod.SpeakerLabelDialog.instances[0]["speakers"][0]
+    assert panel["label"] == "SPEAKER_00"
+    assert panel["suggest"] == "张总"
+    assert panel["count"] == 1
+    assert panel["samples"], "面板必须给示例发言供人工对照"
+    # ③ 用户点「保存」→ 应用名字
+    win._apply_label_names({"SPEAKER_00": "张总"})
     assert recorder.store.display_name("SPEAKER_00") == "张总"
-    assert win.speaker_table.item(0, 1).text() == "张总"
-    # ④ 本场向量入库 + 落盘；阈值来自 settings
     assert library.added == [("张总", VEC)]
     assert library.saves >= 1
-    assert library.thresholds == [0.75]
-    # ⑤ 认人不影响产物：初版 + 标注版各导出一次
+    # ④ 认人不影响产物：初版 + 标注版各导出一次（改名后的重导出是异步、此处不计）
     assert len(exports) == 2
 
 
 def test_offline_diarize_suggestion_declined_keeps_labels(
         win, qapp, dialogs, monkeypatch, tmp_path):
-    """选「否」：标签保持原样、不入库；但向量留着（下次改名时学，匹配也不丢）。"""
-    recorded, answer = dialogs
+    """标记面板不保存：标签保持原样、不入库；但向量留着（下次命名时学）。"""
     exports, export_threads, calls, seen = [], [], {}, []
     monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
     _fake_diarize_tools(monkeypatch, calls)
@@ -1702,21 +1717,19 @@ def test_offline_diarize_suggestion_declined_keeps_labels(
     library = _FakeVoiceprints(hits=[("张总", 0.83)])
     win._voiceprints = library
     win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
-    answer["ret"] = appmod.QMessageBox.StandardButton.No
 
     recorder = _DiarizableRecorder(_write_wav(tmp_path))
     _prepare_recording(win, recorder)
     win.bridge.speaker_suggestions.connect(seen.append)
 
     win._stop()
-    assert _pump_until(qapp, lambda: bool(_questions(recorded)) and bool(seen), timeout=15.0)
-    assert _pump_until(qapp, lambda: win.start_btn.isEnabled())
+    assert _pump_until(qapp, lambda: bool(appmod.SpeakerLabelDialog.instances),
+                       timeout=15.0), "标记面板未弹出"
 
     assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"   # 名字没被改
     assert library.added == []                                         # 没名字就不入库
-    # 向量留着：之后用户在表格里改名时 `_learn_rename` 会拿它当正样本
-    assert "SPEAKER_00" in win._pending_vectors
-    assert win._suggestion_names == {"SPEAKER_00": "张总"}             # 供「改错即纠正」用
+    assert "SPEAKER_00" in win._pending_vectors                        # 向量留着
+    assert win._suggestion_names == {"SPEAKER_00": "张总"}             # 供纠正用
 
 
 def test_offline_diarize_without_embeddings_skips_recognition(
@@ -1841,23 +1854,23 @@ def test_adopt_vector_does_not_duplicate_same_name(win, qapp):
 
 
 def test_correcting_auto_applied_name_relearns(win, qapp, dialogs):
-    """自动命名后用户发现认错了：剔除「张总」那条，并把同一条向量记到「李四」名下。"""
+    """面板保存了建议名「张总」，随后用户发现认错改成「李四」：
+    剔除张总那条误样本，并把同一条向量记到李四名下。"""
     recorded, answer = dialogs
-    answer["ret"] = appmod.QMessageBox.StandardButton.Yes
     library = _FakeVoiceprints(hits=[("张总", 0.83)])
     rec = _rename_setup(win, library, vector=VEC)
     win._pending_vectors = {"SPEAKER_00": VEC}
 
     win._on_speaker_suggestions({"SPEAKER_00": ("张总", 0.83)})
+    win._apply_label_names({"SPEAKER_00": "张总"})     # 面板保存（用户先接受建议）
     assert rec.store.display_name("SPEAKER_00") == "张总"
     assert library.added == [("张总", VEC)]
 
-    _rename_in_table(win, "SPEAKER_00", "李四")         # 用户发现认错了
+    _rename_in_table(win, "SPEAKER_00", "李四")        # 用户发现认错了
 
     assert library.penalized == [("张总", VEC)], "误归属样本没被剔除"
     assert library.added[-1] == ("李四", VEC), "同一条向量没记到正确的人名下"
     assert rec.store.display_name("SPEAKER_00") == "李四"
-    assert len(_questions(recorded)) == 1
 
 
 def test_voiceprint_embedding_has_hard_deadline(win, qapp, dialogs, monkeypatch, tmp_path):

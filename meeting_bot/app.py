@@ -24,6 +24,7 @@ from .config import (PROJECT_ROOT, ConfigError, Settings, load_settings,
                      secrets_source)
 from .export import export_all
 from .subtitle import SubtitleWindow
+from .speaker_dialog import SpeakerLabelDialog
 from .transcript import (Journal, TranscriptStore, journal_finished, journal_meta,
                          load_journal, write_footer)
 from .translator import Translator
@@ -155,6 +156,12 @@ def mine_terms(translator, transcript_md: str) -> list[str]:
             seen.add(term)
             out.append(term)
     return out[:50]
+
+
+def _fmt_hms(seconds: float) -> str:
+    """秒 → 00:00:00（标记面板显示声纹首末时间）。"""
+    s_int = max(0, int(seconds))
+    return f"{s_int // 3600:02d}:{s_int % 3600 // 60:02d}:{s_int % 60:02d}"
 
 
 def app_icon() -> QIcon:
@@ -1529,7 +1536,7 @@ class MainWindow(QMainWindow):
         return suggestions
 
     def _on_speaker_suggestions(self, suggestions) -> None:
-        """（GUI 线程）会后声纹建议：先把已有名字的入库，再问「要不要自动命名」。"""
+        """（GUI 线程）会后声纹建议：已有名字的向量先入库，建议名留给标记面板预填。"""
         if not self._voiceprint_on():
             return
         store = getattr(getattr(self, "recorder", None), "store", None)
@@ -1543,35 +1550,77 @@ class MainWindow(QMainWindow):
                 name, score = str(value[0]), float(value[1])
             except (TypeError, IndexError, ValueError):
                 continue
-            if label in known:            # 只认当前这场会议的标签（上一场的建议一律丢弃）
+            if label in known:
                 wanted[label] = (name, score)
-        # 用户此前手动改过名的标签：本场向量直接入学（不必等这次弹框）
         changed = self._adopt_named(store)
-        if not wanted:
-            if changed:
-                self._voiceprints.save()
-            return
         self._suggestion_names.update({l: n for l, (n, _s) in wanted.items()})
-        body = chr(10).join(f"  {l} ≈ {n}（{s:.2f}）" for l, (n, s) in wanted.items())
-        ret = QMessageBox.question(
-            self, "识别到熟悉发言人",
-            f"识别到熟悉发言人：{chr(10)}{body}{chr(10)}{chr(10)}"
-            f"是否用这些名字自动命名？（点「否」保持标签，之后在表格里改名也会记住）",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if ret != QMessageBox.StandardButton.Yes:
-            if changed:
-                self._voiceprints.save()
-            return                        # 保持标签：向量留在库里，下次匹配更准
-        for label, (name, _score) in wanted.items():
-            store.set_speaker_name(label, name)     # 落 store（导出产物与字幕都以它为准）
-            changed |= self._adopt_vector(label, name)
+        if changed:
+            self._voiceprints.save()
+        # 打开标记面板：用户对照逐字稿内容自己定名字（建议名只做预填）
+        QTimer.singleShot(400, self._open_label_dialog)
+
+    # ------------------------------------------------------------------
+    # 标记面板：对照逐字稿内容给声纹起名（会议后人工标记）
+    # ------------------------------------------------------------------
+
+    def _open_label_dialog(self) -> None:
+        """打开说话人标记面板（每声纹：示例发言 + 名字输入框 + 声纹建议预填）。"""
+        store = getattr(getattr(self, "recorder", None), "store", None)
+        if store is None:
+            return
+        labels = store.speakers()
+        if not labels:
+            return
+        data: list[dict] = []
+        for sp in labels:
+            segs = [s for s in store.segments() if s.speaker == sp.label]
+            samples = []
+            for seg in segs[:3]:
+                body_text = seg.translation or seg.text
+                samples.append(f"{body_text.strip()}\n  〔原文〕 {seg.text.strip()}")
+            first = segs[0].start if segs else 0.0
+            last = segs[-1].end if segs else 0.0
+            data.append({
+                "label": sp.label,
+                "samples": samples,
+                "suggest": self._suggestion_names.get(sp.label, ""),
+                "count": len(segs),
+                "span": f"{_fmt_hms(first)} → {_fmt_hms(last)}",
+            })
+        dlg = SpeakerLabelDialog(data, parent=self)
+        if dlg.exec():
+            self._apply_label_names(dlg.names)
+
+    def _apply_label_names(self, names: dict[str, str]) -> None:
+        """面板确认：写 store → 声纹学习 → 回填字幕 → 异步重导产物。"""
+        store = getattr(getattr(self, "recorder", None), "store", None)
+        if not store or not names:
+            return
+        for label, name in names.items():
+            before = store.display_name(label)
+            store.set_speaker_name(label, name)
+            if store.display_name(label) != before:
+                self._learn_rename(label, name)
         self._sync_subtitle_names()
         refresh = getattr(self.subtitle, "refresh_names", None)
         if callable(refresh):
-            refresh()                     # 已显示的块立刻换名字
-        self._refresh_speakers()          # 表格别等 5 秒定时器
-        if changed:
-            self._voiceprints.save()
+            refresh()
+        self._refresh_speakers()
+        self._voiceprints.save()
+        self.status.setText(f"已命名 {len(names)} 位说话人，逐字稿/纪要已更新")
+        if not self.isVisible():
+            self._tray_notify("说话人已命名", f"已命名 {len(names)} 位，产物已更新")
+        # 异步重导出（带姓名）——走会话 translator，失败不打扰
+        session = getattr(self, "_last_session", None)
+        if session is not None:
+            def _reexport():
+                try:
+                    export_all(store, self.settings, session.get("title") or "未命名会议",
+                               getattr(session.get("recorder"), "started_at", None) or datetime.now(),
+                               translator=session.get("translator"))
+                except Exception:
+                    pass
+            threading.Thread(target=_reexport, daemon=True).start()
 
     def _adopt_named(self, store) -> bool:
         """把「本场已有人名」的标签向量入库（自动应用 / 用户先前手动改名都算）。"""
