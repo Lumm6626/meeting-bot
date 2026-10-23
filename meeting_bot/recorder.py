@@ -361,7 +361,7 @@ class Recorder:
     def _main_loop(self) -> None:
         # VAD 断句阈值可配（VAD_SILENCE_MS，默认 320ms）：越短出字幕越快，
         # 但句中长停顿会被切成两句 → 帧数 = 毫秒 / 32（512 样本 @16k）
-        silence_frames = max(3, int(getattr(self._settings, "vad_silence_ms", 320) or 320) // 32)
+        silence_frames = max(3, int(getattr(self._settings, "vad_silence_ms", 480) or 480) // 32)
         buf = UtteranceBuffer(min_silence_frames=silence_frames)
         self._open_audio_sink()      # 录音落盘：finally 里统一关盘
         try:
@@ -672,6 +672,10 @@ class Recorder:
         except Exception as e:      # 落盘失败不能影响字幕/纪要
             self._say(f"[警告] 译文落盘失败：{e}")
 
+    def _polish_on(self) -> bool:
+        """中文润色开关（POLISH_ZH，默认开）。"""
+        return bool(getattr(self._settings, "polish_zh", True))
+
     def _stream_translate(self, seg: Segment) -> None:
         """流式翻译一条语句：译文逐字上屏，节流刷新，末次必刷。
 
@@ -733,11 +737,24 @@ class Recorder:
                     continue
                 try:
                     if seg.lang == "zh":
-                        seg.translation = seg.text
-                        # 中文段无需翻译：一次通知即完成第二阶段（没有流可节流）
-                        if seg.translation:
-                            self._notify_update(seg)
-                            self._persist_translation(seg)
+                        # 中文段：原文即刻上屏（不做任何等待），随后若开启润色，
+                        # 用 LLM 整理（纠同音错字/补标点）后**原位替换**。
+                        raw = seg.text
+                        seg.translation = raw
+                        self._notify_update(seg)
+                        self._persist_translation(seg)
+                        if self._polish_on():
+                            try:
+                                polished = self._translator.polish(
+                                    raw, context=self._recent_context(seg))
+                                if polished and polished.strip() != raw.strip():
+                                    seg.translation = polished.strip()
+                                    self._notify_update(seg)
+                                    self._persist_translation(seg)
+                            except TranslationError:
+                                pass          # 润色失败：保留原始识别文本
+                            except Exception:
+                                pass
                     else:
                         # 非中文段走流式：译文逐字上屏（_stream_translate 内部负责
                         # 节流刷新、末次必刷、流中断时把半句回退成原文）

@@ -47,6 +47,14 @@ class MinutesResult:
     open_questions: list[str] = field(default_factory=list)
 
 
+SYSTEM_POLISH = (
+    "你是中文会议转写整理器。输入是语音识别的中文口语文本，可能有同音错别字、"
+    "缺标点、重复和口头禅。任务：整理成通顺、带标点的简体中文。"
+    "要求：1) 只输出整理后的正文，不要解释；2) 修正明显的同音/近音错别字"
+    "（结合上文语境），不确定的保持原样；3) 补全标点、去掉无意义重复与语气词；"
+    "4) 不得增删事实、数字、人名、产品名；5) 中英夹杂的英文术语保留原文。"
+)
+
 SYSTEM_TRANSLATE = (
     "你是会议实时翻译引擎。把用户发言翻译成简体中文。"
     "语境：医疗/商务会议口语。"
@@ -208,6 +216,17 @@ class Translator:
         messages = [
             {"role": "system", "content": SYSTEM_TRANSLATE},
             {"role": "user", "content": build_user_message(text, lang, context)},
+        ]
+        return self._chat(messages, max_tokens=512)
+
+    def polish(self, text: str, context: str = "") -> str:
+        """中文润色：修正识别错字、补标点、去重复（用于中文发言的字幕整理）。
+
+        走与翻译相同的接口；失败由调用方回退成原始识别文本。
+        """
+        messages = [
+            {"role": "system", "content": SYSTEM_POLISH},
+            {"role": "user", "content": build_user_message(text, "zh", context)},
         ]
         return self._chat(messages, max_tokens=512)
 

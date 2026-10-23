@@ -9,7 +9,7 @@ from silero_vad import load_silero_vad
 SAMPLE_RATE = 16000
 FRAME = 512                      # silero 单帧样本数 @16k
 MIN_SPEECH_FRAMES = 10           # ~0.32s 起算一句
-MIN_SILENCE_FRAMES = 10          # ~0.32s 静音断句（帧=512样本@16k≈32ms）
+MIN_SILENCE_FRAMES = 15          # ~0.48s 静音断句（帧=512样本@16k≈32ms）
                                  # 从 15 帧(0.48s)降到 10 帧(0.32s)：更快出字幕，
                                  # 代价是句中停顿较久时可能被切成两句（可用 VAD_SILENCE_MS 调回）
 MAX_UTTERANCE_FRAMES = 600       # 最长 19s 强制断句

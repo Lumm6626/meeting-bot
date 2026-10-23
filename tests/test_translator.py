@@ -427,3 +427,20 @@ def test_minutes_unknown_template_falls_back_to_standard(monkeypatch):
     for bad in ("", None, "Action-Items", "english"):
         prompt = _minutes_prompt(monkeypatch, bad)
         assert prompt == MINUTES_PROMPT.replace("{transcript}", "# 会议逐字稿：周会\n原文：hello")
+
+
+def test_polish_uses_polish_prompt_and_returns_text(monkeypatch):
+    """中文润色走独立 system prompt（纠错字/补标点），不是翻译 prompt。"""
+    calls = []
+
+    def fake_create(self, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse("要走流程，这个不能跳过。")
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    t = Translator(_settings())
+    out = t.polish("要走流程,这个不能跳过", context="原文：先审批\n译文：先审批")
+    assert "要走流程" in out
+    system = calls[0]["messages"][0]["content"]
+    assert "整理" in system and "标点" in system
+    assert "翻译" not in system.split("整理器")[0] or "整理器" in system

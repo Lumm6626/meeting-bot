@@ -2834,3 +2834,43 @@ def test_recent_context_respects_configured_limit(monkeypatch):
     ctx = r._recent_context(r.store.segments()[-1])   # 最后一句是 line 4，上文取最近 2 条
     assert "line 2" in ctx and "line 3" in ctx
     assert "line 0" not in ctx and "line 1" not in ctx
+
+
+def test_zh_segment_polished_and_updated_in_place(monkeypatch):
+    """中文段：原文先上屏，润色后原位替换（面板收到两次更新，最终是整理版）。"""
+    class _ASRZh:
+        def transcribe(self, audio, sample_rate=16000):
+            from meeting_bot.transcript import Segment
+            return [Segment(0.0, 2.0, "要走流程,这个不能跳过", lang="zh")]
+
+    class _Tr:
+        def __init__(self):
+            self.polish_calls = 0
+
+        def polish(self, text, context=""):
+            self.polish_calls += 1
+            return "要走流程，这个不能跳过。"
+
+        def translate(self, text, lang="", context=""):
+            return "x"
+
+    tr = _Tr()
+    monkeypatch.setattr("meeting_bot.recorder.UtteranceBuffer",
+                        lambda *a, **k: FakeVAD())
+    monkeypatch.setattr("meeting_bot.recorder.ASR_BATCH_SECONDS", 0.01)
+    updates = []
+    r = Recorder(_settings(), capture=FakeCapture(chunks=1), asr=_ASRZh(),
+                 translator=tr, diarizer=None)
+    r.on_update(updates.append)
+    r.on_status(lambda m: None)
+    r.start("中文润色")
+    try:
+        assert _wait_until(lambda: r.store.segments() and
+                           r.store.segments()[0].translation.endswith("。"), timeout=10)
+    finally:
+        r.stop()
+    seg = r.store.segments()[0]
+    assert tr.polish_calls >= 1
+    assert seg.text == "要走流程,这个不能跳过"          # 原文保留
+    assert seg.translation == "要走流程，这个不能跳过。"  # 润色版进译文
+    assert len(updates) >= 2                            # 原文一次 + 润色一次

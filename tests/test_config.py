@@ -512,7 +512,7 @@ def test_latency_tuning_defaults_and_overrides(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("OPENCODE_API_KEY=sk-test123\n", encoding="utf-8")
     s = load_settings(env)
-    assert s.vad_silence_ms == 320
+    assert s.vad_silence_ms == 480   # 中文长句更友好（可配）
     assert s.translate_context_segments == 2
     assert s.translate_model_fast == ""
 

@@ -64,9 +64,11 @@ class Settings:
     # （DIARIZE_ENABLED=false）。能力保留：置 true 即恢复实时标注。
     diarize_enabled: bool = True
     # 延迟调优：VAD 断句静音阈值（毫秒）/ 翻译上文参考条数 / 字幕专用快速模型
-    vad_silence_ms: int = 320
+    vad_silence_ms: int = 480
     translate_context_segments: int = 2
     translate_model_fast: str = ""
+    # 中文发言润色：修正同音错字、补标点（开启后中文段约 1~2 秒后原地替换为整理版）
+    polish_zh: bool = True
     # 云端识别（Groq）：模型 / 语言提示（空=自动检测）/ 领域词表提示
     groq_asr_model: str = "whisper-large-v3"
     asr_language: str = ""
@@ -253,9 +255,10 @@ def load_settings(env_path: Path | None = None) -> Settings:
         asr_batch_seconds=_float_env("ASR_BATCH_SECONDS"),
         asr_batch_max_wait=_float_env("ASR_BATCH_MAX_WAIT"),
         diarize_enabled=(os.getenv("DIARIZE_ENABLED") or "true").strip().lower() not in ("false", "0", "no", "off"),
-        vad_silence_ms=int(os.getenv("VAD_SILENCE_MS") or 320),
+        vad_silence_ms=int(os.getenv("VAD_SILENCE_MS") or 480),
         translate_context_segments=int(os.getenv("TRANSLATE_CONTEXT_SEGMENTS") or 2),
         translate_model_fast=(os.getenv("TRANSLATE_MODEL_FAST") or "").strip(),
+        polish_zh=(os.getenv("POLISH_ZH") or "true").strip().lower() not in ("false", "0", "no", "off"),
         groq_asr_model=(os.getenv("GROQ_ASR_MODEL") or "whisper-large-v3").strip(),
         asr_language=(os.getenv("ASR_LANGUAGE") or "").strip(),
         asr_prompt=(os.getenv("ASR_PROMPT") or "").strip(),
