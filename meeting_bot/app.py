@@ -1439,7 +1439,8 @@ class MainWindow(QMainWindow):
         known = [sp.name or sp.label for sp in store.speakers()]
         # 已有名字也当候选；再补上「发言人1..3」方便快速点选
         known = [n for n in dict.fromkeys(known) if n]
-        dlg = SegmentLabelDialog(segs, known_names=known, parent=self)
+        dlg = SegmentLabelDialog(segs, known_names=known, parent=self,
+                                 display_resolver=store.display_name)
         if not dlg.exec():
             return
         self._apply_manual_speakers(store, dlg.assignments)

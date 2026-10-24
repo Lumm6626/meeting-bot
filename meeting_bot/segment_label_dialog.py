@@ -23,12 +23,13 @@ class SegmentLabelDialog(QDialog):
     返回值 ``self.assignments``：dict[seq -> 名字]（只含用户改动过的行）
     """
 
-    def __init__(self, segments, known_names=(), parent=None):
+    def __init__(self, segments, known_names=(), parent=None, display_resolver=None):
         super().__init__(parent)
         self.setWindowTitle("标注发言人（按逐字稿）")
         self.resize(980, 720)
-        self._segments = list(segments)
+        self._segments = sorted(segments, key=lambda x: (x.start, x.seq))
         self._names = [n for n in dict.fromkeys(known_names) if n]
+        self._display = display_resolver or (lambda label: label or "发言人?")
         self.assignments: dict[int, str] = {}
 
         root = QVBoxLayout(self)
@@ -58,7 +59,8 @@ class SegmentLabelDialog(QDialog):
         root.addLayout(bar)
 
         self.table = QTableWidget(len(self._segments), 4)
-        self.table.setHorizontalHeaderLabels(["时间", "发言人", "译文", "原文"])
+        # 顺序与导出的逐字稿一致：原文在前、译文在后
+        self.table.setHorizontalHeaderLabels(["时间", "发言人", "原文", "译文"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.verticalHeader().setVisible(False)
@@ -78,11 +80,14 @@ class SegmentLabelDialog(QDialog):
             combo.setEditable(True)
             combo.addItems(self._names)
             current = seg.speaker or ""
-            combo.setCurrentText(current)
+            # 未命名时显示「发言人A/B」（与逐字稿一致），而不是内部标签 SPEAKER_00
+            combo.setCurrentText(self._display(current) if current else "")
             self.table.setCellWidget(row, 1, combo)
             self._combos[seg.seq] = combo
-            self.table.setItem(row, 2, self._cell((seg.translation or seg.text or "").strip()))
-            self.table.setItem(row, 3, self._cell((seg.text or "").strip()))
+            self.table.setItem(row, 2, self._cell((seg.text or "").strip()))
+            translated = (seg.translation or "").strip()
+            self.table.setItem(row, 3,
+                               self._cell(translated if translated != (seg.text or "").strip() else ""))
             self.table.setRowHeight(row, 46)
 
         root.addWidget(self.table, 1)
@@ -129,6 +134,9 @@ class SegmentLabelDialog(QDialog):
             if combo is None:
                 continue
             name = combo.currentText().strip()
-            if name and name != (seg.speaker or ""):
-                self.assignments[seg.seq] = name
+            if not name:
+                continue
+            if name == self._display(seg.speaker or ""):
+                continue          # 没改动（仍是 发言人A / 原名）
+            self.assignments[seg.seq] = name
         self.accept()
