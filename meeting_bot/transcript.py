@@ -28,8 +28,16 @@ _END_PUNCT = "。！？；：，、….!?;:,"
 _CJK_CHAR = re.compile(r"[一-鿿]")
 
 
+def _last_word_char(text: str) -> str:
+    """取末尾最后一个「字/字母/数字」（跳过标点空白），用来判断中文还是英文语境。"""
+    for ch in reversed(text):
+        if ch.isalnum():
+            return ch
+    return ""
+
+
 def join_sentences(parts: list[str], *, sep_empty: str = "，") -> str:
-    """把同一发言人的多句拼成一段：句间无标点时补 ``，``（中文）/空格（英文）。"""
+    """把同一发言人的多句拼成一段（中文补「，」，英文补空格，避免单词/句子粘连）。"""
     out = ""
     for raw in parts:
         piece = (raw or "").strip()
@@ -38,10 +46,16 @@ def join_sentences(parts: list[str], *, sep_empty: str = "，") -> str:
         if not out:
             out = piece
             continue
-        if out[-1] in _END_PUNCT or piece[0] in _END_PUNCT:
-            out += piece
-        elif _CJK_CHAR.search(out[-1]) or _CJK_CHAR.search(piece[0]):
-            out += "，" + piece
+        prev_char = out[-1]
+        next_char = piece[0]
+        cjk_context = bool(_CJK_CHAR.match(_last_word_char(out))
+                           or _CJK_CHAR.match(next_char))
+        if prev_char in "。！？；：，、…":
+            out += piece                      # 中文句末/句中标点：直接相接
+        elif prev_char in ".!?;:,":
+            out += ("" if cjk_context else " ") + piece
+        elif cjk_context:
+            out += sep_empty + piece
         else:
             out += " " + piece
     return out
@@ -276,22 +290,21 @@ def load_journal(path: Path | str, attach_journal: bool = False) ->         tupl
 
 
 def _flush_turn(lines: list[str], segs: list[Segment], store) -> None:
-    """输出一个发言回合：发言人 + 起始时间 + 合并成段的正文（译文优先）。"""
+    """输出一个发言回合（Teams 转录样式）：发言人 + 时间 → 原文在前、译文在后。"""
     label = segs[0].speaker or ""
     speaker = store.display_name(label)
     lines.append(f"**{speaker}**　{fmt_ts(segs[0].start)}")
-    zh = join_sentences([s.translation or s.text for s in segs])
-    if zh:
-        lines.append(zh)
+
+    # 原文（多句合并成一段，句间自动补标点）
+    original = join_sentences([s.text for s in segs])
+    lines.append(original)
     lines.append("")
-    # 原文（外语）另起一段灰色引用，便于核对；纯中文时省略避免重复
-    orig_parts = [s.text for s in segs if (s.translation or "").strip()
-                  and s.translation.strip() != s.text.strip()]
-    if orig_parts:
-        orig = join_sentences(orig_parts)
-        if orig and orig != zh:
-            lines.append("> " + orig.replace(chr(10), chr(10) + "> "))
-            lines.append("")
+
+    # 译文：与原文不同时才单独给一行（纯中文发言不重复）
+    translated = join_sentences([s.translation for s in segs if (s.translation or "").strip()])
+    if translated and translated.strip() != original.strip():
+        lines.append(f"> 译文：{translated}")
+        lines.append("")
 
 
 class TranscriptStore:
