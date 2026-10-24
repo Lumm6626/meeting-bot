@@ -87,7 +87,7 @@ def map_local_labels(prev_labeled: list[tuple[float, float, str]],
 
 
 class Recorder:
-    def __init__(self, settings: Settings,
+    def __init__(self, settings: Settings, session_id: str = "",
                  capture: AudioCapture | None = None,
                  asr: ASREngine | None = None,
                  translator: Translator | None = None,
@@ -107,6 +107,7 @@ class Recorder:
         默认自建一个无日志的 store，保持既有行为。
         """
         self._settings = settings
+        self._session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
         self._audio_source = audio_source
         # 云端识别（groq）：每条语句到达即识别（不再攒批），getattr 兜住旧构造的 Settings
         self._asr_provider = (getattr(settings, "asr_provider", "local") or "local").strip().lower()
@@ -302,7 +303,7 @@ class Recorder:
         try:
             directory = Path(out) / AUDIO_SINK_DIR
             directory.mkdir(parents=True, exist_ok=True)
-            path = directory / f"rec_{datetime.now():%Y%m%d_%H%M%S}.wav"
+            path = directory / f"rec_{self._session_id}.wav"
             self._audio_sink = sf.SoundFile(
                 str(path), mode="w", samplerate=AUDIO_SINK_SAMPLE_RATE,
                 channels=1, subtype="PCM_16")

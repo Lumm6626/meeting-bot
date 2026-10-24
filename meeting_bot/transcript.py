@@ -80,17 +80,21 @@ class Journal:
     """
 
     def __init__(self, path: Path | str, title: str = "",
-                 started_at: datetime | None = None) -> None:
+                 started_at: datetime | None = None, append: bool = False) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()     # 识别/翻译/标注/UI 四个线程都会写
-        self._fp = self.path.open("w", encoding="utf-8", newline="\n")
+        self._append = bool(append) and self.path.is_file()
+        self._fp = self.path.open("a" if self._append else "w",
+                                  encoding="utf-8", newline="\n")
         self._closed = False
         self._finished = False
         # 写失败的「最近一次异常」：日志是防丢的安全网，不能反过来把录制搞崩
         self.error: Exception | None = None
-        self._write({"t": HEADER, "title": title,
-                     "started_at": (started_at or datetime.now()).isoformat(timespec="seconds")})
+        if not self._append:
+            # 追加模式不重写 header（沿用原日志开头，避免双 header）
+            self._write({"t": HEADER, "title": title,
+                         "started_at": (started_at or datetime.now()).isoformat(timespec="seconds")})
 
     def _write(self, obj: dict) -> None:
         with self._lock:
@@ -184,18 +188,24 @@ def write_footer(path: Path | str) -> None:
         _write_jsonl_line(fp, {"t": FOOTER})
 
 
-def load_journal(path: Path | str) -> tuple[str, datetime, "TranscriptStore"]:
+def load_journal(path: Path | str, attach_journal: bool = False) ->         tuple[str, datetime, "TranscriptStore"]:
     """回放日志重建 store，返回 (标题, 开始时间, store)。
 
     - 坏行逐行跳过（崩溃时半行 JSON 是预期内的）；
     - 缺 header 抛 ``ValueError``（不是本程序写的日志 / 文件被截断到开头都没有）；
-    - 回放出的 store 不挂 journal（避免把回放动作再写一遍）。
+    - ``attach_journal=False`` 时不挂 journal（避免把回放动作再写一遍）；
+      ``attach_journal=True`` 时以追加模式挂回原日志——之后的改名等事件会写回
+      该文件（用于「对历史会议补标记发言人」）。
     """
     title: str | None = None
     started_at: datetime | None = None
-    store = TranscriptStore()
+    store = TranscriptStore(journal=Journal(path, append=True)
+                            if attach_journal else None)
+    # 先把行全部读进来再回放：挂日志（追加模式）会在回放 update/speaker 事件时
+    # 往同一文件追加新行，若边读边写会把刚追加的行再读回来 → 无限循环（实测卡死）
     with Path(path).open("r", encoding="utf-8") as fp:
-        for line in fp:
+        lines = fp.readlines()
+    for line in lines:
             ev = _parse_line(line)
             if ev is None:
                 continue                      # 坏行 / 空行：跳过继续

@@ -939,8 +939,9 @@ def _install_fake_stack(monkeypatch):
         made["capture"].append(cap)
         return cap
 
-    def _recorder_factory(settings, capture=None, asr=None, translator=None,
-                          diarizer=None, audio_source=None, store=None):
+    def _recorder_factory(settings, session_id=None, capture=None, asr=None,
+                          translator=None, diarizer=None, audio_source=None,
+                          store=None):
         rec = _FakeStartedRecorder(settings, capture=capture, audio_source=audio_source)
         made["recorder"].append(rec)
         return rec
@@ -2042,6 +2043,7 @@ def test_find_last_recording_picks_latest_wav(tmp_path):
     class _W:
         settings = _S()
         _recording_dir = MainWindow._recording_dir
+        _pair_journal = MainWindow._pair_journal
 
     found = MainWindow._find_last_recording(_W())
     assert found is not None and found[0].name == "rec_new.wav"

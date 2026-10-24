@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayou
 from .capture import AudioCapture, CaptureError
 from .config import (PROJECT_ROOT, ConfigError, Settings, load_settings,
                      secrets_source)
-from .export import export_all
+from .export import export_all, meeting_dir, write_transcript
 from .subtitle import SubtitleWindow
 from .speaker_dialog import SpeakerLabelDialog
 from .transcript import (Journal, TranscriptStore, journal_finished, journal_meta,
@@ -855,14 +855,14 @@ class MainWindow(QMainWindow):
         """录制工作区：``<output_dir>/.recording/``（隐藏目录，已加进 .gitignore）。"""
         return Path(self.settings.output_dir) / RECORDING_DIR
 
-    def _new_journal_store(self, title: str) -> TranscriptStore:
+    def _new_journal_store(self, title: str, session_id: str) -> TranscriptStore:
         """为本场录制新建「带日志的 store」。
 
         日志建不出来（磁盘只读 / 权限 / 目录异常）不得阻断录制：降级成无日志的
         store 照常录，只是丧失崩溃恢复能力（状态栏告警一次）。
         """
         try:
-            path = self._recording_dir() / f"rec_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+            path = self._recording_dir() / f"rec_{session_id}.jsonl"
             return TranscriptStore(journal=Journal(path, title=title or "未命名会议"))
         except OSError as e:
             self.bridge.status.emit(f"[警告] 无法创建录制日志（本次不支持崩溃恢复）：{e}")
@@ -1132,9 +1132,11 @@ class MainWindow(QMainWindow):
                     # Qt 槽内异常外冒会直接终止进程（qFatal），不能让它冒出去。
                     self._warn_diarizer_unavailable(e)
             try:
-                store = self._new_journal_store(title)
+                session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                store = self._new_journal_store(title, session_id)
                 self.recorder = Recorder(
-                    run_settings, capture=capture, translator=translator,
+                    run_settings, session_id=session_id, capture=capture,
+                    translator=translator,
                     diarizer=diarizer,
                     audio_source=getattr(run_settings, "audio_source", "both"),
                     store=store)
@@ -1337,8 +1339,8 @@ class MainWindow(QMainWindow):
         except OSError:
             return None
         for wav in wavs:
-            journal = wav.with_suffix(".jsonl")
-            if not journal.is_file():
+            journal = self._pair_journal(wav)
+            if journal is None:
                 continue
             try:
                 if any('"t": "add"' in line or '"t":"add"' in line
@@ -1349,7 +1351,11 @@ class MainWindow(QMainWindow):
         return None
 
     def _label_speakers(self) -> None:
-        """按钮/托盘入口：提问人数 → 后台重跑标注（幂等，可反复执行）。"""
+        """按钮/托盘入口：本场会话优先；否则从「已生成的会议记录」里选一场补标记。
+
+        历史场次分两种情况：没有声纹标签 → 先重跑标注；已有标签 → 直接打开
+        标记面板改名字（不再重跑、不覆盖已有名字以外的内容）。
+        """
         session = getattr(self, "_last_session", None)
         audio_guess = getattr(session.get("recorder"), "audio_path", None) if session else None
         if audio_guess and Path(audio_guess).is_file():
@@ -1357,29 +1363,119 @@ class MainWindow(QMainWindow):
             audio_path, store = Path(audio_guess), session["store"]
             title = session.get("title") or getattr(recorder, "title", "") or "未命名会议"
             started_at = getattr(recorder, "started_at", None) or datetime.now()
-        else:
-            found = self._find_last_recording()
-            if not found:
-                self.status.setText("没有可标注的录音（需要先录一场会议）")
+            num = self._ask_speaker_count()
+            if num is None:
                 return
-            wav, journal = found
-            try:
-                title, started_at, store = load_journal(journal)
-            except Exception as e:
-                self.status.setText(f"读取上次录制日志失败：{e}")
-                return
-            audio_path = wav
-        num, ok = QInputDialog.getInt(
-            self, "说话人数量", "本场有几个人说话？（0 = 自动检测）", 0, 0, 12)
+            self._run_label_job(audio_path, store, title, started_at, num,
+                                (session or {}).get("translator"))
+            return
+        # ---- 历史会议：从 .recording 里挑一场 ----
+        past = self._list_past_recordings()
+        if not past:
+            self.status.setText("没有可标注的录音（需要先录一场会议）")
+            return
+        names = [f"{p['title']} · {p['when']} · {p['segments']} 句"
+                 + (" · 已标声纹" if p["labels"] else " · 未标注") for p in past]
+        idx, ok = QInputDialog.getItem(self, "选择会议",
+                                       "选择要补标记发言人的会议：", names, 0, False)
         if not ok:
             return
+        pick = past[idx]
+        try:
+            title, started_at, store = load_journal(pick["jsonl"], attach_journal=True)
+        except Exception as e:
+            self.status.setText(f"读取会议记录失败：{e}")
+            return
+        # 本场会话上下文替换成历史场次（面板/回填/导出都吃这一份）
+        self._last_session = {"store": store, "title": title,
+                              "started_at": started_at or datetime.now(),
+                              "recorder": None, "translator": None}
+        if store.speakers():
+            # 已有标签：直接打开标记面板改名字（不重跑标注）
+            QTimer.singleShot(200, self._open_label_dialog)
+            return
+        num = self._ask_speaker_count()
+        if num is None:
+            return
+        self._run_label_job(pick["wav"], store, title, started_at or datetime.now(),
+                            num, None)
+
+    def _ask_speaker_count(self) -> int | None:
+        """提问人数（0=自动）；取消返回 None。"""
+        num, ok = QInputDialog.getInt(
+            self, "说话人数量", "本场有几个人说话？（0 = 自动检测）", 0, 0, 12)
+        return int(num) if ok else None
+
+    def _run_label_job(self, audio_path, store, title, started_at, num,
+                       translator) -> None:
         self.label_btn.setEnabled(False)
         self.label_btn.setText("标注中…")
         self.status.setText("正在标注说话人（约 0.5~1.5 倍会议时长，可关闭窗口后台继续）…")
         threading.Thread(target=self._label_worker,
                          args=(audio_path, store, title, started_at,
-                               num or None, (session or {}).get("translator")),
+                               num or None, translator),
                          daemon=True).start()
+
+    def _list_past_recordings(self) -> list[dict]:
+        """历史会议清单（有逐字稿内容的录音，按时间倒序）。"""
+        out: list[dict] = []
+        try:
+            entries = sorted(self._recording_dir().glob("rec_*.wav"),
+                             key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return out
+        for wav in entries:
+            journal = self._pair_journal(wav)
+            if journal is None:
+                continue
+            try:
+                j_title, j_started, _ = load_journal(journal)
+                n_add = sum('"t": "add"' in line or '"t":"add"' in line
+                            for line in journal.read_text(encoding="utf-8").splitlines())
+            except (OSError, ValueError):
+                continue
+            if n_add == 0:
+                continue
+            labels = 0
+            try:
+                _, _, j_store = load_journal(journal)
+                labels = len(j_store.speakers())
+            except (OSError, ValueError):
+                pass
+            if any(e["jsonl"] == journal for e in out):
+                continue                    # 同一场多段录音，只列一场
+            out.append({"wav": wav, "jsonl": journal,
+                        "title": j_title or wav.stem,
+                        "when": (j_started.strftime("%m-%d %H:%M") if j_started else ""),
+                        "segments": n_add, "labels": labels})
+        return out
+
+    def _pair_journal(self, wav: Path) -> Path | None:
+        """找 wav 配对的日志：先按同名；找不到就取 mtime 最接近的日志（5 分钟内）。
+
+        历史版本里日志与音频分别取 datetime.now()，同名会差 1 秒；而长会里 wav
+        的 mtime 是「录音结束时刻」、日志是「最后事件时刻」，两者可能差 1 分钟
+        （实测 85 分钟会议差了 60 秒）→ 取最接近者，并给 5 分钟上限防误配。
+        """
+        exact = wav.with_suffix(".jsonl")
+        if exact.is_file():
+            return exact
+        try:
+            mtime = wav.stat().st_mtime
+        except OSError:
+            return None
+        best, best_gap = None, float("inf")
+        try:
+            for j in self._recording_dir().glob("rec_*.jsonl"):
+                try:
+                    gap = abs(j.stat().st_mtime - mtime)
+                except OSError:
+                    continue
+                if gap < best_gap:
+                    best, best_gap = j, gap
+        except OSError:
+            pass
+        return best if best is not None and best_gap <= 300 else None
 
     def _label_worker(self, audio_path: Path, store, title: str,
                       started_at: datetime, num_speakers: int | None,
@@ -1462,9 +1558,19 @@ class MainWindow(QMainWindow):
         这回事，「逐字稿更新了」得让他看得见。
         """
         self.status.setText(msg)
-        if not self.isVisible():
+        try:
+            self.label_btn.setText("标注说话人")
+            self.label_btn.setEnabled(True)
+        except AttributeError:
+            pass
+        if not self.isVisible() and not getattr(self, "_quitting", False):
             self._tray_notify("说话人标注完成" if ok else "说话人标注失败",
                               _notice_line(msg))
+        if ok and not getattr(self, "_label_dialog_scheduled", False):
+            store = self._current_store()
+            if store is not None and store.speakers():
+                self._label_dialog_scheduled = True
+                QTimer.singleShot(400, self._open_label_dialog)
 
     # ------------------------------------------------------------------
     # 说话人记忆（声纹库）：会后认「熟人」+ 改名即学习
@@ -1556,16 +1662,24 @@ class MainWindow(QMainWindow):
         self._suggestion_names.update({l: n for l, (n, _s) in wanted.items()})
         if changed:
             self._voiceprints.save()
-        # 打开标记面板：用户对照逐字稿内容自己定名字（建议名只做预填）
-        QTimer.singleShot(400, self._open_label_dialog)
+        # 面板由 _on_diarized 统一打开（含没有声纹建议的场次）；这里只做预填
 
     # ------------------------------------------------------------------
     # 标记面板：对照逐字稿内容给声纹起名（会议后人工标记）
     # ------------------------------------------------------------------
 
+    def _current_store(self):
+        """标记相关操作的 store：优先当前会话，其次历史场次。"""
+        rec = getattr(self, "recorder", None)
+        if rec is not None:
+            return getattr(rec, "store", None)
+        session = getattr(self, "_last_session", None)
+        return session.get("store") if session else None
+
     def _open_label_dialog(self) -> None:
         """打开说话人标记面板（每声纹：示例发言 + 名字输入框 + 声纹建议预填）。"""
-        store = getattr(getattr(self, "recorder", None), "store", None)
+        self._label_dialog_scheduled = False
+        store = self._current_store()
         if store is None:
             return
         labels = store.speakers()
@@ -1593,7 +1707,7 @@ class MainWindow(QMainWindow):
 
     def _apply_label_names(self, names: dict[str, str]) -> None:
         """面板确认：写 store → 声纹学习 → 回填字幕 → 异步重导产物。"""
-        store = getattr(getattr(self, "recorder", None), "store", None)
+        store = self._current_store()
         if not store or not names:
             return
         for label, name in names.items():
@@ -1610,14 +1724,28 @@ class MainWindow(QMainWindow):
         self.status.setText(f"已命名 {len(names)} 位说话人，逐字稿/纪要已更新")
         if not self.isVisible():
             self._tray_notify("说话人已命名", f"已命名 {len(names)} 位，产物已更新")
-        # 异步重导出（带姓名）——走会话 translator，失败不打扰
+        # 异步重导出（带姓名）：本场有 translator 就重生成纪要；历史场次无 translator
+        # 时只覆盖逐字稿（不能把旧纪要冲成占位符）
         session = getattr(self, "_last_session", None)
         if session is not None:
+            translator = session.get("translator")
+            if translator is None:
+                try:
+                    if getattr(self.settings, "opencode_api_key", "").strip():
+                        translator = Translator(self.settings)
+                except Exception:
+                    translator = None
+            title = session.get("title") or "未命名会议"
+            started_at = session.get("started_at") or datetime.now()
+
             def _reexport():
                 try:
-                    export_all(store, self.settings, session.get("title") or "未命名会议",
-                               getattr(session.get("recorder"), "started_at", None) or datetime.now(),
-                               translator=session.get("translator"))
+                    if translator is not None:
+                        export_all(store, self.settings, title, started_at,
+                                   translator=translator)
+                    else:
+                        d = meeting_dir(self.settings, title, started_at)
+                        write_transcript(store, d, title, started_at)
                 except Exception:
                     pass
             threading.Thread(target=_reexport, daemon=True).start()
