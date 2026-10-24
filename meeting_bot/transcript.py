@@ -24,6 +24,8 @@ def pretty_speaker_label(label: str) -> str:
     return f"发言人{idx + 1}"
 
 
+MAX_BLOCK_CHARS = 320        # 单个发言段最多约 320 字（超了再起一段，避免一大坨）
+
 _END_PUNCT = "。！？；：，、….!?;:,"
 _CJK_CHAR = re.compile(r"[一-鿿]")
 
@@ -289,6 +291,10 @@ def load_journal(path: Path | str, attach_journal: bool = False) ->         tupl
     return title, started_at or datetime.now(), store
 
 
+def _block_chars(segs: list[Segment]) -> int:
+    return sum(len((s.text or "") + (s.translation or "")) for s in segs)
+
+
 def _flush_turn(lines: list[str], segs: list[Segment], store) -> None:
     """输出一个发言回合（Teams 转录样式）：发言人 + 时间 → 原文在前、译文在后。"""
     label = segs[0].speaker or ""
@@ -401,17 +407,16 @@ class TranscriptStore:
         lines += ["", "## 正文", ""]
 
         # ---- 正文：同类发言人合并成段 ----
-        current_label = object()
         buf: list[Segment] = []
         for label, segs in turns:
-            for index, seg in enumerate(segs):
-                if label != current_label:
+            for seg in segs:
+                same_turn = bool(buf) and buf[-1].speaker == seg.speaker and bool(seg.speaker)
+                if same_turn and _block_chars(buf) < MAX_BLOCK_CHARS:
+                    buf.append(seg)
+                else:
                     if buf:
                         _flush_turn(lines, buf, self)
-                    current_label = label
                     buf = [seg]
-                else:
-                    buf.append(seg)
         if buf:
             _flush_turn(lines, buf, self)
         return chr(10).join(lines)
