@@ -3,10 +3,48 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+
+_SPEAKER_RE = re.compile(r"^SPEAKER_(\d+)$")
+
+
+def pretty_speaker_label(label: str) -> str:
+    """SPEAKER_00 → 发言人A，SPEAKER_01 → 发言人B…（超 26 人退回编号）。"""
+    m = _SPEAKER_RE.match(label or "")
+    if not m:
+        return label
+    idx = int(m.group(1))
+    if 0 <= idx < 26:
+        return f"发言人{chr(ord('A') + idx)}"
+    return f"发言人{idx + 1}"
+
+
+_END_PUNCT = "。！？；：，、….!?;:,"
+_CJK_CHAR = re.compile(r"[一-鿿]")
+
+
+def join_sentences(parts: list[str], *, sep_empty: str = "，") -> str:
+    """把同一发言人的多句拼成一段：句间无标点时补 ``，``（中文）/空格（英文）。"""
+    out = ""
+    for raw in parts:
+        piece = (raw or "").strip()
+        if not piece:
+            continue
+        if not out:
+            out = piece
+            continue
+        if out[-1] in _END_PUNCT or piece[0] in _END_PUNCT:
+            out += piece
+        elif _CJK_CHAR.search(out[-1]) or _CJK_CHAR.search(piece[0]):
+            out += "，" + piece
+        else:
+            out += " " + piece
+    return out
 
 
 def fmt_ts(seconds: float) -> str:
@@ -237,6 +275,25 @@ def load_journal(path: Path | str, attach_journal: bool = False) ->         tupl
     return title, started_at or datetime.now(), store
 
 
+def _flush_turn(lines: list[str], segs: list[Segment], store) -> None:
+    """输出一个发言回合：发言人 + 起始时间 + 合并成段的正文（译文优先）。"""
+    label = segs[0].speaker or ""
+    speaker = store.display_name(label)
+    lines.append(f"**{speaker}**　{fmt_ts(segs[0].start)}")
+    zh = join_sentences([s.translation or s.text for s in segs])
+    if zh:
+        lines.append(zh)
+    lines.append("")
+    # 原文（外语）另起一段灰色引用，便于核对；纯中文时省略避免重复
+    orig_parts = [s.text for s in segs if (s.translation or "").strip()
+                  and s.translation.strip() != s.text.strip()]
+    if orig_parts:
+        orig = join_sentences(orig_parts)
+        if orig and orig != zh:
+            lines.append("> " + orig.replace(chr(10), chr(10) + "> "))
+            lines.append("")
+
+
 class TranscriptStore:
     def __init__(self, journal: Journal | None = None) -> None:
         self._segments: list[Segment] = []
@@ -289,7 +346,9 @@ class TranscriptStore:
         if not label:
             return "发言人?"
         sp = self._speakers.get(label)
-        return sp.name if sp and sp.name else label
+        if sp and sp.name:
+            return sp.name
+        return pretty_speaker_label(label)
 
     def segments(self) -> list[Segment]:
         return list(self._segments)
@@ -304,17 +363,53 @@ class TranscriptStore:
             self._next_seq = seg.seq + 1
 
     def to_markdown(self, title: str, started_at: datetime) -> str:
+        """逐字稿：按「发言人回合」分段（同一个人连续说的合并成一段）。"""
         lines = [f"# 会议逐字稿：{title}", "",
-                 f"> 会议时间：{started_at:%Y-%m-%d %H:%M}", "",
-                 "## 发言人", ""]
-        for sp in self._speakers.values():
-            lines.append(f"- {sp.label}：{sp.name or '未命名'}")
+                 f"> 会议时间：{started_at:%Y-%m-%d %H:%M}", ""]
+
+        # ---- 发言人汇总（谁说了多久、多少句）----
+        turns = self._turns()
+        lines += ["## 发言人", ""]
+        summary: dict[str, dict] = {}
+        for label, segs in turns:
+            if not label:
+                continue
+            info = summary.setdefault(label, {"n": 0, "first": segs[0].start,
+                                              "last": segs[-1].end})
+            info["n"] += len(segs)
+            info["last"] = max(info["last"], segs[-1].end)
+        for label, info in summary.items():
+            span = max(0, int(info["last"] - info["first"]))
+            dur = f"{span // 60} 分 {span % 60} 秒" if span >= 60 else f"{span} 秒"
+            lines.append(f"- {self.display_name(label)}：{info['n']} 句，"
+                         f"跨度 {dur}（首次发言 {fmt_ts(info['first'])}）")
+        if len(lines) and lines[-1] == "":
+            lines.pop()
         lines += ["", "## 正文", ""]
+
+        # ---- 正文：同类发言人合并成段 ----
+        current_label = object()
+        buf: list[Segment] = []
+        for label, segs in turns:
+            for index, seg in enumerate(segs):
+                if label != current_label:
+                    if buf:
+                        _flush_turn(lines, buf, self)
+                    current_label = label
+                    buf = [seg]
+                else:
+                    buf.append(seg)
+        if buf:
+            _flush_turn(lines, buf, self)
+        return chr(10).join(lines)
+
+    def _turns(self) -> list[tuple[str, list[Segment]]]:
+        """把语句按「同一发言人连续出现」切成回合（'' 视为未标注，独立成段）。"""
+        turns: list[tuple[str, list[Segment]]] = []
         for seg in self._segments:
-            speaker = self.display_name(seg.speaker)
-            lang = seg.lang or "?"
-            lines.append(f"**{fmt_ts(seg.start)} · {speaker}（{lang}）**")
-            lines.append(f"原文：{seg.text}")
-            lines.append(f"译文：{seg.translation or '（未翻译）'}")
-            lines.append("")
-        return "\n".join(lines)
+            label = seg.speaker or ""
+            if turns and turns[-1][0] == label:
+                turns[-1][1].append(seg)
+            else:
+                turns.append((label, [seg]))
+        return turns

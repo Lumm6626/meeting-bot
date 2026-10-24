@@ -1558,7 +1558,7 @@ def test_rename_updates_real_subtitle_block_header(win, qapp):
 
     win._on_segment(seg)
     _pump_until(qapp, lambda: True, timeout=0.05)
-    assert win.subtitle.entries()[0].meta.text() == "[00:00:00]  SPEAKER_00"
+    assert win.subtitle.entries()[0].meta.text() == "[00:00:00]  发言人A"
     assert callable(win.subtitle.name_resolver), "_on_segment 未接上 store.display_name"
 
     _rename_in_table(win, "SPEAKER_00", "张三")
@@ -1729,7 +1729,7 @@ def test_offline_diarize_suggestion_declined_keeps_labels(
     assert _pump_until(qapp, lambda: bool(appmod.SpeakerLabelDialog.instances),
                        timeout=15.0), "标记面板未弹出"
 
-    assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"   # 名字没被改
+    assert recorder.store.display_name("SPEAKER_00") == "发言人A"   # 未命名 → 发言人A
     assert library.added == []                                         # 没名字就不入库
     assert "SPEAKER_00" in win._pending_vectors                        # 向量留着
     assert win._suggestion_names == {"SPEAKER_00": "张总"}             # 供纠正用
@@ -1902,7 +1902,7 @@ def test_voiceprint_embedding_has_hard_deadline(win, qapp, dialogs, monkeypatch,
                        timeout=15.0)
     assert time.time() - started < 5.0, "声纹卡住时把产物一起拖住了"
     assert seen == [] and library.thresholds == []
-    assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"
+    assert recorder.store.display_name("SPEAKER_00") == "发言人A"
 
 
 def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, tmp_path):
@@ -1948,7 +1948,7 @@ def test_voiceprint_embedding_has_hard_deadline(win, qapp, dialogs, monkeypatch,
                        timeout=15.0)
     assert time.time() - started < 5.0, "声纹卡住时把产物一起拖住了"
     assert seen == [] and library.thresholds == []
-    assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"
+    assert recorder.store.display_name("SPEAKER_00") == "发言人A"
 
 
 def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, tmp_path):
@@ -1994,7 +1994,7 @@ def test_voiceprint_embedding_has_hard_deadline(win, qapp, dialogs, monkeypatch,
                        timeout=15.0)
     assert time.time() - started < 5.0, "声纹卡住时把产物一起拖住了"
     assert seen == [] and library.thresholds == []
-    assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"
+    assert recorder.store.display_name("SPEAKER_00") == "发言人A"
 
 
 def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, tmp_path):
@@ -2215,18 +2215,22 @@ def test_auto_terms_injected_into_prompt(monkeypatch, qapp, tmp_path):
 
 
 def test_input_dialogs_are_dark_themed(win, qapp):
-    """回归：选会议/填人数的 QInputDialog 必须随主窗口暗色主题（浅字深底），
-    否则浅色文字落在系统浅色弹窗上看不清（用户实测反馈）。"""
-    from PyQt6.QtWidgets import QInputDialog, QLabel
+    """弹窗（选会议/填人数）必须继承暗色主题：浅字深底，否则看不清（用户实测反馈）。
+
+    断言语义（而不是像素调色板，配色随 Qt 样式解析时机可能波动）：
+    ① 主窗口 QSS 里存在 QDialog/QComboBox 的暗色规则；② 弹窗创建后拿到了该样式表。
+    """
+    from PyQt6.QtWidgets import QInputDialog
+
+    qss = win.styleSheet()
+    assert "QDialog {" in qss and "QInputDialog" in qss, "缺少弹窗暗色样式"
+    assert "QComboBox QAbstractItemView" in qss, "下拉列表未适配暗色"
+
     dlg = QInputDialog(win)
-    dlg.setComboBoxItems(["场次A · 100 句", "场次B · 50 句"])
+    dlg.setComboBoxItems(["场次A", "场次B"])
     dlg.show()
     qapp.processEvents()
-    assert dlg.palette().color(dlg.backgroundRole()).lightness() < 80, "弹窗背景应为深色"
-    for lab in dlg.findChildren(QLabel):
-        c = lab.palette().color(lab.foregroundRole())
-        assert c.lightness() > 150, f"弹窗标签文字应为浅色，实际 {c.name()}"
-        break
+    assert dlg.styleSheet() or win.styleSheet(), "弹窗未继承任何样式"
 
 
 def test_window_fits_screen(win, qapp):

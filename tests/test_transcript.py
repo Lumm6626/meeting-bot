@@ -24,21 +24,35 @@ def test_add_and_update():
 def test_speaker_names():
     store = TranscriptStore()
     store.register_label("SPEAKER_00")
-    assert store.display_name("SPEAKER_00") == "SPEAKER_00"
+    # 默认名美化：SPEAKER_00 → 发言人A（未命名的声纹不再暴露内部标签）
+    assert store.display_name("SPEAKER_00") == "发言人A"
+    assert store.display_name("SPEAKER_01") == "发言人B"
     store.set_speaker_name("SPEAKER_00", "张三")
     assert store.display_name("SPEAKER_00") == "张三"
     assert store.display_name("") == "发言人?"
 
 
 def test_to_markdown():
+    """按发言人分段：同人连续发言合并成段，未命名显示 发言人A/B。"""
     store = TranscriptStore()
-    store.add(5.0, 8.0, "Good morning everyone.", lang="en")
+    seg = store.add(5.0, 8.0, "Good morning everyone.", lang="en")
+    nxt = store.add(9.0, 12.0, "Let us start.", lang="en")
+    store.update(seg.seq, speaker="SPEAKER_00")
+    store.update(nxt.seq, speaker="SPEAKER_00")
     store.set_speaker_name("SPEAKER_00", "Alice")
     md = store.to_markdown("周会", datetime(2026, 10, 16, 10, 30))
     assert "# 会议逐字稿：周会" in md
-    assert "Alice" in md
-    assert "[00:00:05]" in md
+    assert "Alice" in md                        # 已命名的声纹显示名字
+    assert "[00:00:05]" in md                   # 回合起始时间保留
     assert "Good morning everyone." in md
+    assert "Let us start." in md
+    # 同一发言人连续两句合并成一段（不再一句一行带时间码）
+    assert md.count("**Alice**") == 1
+    # 未命名的声纹按 发言人A/B 显示
+    store2 = TranscriptStore()
+    s2 = store2.add(0.0, 1.0, "hi")
+    store2.update(s2.seq, speaker="SPEAKER_02")
+    assert "发言人C" in store2.to_markdown("t", datetime(2026, 1, 1))
 
 
 def test_set_speaker_name_writes_speaker_event_and_replays(tmp_path):

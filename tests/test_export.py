@@ -47,8 +47,9 @@ def test_write_transcript(tmp_path):
     store.add(0.0, 2.0, "hello", lang="en")
     p = write_transcript(store, d, "周会", datetime(2026, 10, 16, 9, 30))
     content = p.read_text(encoding="utf-8")
-    assert "hello" in content
-    assert "译文" in content
+    assert "hello" in content            # 原文保留
+    assert "会议逐字稿" in content        # 标题
+    assert "[00:00:00]" in content       # 回合时间
 
 
 def test_minutes_to_docx(tmp_path):
