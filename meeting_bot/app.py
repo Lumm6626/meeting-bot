@@ -660,6 +660,9 @@ class MainWindow(QMainWindow):
         self.status = QLabel(status_text)
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
+        # 长报错（含不可断行的文件路径）会把 sizeHint 撑到几千像素 → 窗口超屏。
+        # Ignored 让宽度由布局决定（自动换行），标签自己不再"要求"宽度。
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.elapsed_label = QLabel("就绪")
         self.elapsed_label.setObjectName("elapsed")
         card_lay.addWidget(self.status)
@@ -672,6 +675,8 @@ class MainWindow(QMainWindow):
         self.cloud_banner.setWordWrap(True)
         self.cloud_banner.setVisible(False)
         self.cloud_banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.cloud_banner.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                        QSizePolicy.Policy.Preferred)
         cloud_row = QHBoxLayout()
         cloud_row.setSpacing(8)
         cloud_row.addWidget(self.cloud_banner, 1)
@@ -690,6 +695,8 @@ class MainWindow(QMainWindow):
             "双击「名字」列输入姓名即可（整场回填 + 存入声纹库，下次自动认人）")
         self.speaker_hint.setObjectName("footer_hint")
         self.speaker_hint.setWordWrap(True)
+        self.speaker_hint.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                        QSizePolicy.Policy.Preferred)
         lay.addWidget(self.speaker_hint)
 
         self.speaker_table = QTableWidget(0, 2)
@@ -698,7 +705,7 @@ class MainWindow(QMainWindow):
         self.speaker_table.setShowGrid(False)
         self.speaker_table.verticalHeader().setVisible(False)
         self.speaker_table.horizontalHeader().setStretchLastSection(True)
-        self.speaker_table.setMinimumHeight(140)
+        self.speaker_table.setMinimumHeight(110)   # 小屏留出余量（窗口最小高度别超过 768 逻辑屏的 90%）
         lay.addWidget(self.speaker_table, 1)
 
         self.footer_hint = QLabel(
@@ -710,7 +717,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self.setStyleSheet(DARK_QSS)
-        self.resize(560, 600)
+        self._fit_to_screen()
 
         self.start_btn.clicked.connect(self._start)
         self.stop_btn.clicked.connect(self._stop)
@@ -1072,7 +1079,10 @@ class MainWindow(QMainWindow):
     def _abandon_journal(self, path: Path) -> None:
         """用户选择不恢复：改名成 .abandoned.jsonl，之后启动不再提示（原文件保留可找回）。"""
         try:
-            path.rename(path.with_suffix(".abandoned.jsonl"))
+            if path.exists():
+                path.rename(path.with_suffix(".abandoned.jsonl"))
+        except FileNotFoundError:
+            pass                      # 已被归档/被清理：不是问题，别报警
         except OSError as e:
             self.status.setText(f"[警告] 无法归档未完成日志：{e}")
 
@@ -1191,6 +1201,20 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_boot, daemon=True).start()
 
+    def _fit_to_screen(self) -> None:
+        """初始窗口尺寸钳制到屏幕可用区域（高 DPI/小屏时不再超出屏幕）。"""
+        want_w, want_h = 600, 680
+        screen = self.screen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            want_w = max(420, min(want_w, int(avail.width() * 0.9)))
+            want_h = max(380, min(want_h, int(avail.height() * 0.9)))
+            self.resize(want_w, want_h)
+            self.move(avail.x() + (avail.width() - want_w) // 2,
+                      avail.y() + max(0, (avail.height() - want_h) // 2))
+        else:
+            self.resize(want_w, want_h)
+
     def _preload_engine(self) -> None:
         """后台预热重型依赖：把「点开始记录」的等待从 ~6 秒压到 ~1 秒。"""
         try:
@@ -1232,7 +1256,11 @@ class MainWindow(QMainWindow):
         self.subtitle.update_segment(seg, name)
 
     def _on_status(self, msg):
-        self.status.setText(msg)
+        # 超长报错（含不可断行的文件路径）只显示前 160 字：避免刷屏，也避免把窗口撑宽
+        text = str(msg or "")
+        if len(text) > 160:
+            text = text[:160] + "…"
+        self.status.setText(text)
 
     def _refresh_speakers(self):
         # 命名指引：有标签就隐藏，没有就显示（放在最前，不受后面提前返回影响）

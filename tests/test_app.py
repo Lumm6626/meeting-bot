@@ -2134,3 +2134,19 @@ def test_input_dialogs_are_dark_themed(win, qapp):
         c = lab.palette().color(lab.foregroundRole())
         assert c.lightness() > 150, f"弹窗标签文字应为浅色，实际 {c.name()}"
         break
+
+
+def test_window_fits_screen(win, qapp):
+    """回归：窗口宽度/高度不得超过屏幕可用区域（曾在长报错把 sizeHint 撑到 3248px）。"""
+    win.show()
+    qapp.processEvents()
+    avail = win.screen().availableGeometry()
+    assert win.width() <= avail.width(), f"窗口宽 {win.width()} 超过屏幕 {avail.width()}"
+    assert win.height() <= avail.height(), f"窗口高 {win.height()} 超过屏幕 {avail.height()}"
+    assert win.minimumSizeHint().width() <= 640, "最小宽度异常（长文本不应撑宽布局）"
+
+
+def test_long_status_text_is_truncated(win):
+    """超长报错（含不可断行路径）只显示前 160 字，避免撑宽窗口/刷屏。"""
+    win._on_status("错误" * 300)
+    assert len(win.status.text()) <= 161
