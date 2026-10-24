@@ -25,6 +25,7 @@ from .config import (PROJECT_ROOT, ConfigError, Settings, load_settings,
 from .export import export_all, meeting_dir, write_transcript
 from .subtitle import SubtitleWindow
 from .speaker_dialog import SpeakerLabelDialog
+from .segment_label_dialog import SegmentLabelDialog
 from .transcript import (Journal, TranscriptStore, journal_finished, journal_meta,
                          load_journal, write_footer)
 from .translator import Translator
@@ -59,7 +60,7 @@ def _ensure_heavy(preload_diarize: bool = True) -> None:
                 from .diarization import Diarizer as _Diarizer
                 Diarizer = _Diarizer
             if assign_speakers is None:
-                from .diarization import assign_speakers as _assign_speakers
+                from .speaker_assign import assign_speakers as _assign_speakers
                 assign_speakers = _assign_speakers
 
 
@@ -72,7 +73,7 @@ def _resolve_diarize_tools():
     global Diarizer, assign_speakers
     if Diarizer is None or assign_speakers is None:
         from .diarization import Diarizer as _Diarizer
-        from .diarization import assign_speakers as _assign_speakers
+        from .speaker_assign import assign_speakers as _assign_speakers
         if Diarizer is None:
             Diarizer = _Diarizer
         if assign_speakers is None:
@@ -640,7 +641,8 @@ class MainWindow(QMainWindow):
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_btn.setEnabled(False)
         # 「标注说话人」独立动作：会后（或重启后对上一场）随时可重跑，可指定人数
-        self.label_btn = QPushButton("标注说话人")
+        self.label_btn = QPushButton("标注发言人")
+        self.label_btn.setToolTip("打开逐字稿，逐句/批量指定谁在说话（不需要先跑自动聚类）")
         self.label_btn.setProperty("role", "secondary")
         self.label_btn.setFixedHeight(44)
         self.label_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1422,11 +1424,116 @@ class MainWindow(QMainWindow):
         return None
 
     def _label_speakers(self) -> None:
-        """按钮/托盘入口：本场会话优先；否则从「已生成的会议记录」里选一场补标记。
+        """主入口：打开**逐字稿标注窗口**（对照稿子逐句指定发言人）。
 
-        历史场次分两种情况：没有声纹标签 → 先重跑标注；已有标签 → 直接打开
-        标记面板改名字（不再重跑、不覆盖已有名字以外的内容）。
+        不再强制先跑 pyannote：把稿子摊开让用户直接标，最快也最准。
+        「自动区分说话人」（声纹聚类）保留在托盘菜单里，作为可选的预分组手段。
         """
+        store = self._resolve_store_for_labeling()
+        if store is None:
+            return
+        segs = store.segments()
+        if not segs:
+            self.status.setText("这场没有逐字稿内容，无法标注")
+            return
+        known = [sp.name or sp.label for sp in store.speakers()]
+        # 已有名字也当候选；再补上「发言人1..3」方便快速点选
+        known = [n for n in dict.fromkeys(known) if n]
+        dlg = SegmentLabelDialog(segs, known_names=known, parent=self)
+        if not dlg.exec():
+            return
+        self._apply_manual_speakers(store, dlg.assignments)
+
+    def _resolve_store_for_labeling(self):
+        """取要标注的 store：优先当前会话；否则让用户从历史会议里选一场。"""
+        session = getattr(self, "_last_session", None)
+        audio_guess = getattr(session.get("recorder"), "audio_path", None) if session else None
+        if session and session.get("store") is not None and session["store"].segments():
+            return session["store"]
+        past = self._list_past_recordings()
+        if not past:
+            self.status.setText("没有可标注的会议记录（先录一场会议）")
+            return None
+        labels = [f"{i + 1}. {p['title']} · {p['when']} · {p['segments']} 句"
+                  for i, p in enumerate(past)]
+        chosen, ok = QInputDialog.getItem(self, "选择会议", "选择要标注发言人的会议：",
+                                          labels, 0, False)
+        if not ok or not chosen:
+            return None
+        try:
+            idx = labels.index(str(chosen))
+        except ValueError:
+            return None
+        pick = past[idx]
+        try:
+            title, started_at, store = load_journal(pick["jsonl"], attach_journal=True)
+        except Exception as e:
+            self.status.setText(f"读取会议记录失败：{e}")
+            return None
+        self._last_session = {"store": store, "title": title,
+                              "started_at": started_at or datetime.now(),
+                              "recorder": None, "translator": None}
+        return store
+
+    def _apply_manual_speakers(self, store, assignments: dict[int, str]) -> None:
+        """手工标注结果：写 store/日志 → 回填字幕 → 异步重导产物。"""
+        if not assignments:
+            self.status.setText("没有改动")
+            return
+        by_seq = {s.seq: s for s in store.segments()}
+        for seq, name in assignments.items():
+            seg = by_seq.get(seq)
+            if seg is None:
+                continue
+            seg.speaker = name
+            store.register_label(name)
+            if getattr(store, "journal", None) is not None:
+                store.update(seq, speaker=name)
+        self._sync_subtitle_names()
+        refresh = getattr(self.subtitle, "refresh_names", None)
+        if callable(refresh):
+            refresh()
+        self._refresh_speakers()
+        self.status.setText(f"已标注 {len(assignments)} 句的发言人，产物正在更新…")
+        if not self.isVisible():
+            self._tray_notify("发言人已标注", f"{len(assignments)} 句已更新")
+        self._re_export_current(len(assignments))
+
+    def _re_export_current(self, changed: int = 0) -> None:
+        """把当前 store 重新导出（有 translator 时重生成纪要，否则只更逐字稿）。"""
+        store = self._current_store()
+        session = getattr(self, "_last_session", None)
+        if store is None or session is None:
+            return
+        translator = session.get("translator")
+        if translator is None:
+            try:
+                if getattr(self.settings, "opencode_api_key", "").strip():
+                    translator = Translator(self.settings)
+            except Exception:
+                translator = None
+        title = session.get("title") or "未命名会议"
+        started_at = session.get("started_at") or datetime.now()
+
+        def work():
+            try:
+                if translator is not None:
+                    export_all(store, self.settings, title, started_at,
+                               translator=translator)
+                else:
+                    d = meeting_dir(self.settings, title, started_at)
+                    write_transcript(store, d, title, started_at)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _auto_label_speakers(self) -> None:
+        """可选：按声音自动聚类分组（慢），完成后会自动打开标注窗口改名。"""
+        self._label_speakers_auto()
+
+    def _label_speakers_auto(self) -> None:
+        """老的自动聚类流程（选会议 → 人数 → 子进程标注 → 面板）。"""
         session = getattr(self, "_last_session", None)
         audio_guess = getattr(session.get("recorder"), "audio_path", None) if session else None
         if audio_guess and Path(audio_guess).is_file():
@@ -1440,28 +1547,20 @@ class MainWindow(QMainWindow):
             self._run_label_job(audio_path, store, title, started_at, num,
                                 (session or {}).get("translator"))
             return
-        # ---- 历史会议：从 .recording 里挑一场 ----
         past = self._list_past_recordings()
         if not past:
             self.status.setText("没有可标注的录音（需要先录一场会议）")
             return
-        # 注意：getItem 返回的是**选中文本**（不是索引）——直接当下标用会 TypeError，
-        # 用户在界面上只看到「点了没反应」。用带序号的文本 + 回查索引。
         labels = [f"{i + 1}. {p['title']} · {p['when']} · {p['segments']} 句"
                   + (" · 已标声纹" if p["labels"] else " · 未标注")
                   for i, p in enumerate(past)]
         chosen, ok = QInputDialog.getItem(self, "选择会议",
-                                          "选择要补标记发言人的会议：", labels, 0, False)
+                                          "选择要自动分组的会议：", labels, 0, False)
         if not ok or not chosen:
             return
         try:
             idx = labels.index(str(chosen))
         except ValueError:
-            try:
-                idx = int(str(chosen).split(".", 1)[0]) - 1
-            except ValueError:
-                return
-        if not (0 <= idx < len(past)):
             return
         pick = past[idx]
         try:
@@ -1469,19 +1568,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.status.setText(f"读取会议记录失败：{e}")
             return
-        # 本场会话上下文替换成历史场次（面板/回填/导出都吃这一份）
         self._last_session = {"store": store, "title": title,
                               "started_at": started_at or datetime.now(),
                               "recorder": None, "translator": None}
-        if store.speakers():
-            # 已有标签：直接打开标记面板改名字（不重跑标注）
-            QTimer.singleShot(200, self._open_label_dialog)
-            return
         num = self._ask_speaker_count()
         if num is None:
             return
-        self._run_label_job(pick["wav"], store, title, started_at or datetime.now(),
-                            num, None)
+        self._run_label_job(pick["wav"], store, title,
+                            started_at or datetime.now(), num, None)
 
     def _ask_speaker_count(self) -> int | None:
         """提问人数（0=自动）；取消返回 None。"""

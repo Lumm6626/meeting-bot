@@ -41,6 +41,40 @@ class Diarizer:
         return spans
 
 
+from .speaker_assign import assign_speakers  # noqa: F401（纯算法拆到轻模块，避免拖入 torch）
+
+
+class DiarizationError(Exception):
+    """说话人聚类不可用（如未配置 HF token）。"""
+
+
+class Diarizer:
+    def __init__(self, settings: Settings):
+        if not settings.hf_token:
+            raise DiarizationError("缺少 HF_TOKEN，无法使用说话人区分")
+        self._pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=settings.hf_token,
+        )
+
+    def label(self, audio: np.ndarray, sample_rate: int = 16000,
+              num_speakers: int | None = None) -> list[tuple[float, float, str]]:
+        """返回 [(start, end, label), ...]，时间以秒为单位。
+
+        ``num_speakers``：已知本场有几个人时传进来，pyannote 不再猜人数，聚类更准
+        （尤其短会/人少时）；None = 自动检测。
+        """
+        waveform = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0)
+        kwargs = {}
+        if num_speakers and int(num_speakers) > 0:
+            kwargs["num_speakers"] = int(num_speakers)
+        result = self._pipeline({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
+        spans = []
+        for turn, _, label in result.itertracks(yield_label=True):
+            spans.append((float(turn.start), float(turn.end), str(label)))
+        return spans
+
+
 def assign_speakers(segments: list[Segment], spans: list[tuple[float, float, str]],
                     min_overlap: float = 0.3) -> list[Segment]:
     """按时间重叠给语句分配说话人；重叠不足则保持未标注。"""
