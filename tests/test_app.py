@@ -2119,3 +2119,18 @@ def test_auto_terms_injected_into_prompt(monkeypatch, qapp, tmp_path):
     rec_settings = made["recorder"][0].settings
     assert "过敏门诊" in rec_settings.asr_prompt
     assert "复合药房" in rec_settings.asr_prompt
+
+
+def test_input_dialogs_are_dark_themed(win, qapp):
+    """回归：选会议/填人数的 QInputDialog 必须随主窗口暗色主题（浅字深底），
+    否则浅色文字落在系统浅色弹窗上看不清（用户实测反馈）。"""
+    from PyQt6.QtWidgets import QInputDialog, QLabel
+    dlg = QInputDialog(win)
+    dlg.setComboBoxItems(["场次A · 100 句", "场次B · 50 句"])
+    dlg.show()
+    qapp.processEvents()
+    assert dlg.palette().color(dlg.backgroundRole()).lightness() < 80, "弹窗背景应为深色"
+    for lab in dlg.findChildren(QLabel):
+        c = lab.palette().color(lab.foregroundRole())
+        assert c.lightness() > 150, f"弹窗标签文字应为浅色，实际 {c.name()}"
+        break

@@ -366,6 +366,43 @@ QMenu {
     border-radius: 6px;
     padding: 4px;
 }
+/* 弹窗（选会议/填人数等 QInputDialog）：主窗口是暗色，弹窗必须同步，
+   否则浅色 QLabel 文字落在系统浅色弹窗上完全看不清（实测反馈） */
+QDialog {
+    background-color: $BG;
+}
+QDialog QLabel {
+    color: $TEXT;
+}
+QInputDialog {
+    background-color: $BG;
+}
+QInputDialog QLabel {
+    color: $TEXT;
+    font-size: 10pt;
+}
+QComboBox {
+    background-color: $SURFACE;
+    color: $TEXT;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+    padding: 5px 10px;
+    min-height: 20px;
+}
+QComboBox QAbstractItemView {
+    background-color: $SURFACE;
+    color: $TEXT;
+    border: 1px solid $BORDER;
+    selection-background-color: $ACCENT_A;
+    selection-color: #FFFFFF;
+}
+QSpinBox {
+    background-color: $SURFACE;
+    color: $TEXT;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
 QMenu::item {
     padding: 6px 18px;
     border-radius: 4px;
