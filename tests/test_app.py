@@ -389,23 +389,29 @@ def _write_wav(tmp_path) -> Path:
     return path
 
 
-def _fake_diarize_tools(monkeypatch, calls):
-    """monkeypatch Diarizer / assign_speakers，记录构造与调用（不加载 torch）。"""
-    class _FakeDiarizer:
-        def __init__(self, settings):
-            calls["init"] = settings
+def _fake_diarize_tools(monkeypatch, calls, spans=None):
+    """把「标注子进程 + assign_speakers」打桩（进程内绝不加载 torch/pyannote）。
 
-        def label(self, audio, sample_rate=16000):
-            calls["label"] = (len(audio), sample_rate)
-            return [(0.0, 4.0, "SPEAKER_00")]
+    标注现在跑在独立子进程（Qt 进程内加载 pyannote 会段错误），所以测试改成
+    替换 `_run_diarizer_subprocess` 的返回值，而不是替换 Diarizer 类。
+    """
+    spans = spans or [(0.0, 4.0, "SPEAKER_00")]
 
-    def _fake_assign(segs, spans):
+    def _fake_run(self, audio_path, num_speakers, timeout):
+        calls["subprocess"] = {"wav": str(audio_path),
+                               "num_speakers": num_speakers}
+        embeddings = calls.pop("embeddings", {})
+        return {"spans": spans, "embeddings": embeddings}
+
+    monkeypatch.setattr(appmod.MainWindow, "_run_diarizer_subprocess", _fake_run)
+
+    def _fake_assign(segs, spans_):
         for seg in segs:
-            seg.speaker = spans[0][2]
+            seg.speaker = spans_[0][2]
         calls["assigned"] = True
         return segs
 
-    monkeypatch.setattr(appmod, "Diarizer", _FakeDiarizer)
+    # 标注已改为子进程：Diarizer 不再进程内构造；只替换 assign_speakers
     monkeypatch.setattr(appmod, "assign_speakers", _fake_assign)
 
 
@@ -431,9 +437,9 @@ def test_finish_runs_offline_diarize_and_re_exports(win, qapp, dialogs, monkeypa
     assert _pump_until(qapp, lambda: len(exports) == 2 and bool(diarized), timeout=15.0), (
         f"会后标注未完成：exports={len(exports)} diarized={diarized} statuses={statuses}")
     # ① 初版（finish 线程）+ 标注版（会后线程）
-    assert "init" in calls and "assigned" in calls
+    assert "subprocess" in calls and "assigned" in calls
     # ② 整场 wav：16000 采样、16000 样本（1 秒）
-    assert calls["label"] == (16000, 16000)
+    assert calls["subprocess"]["wav"].endswith(".wav")   # 整场 wav 交给了子进程
     # 语句被标上说话人（重新导出时才带得出来）
     assert recorder.store.segments()[0].speaker == "SPEAKER_00"
     assert calls["assigned"] is True
@@ -501,11 +507,10 @@ def test_offline_diarize_failure_only_warns(win, qapp, dialogs, monkeypatch, tmp
     exports, export_threads, diarized = [], [], []
     monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
 
-    class _BoomDiarizer:
-        def __init__(self, settings):
-            raise RuntimeError("模型下载失败")
+    def _boom_subprocess(self, audio_path, num_speakers, timeout):
+        raise RuntimeError("模型下载失败")
 
-    monkeypatch.setattr(appmod, "Diarizer", _BoomDiarizer)
+    monkeypatch.setattr(appmod.MainWindow, "_run_diarizer_subprocess", _boom_subprocess)
     monkeypatch.setattr(appmod, "assign_speakers", lambda segs, spans: segs)
     win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
 
@@ -1657,14 +1662,11 @@ class _FakeVoiceprints:
 
 
 def _fake_embeddings(monkeypatch, embeddings, calls=None):
-    """把真模型整段换掉：compute_speaker_embeddings 直接返回给定向量。"""
+    """声纹向量由「子进程」产出：塞进 calls，假子进程会带出来（不再进程内算）。"""
     calls = calls if calls is not None else []
-
-    def fake(audio, sample_rate, spans, embed_fn=None, token=None):
-        calls.append((len(audio), sample_rate, list(spans)))
-        return dict(embeddings)
-
-    monkeypatch.setattr(appmod, "compute_speaker_embeddings", fake)
+    if isinstance(calls, dict):
+        calls["embeddings"] = dict(embeddings)
+        return calls
     return calls
 
 
@@ -1678,7 +1680,7 @@ def test_offline_diarize_suggests_known_speaker_and_applies(
     exports, export_threads, calls, seen = [], [], {}, []
     monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
     _fake_diarize_tools(monkeypatch, calls)
-    _fake_embeddings(monkeypatch, {"SPEAKER_00": VEC})
+    calls["embeddings"] = {"SPEAKER_00": VEC}
     library = _FakeVoiceprints(hits=[("张总", 0.83)])
     win._voiceprints = library
     win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
@@ -1714,7 +1716,7 @@ def test_offline_diarize_suggestion_declined_keeps_labels(
     exports, export_threads, calls, seen = [], [], {}, []
     monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
     _fake_diarize_tools(monkeypatch, calls)
-    _fake_embeddings(monkeypatch, {"SPEAKER_00": VEC})
+    calls["embeddings"] = {"SPEAKER_00": VEC}
     library = _FakeVoiceprints(hits=[("张总", 0.83)])
     win._voiceprints = library
     win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
@@ -1904,25 +1906,112 @@ def test_voiceprint_embedding_has_hard_deadline(win, qapp, dialogs, monkeypatch,
 
 
 def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, tmp_path):
-    """HF token 由 settings 传入（密钥在 Windows 凭据管理器里时环境变量是空的）。"""
-    exports, export_threads, calls, captured = [], [], {}, {}
+    """标注/声纹在子进程里跑：token 由子进程从 settings 读取，主进程只派发任务。"""
+    exports, export_threads, calls = [], [], {}
     monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
     _fake_diarize_tools(monkeypatch, calls)
-
-    def fake(audio, sample_rate, spans, embed_fn=None, token=None):
-        captured["token"] = token
-        return {}
-
-    monkeypatch.setattr(appmod, "compute_speaker_embeddings", fake)
     win._voiceprints = _FakeVoiceprints()
     win.settings = dataclasses.replace(win.settings, hf_token="hf_from_keyring")
 
     recorder = _DiarizableRecorder(_write_wav(tmp_path))
     _prepare_recording(win, recorder)
-
     win._stop()
-    assert _pump_until(qapp, lambda: bool(captured) and len(exports) == 2, timeout=15.0)
-    assert captured["token"] == "hf_from_keyring"
+
+    assert _pump_until(qapp, lambda: bool(calls.get("subprocess")), timeout=15.0)
+    assert calls["subprocess"]["wav"].endswith(".wav")
+    assert len(exports) == 2, "初版 + 标注版各导出一次"
+
+
+def test_voiceprint_embedding_has_hard_deadline(win, qapp, dialogs, monkeypatch, tmp_path):
+    """模型下载 / 网络卡住：按超时放弃，产物照常导出（声纹绝不能拖住交付）。"""
+    exports, export_threads, calls, seen = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    monkeypatch.setattr(appmod, "VOICEPRINT_TIMEOUT", 0.05)
+
+    def hang(*_a, **_k):
+        time.sleep(2.0)                 # 比超时更长
+        return {"SPEAKER_00": VEC}
+
+    monkeypatch.setattr(appmod, "compute_speaker_embeddings", hang)
+    library = _FakeVoiceprints(hits=[("张总", 0.83)])
+    win._voiceprints = library
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.speaker_suggestions.connect(seen.append)
+
+    started = time.time()
+    win._stop()
+    assert _pump_until(qapp, lambda: len(exports) == 2 and win.start_btn.isEnabled(),
+                       timeout=15.0)
+    assert time.time() - started < 5.0, "声纹卡住时把产物一起拖住了"
+    assert seen == [] and library.thresholds == []
+    assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"
+
+
+def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, tmp_path):
+    """标注/声纹在子进程里跑：token 由子进程从 settings 读取，主进程只派发任务。"""
+    exports, export_threads, calls = [], [], {}
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    win._voiceprints = _FakeVoiceprints()
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_from_keyring")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win._stop()
+
+    assert _pump_until(qapp, lambda: bool(calls.get("subprocess")), timeout=15.0)
+    assert calls["subprocess"]["wav"].endswith(".wav")
+    assert len(exports) == 2, "初版 + 标注版各导出一次"
+
+
+def test_voiceprint_embedding_has_hard_deadline(win, qapp, dialogs, monkeypatch, tmp_path):
+    """模型下载 / 网络卡住：按超时放弃，产物照常导出（声纹绝不能拖住交付）。"""
+    exports, export_threads, calls, seen = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    monkeypatch.setattr(appmod, "VOICEPRINT_TIMEOUT", 0.05)
+
+    def hang(*_a, **_k):
+        time.sleep(2.0)                 # 比超时更长
+        return {"SPEAKER_00": VEC}
+
+    monkeypatch.setattr(appmod, "compute_speaker_embeddings", hang)
+    library = _FakeVoiceprints(hits=[("张总", 0.83)])
+    win._voiceprints = library
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.speaker_suggestions.connect(seen.append)
+
+    started = time.time()
+    win._stop()
+    assert _pump_until(qapp, lambda: len(exports) == 2 and win.start_btn.isEnabled(),
+                       timeout=15.0)
+    assert time.time() - started < 5.0, "声纹卡住时把产物一起拖住了"
+    assert seen == [] and library.thresholds == []
+    assert recorder.store.display_name("SPEAKER_00") == "SPEAKER_00"
+
+
+def test_voiceprint_token_comes_from_settings(win, qapp, dialogs, monkeypatch, tmp_path):
+    """标注/声纹在子进程里跑：token 由子进程从 settings 读取，主进程只派发任务。"""
+    exports, export_threads, calls = [], [], {}
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    win._voiceprints = _FakeVoiceprints()
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_from_keyring")
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win._stop()
+
+    assert _pump_until(qapp, lambda: bool(calls.get("subprocess")), timeout=15.0)
+    assert calls["subprocess"]["wav"].endswith(".wav")
+    assert len(exports) == 2, "初版 + 标注版各导出一次"
 
 
 # ---------------------------------------------------------------------------
@@ -2062,10 +2151,13 @@ def test_label_num_speakers_passed_to_diarizer(win, monkeypatch):
             calls["num"] = num_speakers
             return [(0.0, 5.0, "SPEAKER_00")]
 
-    monkeypatch.setattr("meeting_bot.app._resolve_diarize_tools",
-                        lambda: (_Diar, __import__("meeting_bot.diarization",
-                                                   fromlist=["assign_speakers"]).assign_speakers))
-    monkeypatch.setattr("meeting_bot.app._read_audio", lambda p: (np.zeros(16000, dtype=np.float32), 16000))
+    monkeypatch.setattr("meeting_bot.app.assign_speakers",
+                        __import__("meeting_bot.diarization", fromlist=["assign_speakers"]).assign_speakers)
+    rs = {}
+    def _fake_sub(self, audio_path, num_speakers, timeout):
+        rs["num_speakers"] = num_speakers
+        return {"spans": [(0.0, 5.0, "SPEAKER_00")], "embeddings": {}}
+    monkeypatch.setattr(appmod.MainWindow, "_run_diarizer_subprocess", _fake_sub)
     monkeypatch.setattr("meeting_bot.app.export_all", lambda *a, **k: (Path("t.md"), Path("m.docx")))
     monkeypatch.setattr("meeting_bot.app.QInputDialog.getInt",
                         staticmethod(lambda *a, **k: (3, True)))
@@ -2082,8 +2174,9 @@ def test_label_num_speakers_passed_to_diarizer(win, monkeypatch):
     win._last_session["store"] = TranscriptStore()
     seg = win._last_session["store"].add(0.0, 4.0, "hello", lang="en")
 
-    win._label_worker(wav, win._last_session["store"], "测试", __import__("datetime").datetime.now(), 3, None)
-    assert calls["num"] == 3
+    win._label_worker(wav, win._last_session["store"], "测试",
+                      __import__("datetime").datetime.now(), 3, None)
+    assert rs["num_speakers"] == 3, "人数未透传给标注子进程"
     assert win._last_session["store"].segments()[0].speaker == "SPEAKER_00"
 
 

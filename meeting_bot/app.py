@@ -158,6 +158,12 @@ def mine_terms(translator, transcript_md: str) -> list[str]:
     return out[:50]
 
 
+def _to_floats(value):
+    """子进程回传的向量是 list[float]；统一成 numpy 数组（比对用）。"""
+    import numpy as np
+    return np.asarray(value, dtype=np.float32)
+
+
 def _fmt_hms(seconds: float) -> str:
     """秒 → 00:00:00（标记面板显示声纹首末时间）。"""
     s_int = max(0, int(seconds))
@@ -1439,11 +1445,23 @@ class MainWindow(QMainWindow):
         if not past:
             self.status.setText("没有可标注的录音（需要先录一场会议）")
             return
-        names = [f"{p['title']} · {p['when']} · {p['segments']} 句"
-                 + (" · 已标声纹" if p["labels"] else " · 未标注") for p in past]
-        idx, ok = QInputDialog.getItem(self, "选择会议",
-                                       "选择要补标记发言人的会议：", names, 0, False)
-        if not ok:
+        # 注意：getItem 返回的是**选中文本**（不是索引）——直接当下标用会 TypeError，
+        # 用户在界面上只看到「点了没反应」。用带序号的文本 + 回查索引。
+        labels = [f"{i + 1}. {p['title']} · {p['when']} · {p['segments']} 句"
+                  + (" · 已标声纹" if p["labels"] else " · 未标注")
+                  for i, p in enumerate(past)]
+        chosen, ok = QInputDialog.getItem(self, "选择会议",
+                                          "选择要补标记发言人的会议：", labels, 0, False)
+        if not ok or not chosen:
+            return
+        try:
+            idx = labels.index(str(chosen))
+        except ValueError:
+            try:
+                idx = int(str(chosen).split(".", 1)[0]) - 1
+            except ValueError:
+                return
+        if not (0 <= idx < len(past)):
             return
         pick = past[idx]
         try:
@@ -1542,32 +1560,67 @@ class MainWindow(QMainWindow):
             pass
         return best if best is not None and best_gap <= 300 else None
 
+    def _run_diarizer_subprocess(self, audio_path: Path, num_speakers: int | None,
+                                 timeout: float) -> dict:
+        """在独立进程里跑标注（Qt 进程内加载 pyannote 会段错误，实测崩溃）。
+
+        返回 {"spans": [...], "embeddings": {...}}；失败抛 RuntimeError（带原因）。
+        """
+        import json
+        import os
+        import subprocess
+        import sys
+        import tempfile
+
+        out = Path(tempfile.mkstemp(suffix=".json", prefix="diarize_")[1])
+        cmd = [sys.executable, "-m", "meeting_bot.diarize_worker",
+               "--wav", str(audio_path), "--out", str(out)]
+        if num_speakers:
+            cmd += ["--num-speakers", str(int(num_speakers))]
+        env = dict(os.environ)
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env)
+            if not out.is_file():
+                raise RuntimeError(
+                    (proc.stderr or b"").decode("utf-8", "replace")[-300:] or "子进程无输出")
+            data = json.loads(out.read_text(encoding="utf-8"))
+            if not data.get("ok"):
+                raise RuntimeError(data.get("error") or "标注子进程失败")
+            return data
+        finally:
+            try:
+                out.unlink()
+            except OSError:
+                pass
+
     def _label_worker(self, audio_path: Path, store, title: str,
                       started_at: datetime, num_speakers: int | None,
                       translator=None) -> None:
-        """后台：整场 wav → label() → 回填 store（并写入日志）→ 覆盖产物。"""
+        """后台：wav → 子进程标注 → 回填 store（写回日志）→ 声纹认人 → 覆盖产物。"""
         suggestions = None
         try:
-            diarizer_cls, assign = _resolve_diarize_tools()
-            diarizer = diarizer_cls(self.settings)
-            audio, sample_rate = _read_audio(audio_path)
-            spans = diarizer.label(audio, sample_rate, num_speakers=num_speakers)
+            data = self._run_diarizer_subprocess(audio_path, num_speakers,
+                                                 timeout=self._diarize_timeout(audio_path))
+            spans = [(float(a), float(b), str(lbl)) for a, b, lbl in data.get("spans") or []]
+            _, assign = _resolve_diarize_tools()
             changed: list[int] = []
             for seg in store.segments():
                 before = seg.speaker
                 assign([seg], spans)
                 if seg.speaker != before:
                     changed.append(seg.seq)
-            # 回写日志：崩溃恢复/再次导出时标注不丢（store.update 会写 journal 事件）
-            for seq in changed:
+            # 回写日志：崩溃恢复/再次导出时标注不丢
+            if getattr(store, "journal", None) is not None:
                 for seg in store.segments():
-                    if seg.seq == seq:
-                        store.update(seq, speaker=seg.speaker)
-                        break
+                    if seg.seq in changed:
+                        store.update(seg.seq, speaker=seg.speaker)
             for seg in store.segments():
                 if seg.speaker:
                     store.register_label(seg.speaker)
-            suggestions = self._collect_voiceprints(store, audio, sample_rate, spans)
+            embeddings = {
+                str(k): _to_floats(v) for k, v in (data.get("embeddings") or {}).items()}
+            suggestions = self._collect_voiceprints_from(store, embeddings)
             export_all(store, self.settings, title, started_at,
                        translator=translator or self._journal_translator(store))
         except Exception as e:
@@ -1577,6 +1630,17 @@ class MainWindow(QMainWindow):
             self.bridge.speaker_suggestions.emit(suggestions)
         self.bridge.diarized.emit(True, OFFLINE_DIARIZED_DONE)
 
+    @staticmethod
+    def _diarize_timeout(audio_path: Path) -> float:
+        """子进程超时：标注约 1.5 倍音频时长，给 3 倍上限（最少 10 分钟）。"""
+        try:
+            import soundfile as sf
+            info = sf.info(str(audio_path))
+            dur = float(info.frames) / max(1, int(info.samplerate))
+            return max(600.0, dur * 3.0)
+        except Exception:
+            return 3600.0
+
     def _journal_translator(self, store):
         session = getattr(self, "_last_session", None)
         if session and session.get("store") is store:
@@ -1585,36 +1649,9 @@ class MainWindow(QMainWindow):
 
     def _offline_diarize_worker(self, recorder, audio_path: Path,
                                 title: str, started_at: datetime) -> None:
-        """后台：整场 wav → label() → assign_speakers → 重新导出（覆盖同名产物）。
-
-        任何失败（无 token / 模型下载失败 / 磁盘异常 / 导出异常）只告警：
-        初版产物在导出成功时就已落盘，标注失败不改变它们。
-        """
-        suggestions = None
-        try:
-            diarizer_cls, assign = _resolve_diarize_tools()
-            diarizer = diarizer_cls(self.settings)
-            audio, sample_rate = _read_audio(audio_path)
-            spans = diarizer.label(audio, sample_rate)
-            store = recorder.store
-            # assign_speakers 直接改 seg.speaker（store.segments() 返回同一批实例）
-            assign(store.segments(), spans)
-            for seg in store.segments():
-                if seg.speaker:
-                    store.register_label(seg.speaker)
-            # 声纹认人：算出本场每人的声纹向量并与本地库比对（失败只跳过，不影响产物）
-            suggestions = self._collect_voiceprints(store, audio, sample_rate, spans)
-            # 覆盖同名产物：逐字稿/纪要现在带说话人
-            export_all(store, self.settings, title, started_at,
-                       translator=getattr(recorder, "translator", None))
-        except Exception as e:
-            self.bridge.diarized.emit(
-                False, f"[警告] 会后说话人标注失败（已导出的产物保持原样）：{e}")
-            return
-        # 建议在产物更新之后发：模态框出现时，用户手上的文件已经是带说话人版本
-        if suggestions is not None:
-            self.bridge.speaker_suggestions.emit(suggestions)
-        self.bridge.diarized.emit(True, OFFLINE_DIARIZED_DONE)
+        """会后自动标注：复用 _label_worker（子进程），失败只告警不改变产物。"""
+        self._label_worker(audio_path, recorder.store, title, started_at, None,
+                           getattr(recorder, "translator", None))
 
     def _on_diarized(self, ok: bool, msg: str) -> None:
         """标注结果回到 GUI 线程：只更新状态栏（不弹窗打断用户）。
@@ -1676,6 +1713,28 @@ class MainWindow(QMainWindow):
         worker.join(VOICEPRINT_TIMEOUT)
         value = box.get("value")
         return value if isinstance(value, dict) else {}
+
+    def _collect_voiceprints_from(self, store, embeddings):
+        """用子进程算好的声纹向量比对本地库（纯 numpy，进程内跑安全）。"""
+        if not self._voiceprint_on():
+            return None
+        if not embeddings:
+            return None
+        threshold = float(getattr(self.settings, "voiceprint_threshold", 0.75) or 0.75)
+        known = {sp.label for sp in store.speakers()}
+        suggestions: dict[str, tuple[str, float]] = {}
+        for label, vector in embeddings.items():
+            label = str(label)
+            if known and label not in known:
+                continue
+            self._pending_vectors[label] = vector
+            try:
+                hits = self._voiceprints.match(vector, threshold=threshold)
+            except Exception:
+                hits = []
+            if hits:
+                suggestions[label] = (str(hits[0][0]), float(hits[0][1]))
+        return suggestions
 
     def _collect_voiceprints(self, store, audio, sample_rate, spans):
         """（标注线程）算本场声纹向量 → 比对本地库 → 返回 ``{label: (姓名, 分数)}``。
