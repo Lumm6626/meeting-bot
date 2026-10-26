@@ -24,6 +24,7 @@ def pretty_speaker_label(label: str) -> str:
     return f"发言人{idx + 1}"
 
 
+MERGE_GAP_SECONDS = 0.8      # 未标注时：停顿 < 0.8s 视为同一段话
 MAX_BLOCK_CHARS = 320        # 单个发言段最多约 320 字（超了再起一段，避免一大坨）
 
 _END_PUNCT = "。！？；：，、….!?;:,"
@@ -408,15 +409,18 @@ class TranscriptStore:
 
         # ---- 正文：同类发言人合并成段 ----
         buf: list[Segment] = []
-        for label, segs in turns:
-            for seg in segs:
-                same_turn = bool(buf) and buf[-1].speaker == seg.speaker and bool(seg.speaker)
-                if same_turn and _block_chars(buf) < MAX_BLOCK_CHARS:
-                    buf.append(seg)
-                else:
-                    if buf:
-                        _flush_turn(lines, buf, self)
-                    buf = [seg]
+        for seg in self._segments:
+            if not buf:
+                buf = [seg]
+                continue
+            same_speaker = buf[-1].speaker == seg.speaker and bool(seg.speaker)
+            # 未标注（发言人?）时也按「停顿很短」合并成段：避免一句一行太碎
+            close_enough = (seg.start - buf[-1].end) <= MERGE_GAP_SECONDS
+            if (same_speaker or close_enough) and _block_chars(buf) < MAX_BLOCK_CHARS:
+                buf.append(seg)
+            else:
+                _flush_turn(lines, buf, self)
+                buf = [seg]
         if buf:
             _flush_turn(lines, buf, self)
         return chr(10).join(lines)
