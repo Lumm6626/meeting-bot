@@ -297,20 +297,30 @@ def _block_chars(segs: list[Segment]) -> int:
 
 
 def _flush_turn(lines: list[str], segs: list[Segment], store) -> None:
-    """输出一个发言回合（Teams 转录样式）：发言人 + 时间 → 原文在前、译文在后。"""
+    """输出一个发言回合（Teams 转录样式）：
+
+    **发言人A**　[00:01:31]
+    原文每句一行…
+
+    > 译文每句一行…
+    """
     label = segs[0].speaker or ""
     speaker = store.display_name(label)
     lines.append(f"**{speaker}**　{fmt_ts(segs[0].start)}")
-
-    # 原文（多句合并成一段，句间自动补标点）
-    original = join_sentences([s.text for s in segs])
-    lines.append(original)
     lines.append("")
-
-    # 译文：与原文不同时才单独给一行（纯中文发言不重复）
-    translated = join_sentences([s.translation for s in segs if (s.translation or "").strip()])
-    if translated and translated.strip() != original.strip():
-        lines.append(f"> 译文：{translated}")
+    # 原文：每句单独一行（保留说话节奏，不糊成一大段）
+    for seg in segs:
+        text = (seg.text or "").strip()
+        if text:
+            lines.append(text)
+    lines.append("")
+    # 译文：每句单独一行，引用块与原文区分；纯中文发言不重复显示
+    translated = [(seg.translation or "").strip() for seg in segs
+                  if (seg.translation or "").strip()
+                  and (seg.translation or "").strip() != (seg.text or "").strip()]
+    if translated:
+        for t in translated:
+            lines.append(f"> {t}")
         lines.append("")
 
 
@@ -416,7 +426,7 @@ class TranscriptStore:
             same_speaker = buf[-1].speaker == seg.speaker and bool(seg.speaker)
             # 未标注（发言人?）时也按「停顿很短」合并成段：避免一句一行太碎
             close_enough = (seg.start - buf[-1].end) <= MERGE_GAP_SECONDS
-            if (same_speaker or close_enough) and _block_chars(buf) < MAX_BLOCK_CHARS:
+            if same_speaker or close_enough:
                 buf.append(seg)
             else:
                 _flush_turn(lines, buf, self)
