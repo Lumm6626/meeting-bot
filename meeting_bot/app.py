@@ -69,6 +69,9 @@ def _resolve_diarize_tools():
 
     只加载 diarization 模块（torch/pyannote），不连带 recorder/faster-whisper ——
     会后标注发生在录制结束之后，不该顺带把识别模型再拖进来。
+
+    ⚠️ 主进程**不要**再用它拿 assign_speakers（那会把 pyannote 拖进 Qt 进程，
+    实测段错误）；子进程标注走 :func:`_resolve_assign`。
     """
     global Diarizer, assign_speakers
     if Diarizer is None or assign_speakers is None:
@@ -79,6 +82,21 @@ def _resolve_diarize_tools():
         if assign_speakers is None:
             assign_speakers = _assign_speakers
     return Diarizer, assign_speakers
+
+
+def _resolve_assign():
+    """只取 assign_speakers（纯 numpy 逻辑，不 import torch/pyannote）。
+
+    标注已跑在子进程，主进程只需要「把 spans 套到句子上」这一步。之前图省事
+    复用了 :func:`_resolve_diarize_tools`，结果每次标注都会在主进程 import
+    pyannote —— Qt 进程内加载它会段错误，且会与预热线程抢 import 锁（实测测试
+    卡死 / 偶发崩溃）。
+    """
+    global assign_speakers
+    if assign_speakers is None:
+        from .speaker_assign import assign_speakers as _assign_speakers
+        assign_speakers = _assign_speakers
+    return assign_speakers
 
 
 def _read_audio(path: Path):
@@ -1424,10 +1442,12 @@ class MainWindow(QMainWindow):
         return None
 
     def _label_speakers(self) -> None:
-        """主入口：打开**逐字稿标注窗口**（对照稿子逐句指定发言人）。
+        """主入口：**按声纹标注发言人**（一位参会者一张卡，填名字一次全场生效）。
 
-        不再强制先跑 pyannote：把稿子摊开让用户直接标，最快也最准。
-        「自动区分说话人」（声纹聚类）保留在托盘菜单里，作为可选的预分组手段。
+        流程：
+        1. 本场已有声纹标签（pyannote 分出的 SPEAKER_xx）→ 直接开声纹面板；
+        2. 还没有 → 问「要先用声纹分出参会者吗」，同意就后台标注（完成后自动弹面板）；
+        3. 用户不想等 / 没录音 → 退回逐句标注（对照稿子手工指定）。
         """
         store = self._resolve_store_for_labeling()
         if store is None:
@@ -1436,10 +1456,76 @@ class MainWindow(QMainWindow):
         if not segs:
             self.status.setText("这场没有逐字稿内容，无法标注")
             return
+        if self._has_speaker_labels(store):
+            self._open_label_dialog()
+            return
+
+        audio = self._audio_for_store(store)
+        if audio is None:
+            self.status.setText("找不到这场会议的录音，只能用逐句标注")
+            self._label_segments_by_hand(store)
+            return
+
+        answer = QMessageBox.question(
+            self, "按声纹标注发言人",
+            "本场还没区分说话人。\n\n"
+            "要先用声纹把参会者分出来吗？\n"
+            "（后台运行，约会议时长的 0.5~1.5 倍；完成后会自动弹出命名面板，"
+            "命名一次以后每场都能自动认人）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if answer == QMessageBox.StandardButton.Yes:
+            session = getattr(self, "_last_session", None) or {}
+            title = session.get("title") or "未命名会议"
+            started_at = session.get("started_at") or datetime.now()
+            self._run_label_job(audio, store, title, started_at, None,
+                                session.get("translator"))
+            return
+        self._label_segments_by_hand(store)
+
+    def _has_speaker_labels(self, store) -> bool:
+        """本场是否已由声纹分出说话人（有 SPEAKER_xx 标签即算）。"""
+        return any((sp.label or "").strip() for sp in store.speakers())
+
+    def _audio_for_store(self, store) -> Path | None:
+        """找这场会议对应的 wav（当前会话优先，其次按日志文件名 / mtime 配对）。"""
+        session = getattr(self, "_last_session", None) or {}
+        guess = getattr(session.get("recorder"), "audio_path", None)
+        if guess and Path(guess).is_file():
+            return Path(guess)
+        journal = getattr(store, "journal", None)
+        if journal is None:
+            return None
+        wav = Path(journal.path).with_suffix(".wav")
+        if wav.is_file():
+            return wav
+        # 日志与音频文件名可能差几秒：取 mtime 最接近的录音（_pair_journal 的反向匹配）
+        try:
+            mtime = Path(journal.path).stat().st_mtime
+        except OSError:
+            return None
+        best: tuple[float, Path] | None = None
+        try:
+            candidates = list(self._recording_dir().glob("rec_*.wav"))
+        except OSError:
+            return None
+        for cand in candidates:
+            paired = self._pair_journal(cand)
+            if paired is None or Path(paired).resolve() != Path(journal.path).resolve():
+                continue
+            try:
+                delta = abs(cand.stat().st_mtime - mtime)
+            except OSError:
+                continue
+            if best is None or delta < best[0]:
+                best = (delta, cand)
+        return best[1] if best else None
+
+    def _label_segments_by_hand(self, store) -> None:
+        """兜底：对照逐字稿逐句指定发言人（不依赖声纹）。"""
         known = [sp.name or sp.label for sp in store.speakers()]
-        # 已有名字也当候选；再补上「发言人1..3」方便快速点选
         known = [n for n in dict.fromkeys(known) if n]
-        dlg = SegmentLabelDialog(segs, known_names=known, parent=self,
+        dlg = SegmentLabelDialog(store.segments(), known_names=known, parent=self,
                                  display_resolver=store.display_name)
         if not dlg.exec():
             return
@@ -1698,7 +1784,7 @@ class MainWindow(QMainWindow):
             data = self._run_diarizer_subprocess(audio_path, num_speakers,
                                                  timeout=self._diarize_timeout(audio_path))
             spans = [(float(a), float(b), str(lbl)) for a, b, lbl in data.get("spans") or []]
-            _, assign = _resolve_diarize_tools()
+            assign = _resolve_assign()
             changed: list[int] = []
             for seg in store.segments():
                 before = seg.speaker
@@ -1715,6 +1801,9 @@ class MainWindow(QMainWindow):
                     store.register_label(seg.speaker)
             embeddings = {
                 str(k): _to_floats(v) for k, v in (data.get("embeddings") or {}).items()}
+            # 向量落进会议日志：以后打开这场会议仍能「按声纹认人 / 学习」
+            for label, vector in embeddings.items():
+                store.record_voice_vector(label, vector)
             suggestions = self._collect_voiceprints_from(store, embeddings)
             export_all(store, self.settings, title, started_at,
                        translator=translator or self._journal_translator(store))
@@ -1786,6 +1875,7 @@ class MainWindow(QMainWindow):
         self._pending_vectors: dict[str, object] = {}
         self._adopted: dict[str, str] = {}
         self._suggestion_names: dict[str, str] = {}
+        self._suggestion_scores: dict[str, float] = {}
 
     def _embed_with_deadline(self, audio, sample_rate, spans):
         """带硬超时地算声纹向量：模型下载卡住 / 网络不通时也要按时把产物交出去。
@@ -1896,33 +1986,75 @@ class MainWindow(QMainWindow):
         return session.get("store") if session else None
 
     def _open_label_dialog(self) -> None:
-        """打开说话人标记面板（每声纹：示例发言 + 名字输入框 + 声纹建议预填）。"""
+        """打开**声纹命名面板**：一个声纹一张卡（声纹库匹配建议 + 示例发言 + 名字框）。
+
+        向量来源：本次标注的内存结果优先，否则用会议日志里存下的向量（历史会议也能
+        按声纹认人 / 学习）。没跑过声纹的场次打开也只会得到一个空面板，所以先从日志
+        把向量浇进 ``_pending_vectors``。
+        """
         self._label_dialog_scheduled = False
+        try:
+            self._open_label_dialog_body()
+        except Exception as e:      # 槽函数抛异常在 PyQt6 里会把整个程序 abort
+            self.status.setText(f"标记面板打开失败：{e}")
+
+    def _open_label_dialog_body(self) -> None:
         store = self._current_store()
         if store is None:
             return
         labels = store.speakers()
         if not labels:
             return
+        self._seed_vectors(store)
+        self._refresh_suggestions(store)
+
         data: list[dict] = []
         for sp in labels:
             segs = [s for s in store.segments() if s.speaker == sp.label]
             samples = []
             for seg in segs[:3]:
-                body_text = seg.translation or seg.text
-                samples.append(f"{body_text.strip()}\n  〔原文〕 {seg.text.strip()}")
+                samples.append(f"{seg.text.strip()}")
+                translated = (seg.translation or "").strip()
+                if translated and translated != (seg.text or "").strip():
+                    samples.append(f"　→ {translated}")
             first = segs[0].start if segs else 0.0
             last = segs[-1].end if segs else 0.0
             data.append({
                 "label": sp.label,
+                "name": sp.name or "",
                 "samples": samples,
                 "suggest": self._suggestion_names.get(sp.label, ""),
+                "score": self._suggestion_scores.get(sp.label, 0.0),
                 "count": len(segs),
                 "span": f"{_fmt_hms(first)} → {_fmt_hms(last)}",
             })
-        dlg = SpeakerLabelDialog(data, parent=self)
+        dlg = SpeakerLabelDialog(data, parent=self,
+                                 known_names=self._voiceprints.people())
         if dlg.exec():
             self._apply_label_names(dlg.names)
+
+    def _seed_vectors(self, store) -> None:
+        """本场内存向量优先；缺失的从会议日志的 voice 记录里补（历史会议也能学习）。"""
+        for label, vector in (getattr(store, "voice_vectors", {}) or {}).items():
+            self._pending_vectors.setdefault(str(label), vector)
+
+    def _refresh_suggestions(self, store) -> None:
+        """用声纹库比对本场每个声纹，得出「疑似谁 + 相似度」（只对还不知道名字的）。"""
+        if not self._voiceprint_on():
+            return
+        threshold = float(getattr(self.settings, "voiceprint_threshold", 0.75) or 0.75)
+        named = {sp.label for sp in store.speakers() if (sp.name or "").strip()}
+        for label, vector in (getattr(store, "voice_vectors", {}) or {}).items():
+            label = str(label)
+            if label in named or label in self._suggestion_names:
+                continue
+            try:
+                hits = self._voiceprints.match(vector, threshold=threshold)
+            except Exception:
+                hits = []
+            if hits:
+                self._suggestion_names[label] = str(hits[0][0])
+                self._suggestion_scores[label] = float(hits[0][1])
 
     def _apply_label_names(self, names: dict[str, str]) -> None:
         """面板确认：写 store → 声纹学习 → 回填字幕 → 异步重导产物。"""
@@ -1977,12 +2109,22 @@ class MainWindow(QMainWindow):
                 changed |= self._adopt_vector(speaker.label, speaker.name)
         return changed
 
+    def _vector_of(self, label: str):
+        """取本场某个声纹标签的向量：内存结果优先，其次会议日志里存下的。"""
+        vector = self._pending_vectors.get(label)
+        if vector is not None:
+            return vector
+        store = self._current_store()
+        if store is None:
+            return None
+        return (getattr(store, "voice_vectors", {}) or {}).get(label)
+
     def _adopt_vector(self, label: str, name: str) -> bool:
         """本场这个 label 的向量 → 记到 name 名下（同名只记一次，改名则重记）。"""
         name = (name or "").strip()
         if not name or self._adopted.get(label) == name:
             return False
-        vector = self._pending_vectors.get(label)
+        vector = self._vector_of(label)
         if vector is None:                # 本场没算出这个 label 的向量（无音频 / 模型不可用）
             return False
         if not self._voiceprints.add(name, vector):
@@ -2008,7 +2150,7 @@ class MainWindow(QMainWindow):
         wrong = {other for other in (suggested, adopted) if other and other != name}
         try:
             changed = False
-            vector = self._pending_vectors.get(label) if wrong else None
+            vector = self._vector_of(label) if wrong else None
             if vector is not None:
                 for other in sorted(wrong):
                     changed |= bool(self._voiceprints.penalize(other, vector))

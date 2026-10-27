@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -128,6 +129,7 @@ class Journal:
         {"t":"add","seq","start","end","text","lang","speaker","translation"}
         {"t":"update","seq",...只写改动的字段}
         {"t":"speaker","label","name"}
+        {"t":"voice","label","vector"}                该声纹的声纹向量（认人用）
         {"t":"footer"}                                正常结束（已导出）
 
     ``footer`` 是「本场已完整落盘」的标记：下次启动扫描工作区时，没有 footer 的
@@ -144,6 +146,10 @@ class Journal:
                                   encoding="utf-8", newline="\n")
         self._closed = False
         self._finished = False
+        # 回放（load_journal）期间挂起写入：否则「读日志 → 重建 store」会把回放
+        # 动作（update / speaker）当新事件再追加回去，同一条日志每开一次翻一倍
+        # （实测撑到 2.5 GB）
+        self._suspend_depth = 0
         # 写失败的「最近一次异常」：日志是防丢的安全网，不能反过来把录制搞崩
         self.error: Exception | None = None
         if not self._append:
@@ -153,7 +159,7 @@ class Journal:
 
     def _write(self, obj: dict) -> None:
         with self._lock:
-            if self._closed:
+            if self._closed or self._suspend_depth > 0:
                 return
             try:
                 _write_jsonl_line(self._fp, obj)
@@ -174,6 +180,27 @@ class Journal:
 
     def record_speaker(self, label: str, name: str) -> None:
         self._write({"t": "speaker", "label": label, "name": name})
+
+    def record_voice(self, label: str, vector) -> None:
+        """记一条声纹向量（每场每人一条，认人/学习用；写失败也不影响主流程）。"""
+        try:
+            values = [round(float(x), 6) for x in vector]
+        except (TypeError, ValueError):
+            return
+        if not label or not values:
+            return
+        self._write({"t": "voice", "label": str(label), "vector": values})
+
+    @contextmanager
+    def suspended(self):
+        """上下文内不写盘（回放重建 store 时用）。可嵌套。"""
+        with self._lock:
+            self._suspend_depth += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._suspend_depth = max(0, self._suspend_depth - 1)
 
     def footer(self) -> None:
         """标记本场已完整落盘/导出（幂等：重复调用只写一次）。"""
@@ -252,25 +279,49 @@ def load_journal(path: Path | str, attach_journal: bool = False) ->         tupl
       ``attach_journal=True`` 时以追加模式挂回原日志——之后的改名等事件会写回
       该文件（用于「对历史会议补标记发言人」）。
     """
-    title: str | None = None
-    started_at: datetime | None = None
     store = TranscriptStore(journal=Journal(path, append=True)
                             if attach_journal else None)
     # 先把行全部读进来再回放：挂日志（追加模式）会在回放 update/speaker 事件时
     # 往同一文件追加新行，若边读边写会把刚追加的行再读回来 → 无限循环（实测卡死）
     with Path(path).open("r", encoding="utf-8") as fp:
         lines = fp.readlines()
+    # 回放期间禁止写盘：否则 set_speaker_name / update 会把回放动作再追加回日志，
+    # 同一条日志每打开一次就翻一倍（曾把一场会议撑到 2.5 GB）
+    journal = store.journal
+    ctx = journal.suspended() if journal is not None else _null_ctx()
+    with ctx:
+        _replay_lines(lines, store)
+    title = store.session_title
+    if not title:
+        raise ValueError(f"日志缺少 header，无法恢复：{path}")
+    return title, _started_of(lines) or datetime.now(), store
+
+
+def _null_ctx():
+    """空上下文（没有挂 journal 时用，避免分支写两份回放代码）。"""
+    from contextlib import nullcontext
+    return nullcontext()
+
+
+def _started_of(lines) -> datetime | None:
+    for line in lines:
+        ev = _parse_line(line)
+        if ev and ev.get("t") == HEADER:
+            try:
+                return datetime.fromisoformat(str(ev.get("started_at")))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _replay_lines(lines, store) -> None:
     for line in lines:
             ev = _parse_line(line)
             if ev is None:
                 continue                      # 坏行 / 空行：跳过继续
             kind = ev.get("t")
             if kind == HEADER:
-                title = str(ev.get("title") or "")
-                try:
-                    started_at = datetime.fromisoformat(str(ev.get("started_at")))
-                except (TypeError, ValueError):
-                    started_at = None
+                store.session_title = str(ev.get("title") or "")
             elif kind == "add":
                 store._restore(Segment(
                     start=float(ev.get("start") or 0.0),
@@ -286,10 +337,15 @@ def load_journal(path: Path | str, attach_journal: bool = False) ->         tupl
             elif kind == "speaker":
                 store.set_speaker_name(str(ev.get("label") or ""),
                                        str(ev.get("name") or ""))
+            elif kind == "voice":
+                label = str(ev.get("label") or "")
+                try:
+                    vector = [float(x) for x in (ev.get("vector") or [])]
+                except (TypeError, ValueError):
+                    vector = []
+                if label and vector:
+                    store.voice_vectors[label] = vector
             # footer 只是标记，回放时无需处理
-    if title is None:
-        raise ValueError(f"日志缺少 header，无法恢复：{path}")
-    return title, started_at or datetime.now(), store
 
 
 def _block_chars(segs: list[Segment]) -> int:
@@ -328,6 +384,10 @@ class TranscriptStore:
     def __init__(self, journal: Journal | None = None) -> None:
         self._segments: list[Segment] = []
         self._speakers: dict[str, Speaker] = {}
+        # 本场每个声纹标签的声纹向量（label → 向量）：用于「按声纹认人 / 学习」
+        self.voice_vectors: dict[str, list[float]] = {}
+        # 回放时 header 里的会议标题（load_journal 取它做返回值）
+        self.session_title: str = ""
         self._next_seq = 1
         # 有日志则每次变更同步落盘：进程被杀/断电后可经 load_journal 重建
         self._journal = journal
@@ -352,9 +412,26 @@ class TranscriptStore:
                     if hasattr(seg, k):
                         setattr(seg, k, v)
                         changed[k] = v
+                if changed.get("speaker"):
+                    # 标注结果也会进 speakers()：历史会议回放后只有 speaker 字段，
+                    # 不登记的话声纹面板 / 声纹比对全都看不到这些人
+                    self.register_label(str(changed["speaker"]))
                 if changed and self._journal is not None:
                     self._journal.record_update(seq, changed)
                 return
+
+    def record_voice_vector(self, label: str, vector) -> bool:
+        """登记一个声纹标签的向量（写内存 + 日志；同名只记一次，避免重复写盘）。"""
+        try:
+            values = [round(float(x), 6) for x in vector]
+        except (TypeError, ValueError):
+            return False
+        if not label or not values:
+            return False
+        self.voice_vectors[str(label)] = values
+        if self._journal is not None:
+            self._journal.record_voice(str(label), values)
+        return True
 
     def register_label(self, label: str) -> None:
         # 不写日志：标签可由 add 事件里的 speaker 字段推导，多记一行纯属冗余。
@@ -389,6 +466,8 @@ class TranscriptStore:
     def _restore(self, seg: Segment) -> None:
         """回放日志用：按日志里的 seq 原样放回（不重编号，保证后续 update 能命中）。"""
         self._segments.append(seg)
+        if seg.speaker:
+            self.register_label(seg.speaker)   # 让 speakers() 认得日志里带的声纹标签
         if seg.seq >= self._next_seq:
             self._next_seq = seg.seq + 1
 

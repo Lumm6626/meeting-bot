@@ -149,10 +149,12 @@ def _fake_label_dialog(monkeypatch):
     class FakeDialog:
         instances: list[dict] = []
 
-        def __init__(self, speakers, parent=None):
+        def __init__(self, speakers, parent=None, known_names=()):
             self.speakers = speakers
+            self.known = list(known_names)
             self.names = {}
-            FakeDialog.instances.append({"speakers": speakers})
+            FakeDialog.instances.append({"speakers": speakers,
+                                        "known": list(known_names)})
 
         def exec(self):
             return 0        # Rejected：默认不命名，具体用例可 monkeypatch 该行为
@@ -1258,10 +1260,16 @@ def test_recovery_ignores_journal_created_by_current_session(win, qapp, tmp_path
 # ---------------------------------------------------------------------------
 
 def _make_terms_win(qapp, tmp_path, **overrides):
-    """带 asr_prompt 的窗口（不经 load_settings，直接 dataclasses.replace）。"""
+    """带 asr_prompt 的窗口（不经 load_settings，直接 dataclasses.replace）。
+
+    术语库隔离到 tmp_path：真实 术语库.json 会被用户会议不断学习，不隔离的话
+    「合并 asr_prompt」类断言会随数据漂移而失败。
+    """
     from dataclasses import replace
 
     w = MainWindow(replace(_settings(tmp_path), **overrides))
+    from meeting_bot.glossary import GlossaryLibrary
+    w._glossary_lib = GlossaryLibrary(tmp_path / "术语库.json")
     for timer_name in ("_timer", "_elapsed_timer"):
         timer = getattr(w, timer_name, None)
         if timer is not None:
@@ -1643,6 +1651,10 @@ class _FakeVoiceprints:
         self.added: list[tuple[str, object]] = []
         self.penalized: list[tuple[str, object]] = []
         self.saves = 0
+
+    def people(self):
+        """声纹库已知姓名（标记面板拿去当候选下拉项）。"""
+        return [name for name, _score in self.hits] or ["张总"]
 
     def match(self, vector, threshold=0.75):
         self.thresholds.append(threshold)

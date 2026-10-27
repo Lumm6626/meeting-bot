@@ -27,3 +27,9 @@ cache/
 # 识别自动学习数据（术语库/纠错表，本地生物无关数据）
 术语库.json
 纠错表.json
+
+# 临时标注/修复脚本产物
+_auto_diarize.*
+_diarize_out.json
+_demo_panel.py
+_repair_journal.py

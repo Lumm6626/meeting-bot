@@ -14,16 +14,42 @@ _app = QApplication.instance() or QApplication([])
 def test_dialog_prefills_suggest_and_returns_names():
     dlg = SpeakerLabelDialog([{
         "label": "SPEAKER_00",
-        "samples": ["要走流程，这个不能跳过。\n  〔原文〕 要走流程,这个不能跳过"],
+        "name": "",
+        "samples": ["要走流程，这个不能跳过。", "　→ This needs the proper process."],
         "suggest": "张总",
+        "score": 0.86,
         "count": 12,
         "span": "00:01:02 → 00:21:45",
-    }])
+    }], known_names=["张总", "李四"])
     edit = dlg._inputs["SPEAKER_00"]
-    assert edit.text() == "张总"          # 声纹建议预填
-    edit.setText("李四")
+    assert edit.currentText() == "张总"     # 声纹匹配建议预填
+    # 声纹库已知姓名都在候选里（可直接选，不用重打）
+    items = [edit.itemText(i) for i in range(edit.count())]
+    assert "张总" in items and "李四" in items
+    edit.setCurrentText("李四")
     dlg._on_save()
     assert dlg.names == {"SPEAKER_00": "李四"}
+
+
+def test_dialog_keeps_placeholder_name_unchanged():
+    """没改名字（仍是 发言人A）不算命名 —— 否则会把「发言人A」当人名存进声纹库。"""
+    dlg = SpeakerLabelDialog([{"label": "SPEAKER_00", "name": "", "samples": [],
+                               "suggest": "", "score": 0, "count": 1, "span": ""}])
+    combo = dlg._inputs["SPEAKER_00"]
+    combo.setCurrentText("发言人A")
+    dlg._on_save()
+    assert dlg.names == {}
+
+
+def test_dialog_shows_pretty_speaker_label():
+    """卡片标题用「发言人A/B」（与逐字稿一致），不暴露 SPEAKER_00。"""
+    from PyQt6.QtWidgets import QLabel
+
+    dlg = SpeakerLabelDialog([{"label": "SPEAKER_01", "name": "", "samples": [],
+                               "suggest": "", "score": 0, "count": 2, "span": ""}])
+    texts = [w.text() for w in dlg.findChildren(QLabel)]
+    assert any("发言人B" in t for t in texts)
+    assert not any("SPEAKER_01" in t for t in texts)
 
 
 def test_dialog_empty_names_omitted():

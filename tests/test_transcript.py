@@ -96,3 +96,59 @@ def test_journal_append_keeps_single_header(tmp_path):
     # 回放完整文件：名字仍在
     title3, _, st3 = load_journal(p)
     assert st3.display_name("SPEAKER_00") == "张总" or True  # 名字事件回放
+
+
+def test_reopening_attached_journal_does_not_grow_file(tmp_path):
+    """反复「打开历史会议补标记」不能把日志越写越大（曾撑到 2.5 GB）。
+
+    回放时 set_speaker_name / update 会触发写盘，若不挂起就变成
+    「读日志 → 把回放动作再追加回去」→ 每打开一次翻一倍（指数级膨胀）。
+    """
+    p = tmp_path / "rec.jsonl"
+    store = TranscriptStore(journal=Journal(p, title="原场"))
+    for i in range(3):
+        seg = store.add(float(i), float(i) + 2, f"line {i}")
+        store.update(seg.seq, speaker="SPEAKER_00")
+    store.set_speaker_name("SPEAKER_00", "张总")
+    store.journal.close()
+    size_before = p.stat().st_size
+
+    for _ in range(4):
+        title, _started, st = load_journal(p, attach_journal=True)
+        assert title == "原场"
+        assert st.display_name("SPEAKER_00") == "张总"
+        st.journal.close()
+
+    assert p.stat().st_size == size_before, "回放又往日志里写东西了（会指数膨胀）"
+
+
+def test_voice_vector_roundtrip(tmp_path):
+    """声纹向量写进日志并能回放（按声纹认人 / 学习要用它）。"""
+    p = tmp_path / "rec.jsonl"
+    store = TranscriptStore(journal=Journal(p, title="会"))
+    seg = store.add(0.0, 2.0, "hi")
+    store.update(seg.seq, speaker="SPEAKER_00")
+    assert store.record_voice_vector("SPEAKER_00", [0.1, 0.2, 0.3])
+    store.journal.close()
+
+    _t, _s, st2 = load_journal(p)
+    assert st2.voice_vectors == {"SPEAKER_00": [0.1, 0.2, 0.3]}
+
+
+def test_speakers_lists_diarized_labels_after_replay(tmp_path):
+    """历史会议回放后 speakers() 必须列出 pyannote 分出的标签。
+
+    否则「标记发言人」会得到空面板（标注结果只落在 segment.speaker 上），
+    声纹认人 / 学习整条链路都走不通。
+    """
+    p = tmp_path / "rec.jsonl"
+    store = TranscriptStore(journal=Journal(p, title="会"))
+    a = store.add(0.0, 2.0, "hello")
+    b = store.add(2.0, 4.0, "hi")
+    store.update(a.seq, speaker="SPEAKER_00", translation="你好")
+    store.update(b.seq, speaker="SPEAKER_01")
+    store.journal.close()
+
+    _t, _s, st2 = load_journal(p)
+    assert [sp.label for sp in st2.speakers()] == ["SPEAKER_00", "SPEAKER_01"]
+    assert st2.display_name("SPEAKER_01") == "发言人B"      # 未命名 → 漂亮标签
