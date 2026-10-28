@@ -217,6 +217,11 @@ OFFLINE_DIARIZE_STATUS = ("正在会后标注说话人"
                           "（约 0.5~1.5 倍会议时长，可继续用电脑）")
 OFFLINE_DIARIZED_DONE = "说话人标注完成，已更新逐字稿"
 OFFLINE_NO_AUDIO = "[提示] 未保存录音（SAVE_AUDIO=false），跳过会后说话人标注"
+# 快速认人（会后 1~3 分钟出结果）：不跑全量 pyannote 聚类，用发言回合的声纹向量
+# 在线聚类 + 认熟人。FAST_DIARIZE=false 时退回「先导出无名字产物，再后台跑全量标注」。
+FAST_DIARIZE_TIMEOUT = 900.0          # 兜底超时（89 分钟的会实测 2.6 分钟）
+FAST_DIARIZE_STATUS = "正在快速识别发言人（约 1~3 分钟，纪要会直接带名字）…"
+FAST_DIARIZE_DONE = "发言人已识别：{speakers} 人（认出熟人 {named} 位）"
 # 声纹计算的硬上限：模型要下载 / 网络卡住 / CPU 太慢时，绝不能拖着不导出产物。
 # 冷启动（import torch + 加载 wespeaker + 每人 ≤60 秒音频）实测 20 秒内，留足余量。
 VOICEPRINT_TIMEOUT = 120.0
@@ -1359,6 +1364,9 @@ class MainWindow(QMainWindow):
                 recorder.stop()
                 title = title_hint or recorder.title or "未命名会议"
                 started_at = recorder.started_at or datetime.now()
+                # 导出前先快速认人（1~3 分钟）：这样逐字稿**和纪要**一次成型就带人名，
+                # 不必等会后那轮 75 分钟的 pyannote 再重导一遍（重导还要再调一次 LLM）
+                self._fast_identify_result = self._fast_identify(recorder)
                 transcript_path, minutes_path = export_all(
                     recorder.store, self.settings, title, started_at,
                     translator=recorder.translator)
@@ -1401,6 +1409,11 @@ class MainWindow(QMainWindow):
 
         只在 finish() 线程里调用：此时 recorder 已 stop、录音文件已封口。
         """
+        if getattr(self, "_fast_identify_result", None):
+            # 快速认人已经分好说话人（且认出了熟人）：不必再花 1 倍会议时长跑全量
+            # pyannote。要精修可把 FAST_DIARIZE 关掉，或在界面上手动重跑「标注说话人」。
+            self.bridge.status.emit(FAST_DIARIZE_DONE.format(**self._fast_identify_result))
+            return
         if not self._offline_diarize_allowed():
             return
         audio = getattr(recorder, "audio_path", None)
@@ -1742,8 +1755,12 @@ class MainWindow(QMainWindow):
         return best if best is not None and best_gap <= 300 else None
 
     def _run_diarizer_subprocess(self, audio_path: Path, num_speakers: int | None,
-                                 timeout: float) -> dict:
+                                 timeout: float,
+                                 extra_args: list[str] | None = None) -> dict:
         """在独立进程里跑标注（Qt 进程内加载 pyannote 会段错误，实测崩溃）。
+
+        ``extra_args``：透传给子进程的参数（快速模式的 ``--fast`` / ``--spans`` /
+        ``--first-index`` 从这里进）。
 
         返回 {"spans": [...], "embeddings": {...}}；失败抛 RuntimeError（带原因）。
         """
@@ -1758,6 +1775,7 @@ class MainWindow(QMainWindow):
                "--wav", str(audio_path), "--out", str(out)]
         if num_speakers:
             cmd += ["--num-speakers", str(int(num_speakers))]
+        cmd += list(extra_args or [])
         env = dict(os.environ)
         env.setdefault("PYTHONIOENCODING", "utf-8")
         try:
@@ -1830,6 +1848,101 @@ class MainWindow(QMainWindow):
         if session and session.get("store") is store:
             return session.get("translator")
         return None
+
+    def _fast_identify(self, recorder) -> dict | None:
+        """会后**快速认人**：发言回合 → 声纹向量 → 聚类 + 认熟人（子进程，1~3 分钟）。
+
+        为什么快：pyannote 全量聚类要 0.5~1.5 倍会议时长（50 分钟的会跑 75 分钟），
+        而这里假定「一个发言回合里只有一个人在说」（VAD 已经切好），只对每个回合算
+        一条声纹向量（实测 3 秒片段 150 ms），几百个回合约 1~2 分钟出结果。
+
+        成功后：spans 回填到语句（写日志）、认出的名字直接落进 store（逐字稿/纪要
+        立刻带人名）、簇平均向量学进声纹库（下次更容易认出）。失败/超时返回 None，
+        后续仍会走原来的全量标注流程 —— 认人是增强项，绝不能拖住产物。
+        """
+        settings = self.settings
+        if not bool(getattr(settings, "fast_diarize", True)):
+            return None
+        if not (getattr(settings, "hf_token", "") or "").strip():
+            return None
+        audio = getattr(recorder, "audio_path", None)
+        try:
+            has_audio = audio is not None and Path(audio).is_file()
+        except OSError:
+            has_audio = False
+        if not has_audio:
+            return None
+        store = getattr(recorder, "store", None)
+        if store is None:
+            return None
+        from .fast_identify import build_turns
+
+        turns = build_turns(store.segments())
+        if not turns:
+            return None
+        import json
+        import tempfile
+
+        self.bridge.status.emit(FAST_DIARIZE_STATUS)
+        spans_path = Path(tempfile.mkstemp(suffix=".json", prefix="turns_")[1])
+        try:
+            spans_path.write_text(json.dumps([[float(a), float(b)] for a, b in turns],
+                                             ensure_ascii=False), encoding="utf-8")
+            data = self._run_diarizer_subprocess(
+                Path(audio), None, timeout=FAST_DIARIZE_TIMEOUT,
+                extra_args=["--fast", "--spans", str(spans_path),
+                            "--first-index", str(self._next_speaker_index(store))])
+        except Exception as e:
+            self.bridge.status.emit(f"[提示] 快速识别发言人失败（不影响产物）：{e}")
+            return None
+        finally:
+            try:
+                spans_path.unlink()
+            except OSError:
+                pass
+
+        spans = [(float(a), float(b), str(lbl)) for a, b, lbl in data.get("spans") or []]
+        names = {str(k): str(v) for k, v in (data.get("names") or {}).items() if v}
+        if not spans:
+            return None
+        assign = _resolve_assign()
+        changed: list[int] = []
+        for seg in store.segments():
+            before = seg.speaker
+            assign([seg], spans)
+            if seg.speaker != before:
+                changed.append(seg.seq)
+        if getattr(store, "journal", None) is not None:
+            for seg in store.segments():
+                if seg.seq in changed:
+                    store.update(seg.seq, speaker=seg.speaker)
+        for label, name in names.items():
+            store.set_speaker_name(label, name)
+        # 学习：簇的平均向量比单句稳，直接入库（每人上限 20 条，自动丢最旧）
+        learned = 0
+        if self._voiceprint_on():
+            for label, vector in (data.get("embeddings") or {}).items():
+                name = names.get(str(label))
+                if not name:
+                    continue
+                try:
+                    if self._voiceprints.add(name, vector):
+                        learned += 1
+                except Exception:
+                    pass
+            if learned:
+                self._voiceprints.save()
+        return {"speakers": len(store.speakers()), "named": len(names)}
+
+    @staticmethod
+    def _next_speaker_index(store) -> int:
+        """新标签起始编号 = 本场已有 SPEAKER_nn 的最大号 + 1（避免撞车合并错人）。"""
+        best = -1
+        for speaker in store.speakers():
+            m = re.match(r"SPEAKER_(\d+)$", speaker.label or "")
+            if m:
+                best = max(best, int(m.group(1)))
+        return best + 1
 
     def _offline_diarize_worker(self, recorder, audio_path: Path,
                                 title: str, started_at: datetime) -> None:
@@ -2176,6 +2289,16 @@ class MainWindow(QMainWindow):
         self._set_recording_state(False)
         self.status.setText("完成" if ok else "导出失败")
         self._refresh_elapsed()          # 计时行立刻回到「就绪」（不必等下一秒的定时器）
+        # 快速认人是在收尾线程里改的 store（人名、说话人标签）：回到 GUI 线程后
+        # 把已显示的字幕头行也换成真名（否则窗口里还是 发言人A/B，跟纪要文件不一致）
+        try:
+            self._sync_subtitle_names()
+            refresh = getattr(self.subtitle, "refresh_names", None)
+            if callable(refresh):
+                refresh()
+            self._refresh_speakers()
+        except Exception:
+            pass
         if not self._quitting:
             if ok:
                 QMessageBox.information(self, "完成", msg)

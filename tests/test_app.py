@@ -391,7 +391,7 @@ def _write_wav(tmp_path) -> Path:
     return path
 
 
-def _fake_diarize_tools(monkeypatch, calls, spans=None):
+def _fake_diarize_tools(monkeypatch, calls, spans=None, fast=False):
     """把「标注子进程 + assign_speakers」打桩（进程内绝不加载 torch/pyannote）。
 
     标注现在跑在独立子进程（Qt 进程内加载 pyannote 会段错误），所以测试改成
@@ -399,9 +399,10 @@ def _fake_diarize_tools(monkeypatch, calls, spans=None):
     """
     spans = spans or [(0.0, 4.0, "SPEAKER_00")]
 
-    def _fake_run(self, audio_path, num_speakers, timeout):
+    def _fake_run(self, audio_path, num_speakers, timeout, extra_args=None):
         calls["subprocess"] = {"wav": str(audio_path),
-                               "num_speakers": num_speakers}
+                               "num_speakers": num_speakers,
+                               "extra_args": list(extra_args or [])}
         embeddings = calls.pop("embeddings", {})
         return {"spans": spans, "embeddings": embeddings}
 
@@ -415,6 +416,11 @@ def _fake_diarize_tools(monkeypatch, calls, spans=None):
 
     # 标注已改为子进程：Diarizer 不再进程内构造；只替换 assign_speakers
     monkeypatch.setattr(appmod, "assign_speakers", _fake_assign)
+    if not fast:
+        # 这些用例测的是「会后全量标注」老流程：关掉导出前的快速认人，
+        # 否则快速认人一成功就会跳过后台标注（那是另一组用例的事）。
+        monkeypatch.setattr(appmod.MainWindow, "_fast_identify",
+                            lambda self, recorder: None)
 
 
 def test_finish_runs_offline_diarize_and_re_exports(win, qapp, dialogs, monkeypatch, tmp_path):
@@ -2259,3 +2265,141 @@ def test_long_status_text_is_truncated(win):
     """超长报错（含不可断行路径）只显示前 160 字，避免撑宽窗口/刷屏。"""
     win._on_status("错误" * 300)
     assert len(win.status.text()) <= 161
+
+
+# ---------------------------------------------------------------------------
+# a2. 会后「快速认人」：导出前把人名写进 store，只导一次（不再等全量标注）
+# ---------------------------------------------------------------------------
+
+_FAST_PAYLOAD = {
+    "spans": [[0.0, 4.0, "SPEAKER_00"]],
+    "names": {"SPEAKER_00": "Peter Ren"},
+    "scores": {"SPEAKER_00": 0.88},
+    "counts": {"SPEAKER_00": 1},
+    "embeddings": {"SPEAKER_00": [0.1] * 8},
+}
+
+
+def _fake_fast_subprocess(monkeypatch, calls, payload=None):
+    """快速认人子进程替身：返回 spans + names + 簇向量，记录传入参数。"""
+    data = dict(payload if payload is not None else _FAST_PAYLOAD)
+
+    def _fake_run(self, audio_path, num_speakers, timeout, extra_args=None):
+        args = list(extra_args or [])
+        if "--fast" not in args:       # 全量标注（快速失败后的回落）给正常结果
+            return {"spans": [[0.0, 4.0, "SPEAKER_00"]], "embeddings": {}}
+        calls["fast"] = {"wav": str(audio_path), "args": args, "timeout": timeout}
+        calls["spans_arg"] = args[args.index("--spans") + 1] if "--spans" in args else ""
+        return data
+
+    monkeypatch.setattr(appmod.MainWindow, "_run_diarizer_subprocess", _fake_run)
+
+    def _fake_assign(segs, spans_):
+        for seg in segs:
+            seg.speaker = spans_[0][2]
+        return segs
+
+    monkeypatch.setattr(appmod, "assign_speakers", _fake_assign)
+
+
+def test_fast_identify_names_applied_before_export(
+        win, qapp, dialogs, monkeypatch, tmp_path):
+    """快速认人成功 → 名字在导出前就落进 store，因此只导一次带人名的产物。
+
+    这是「会议结束马上拿到带人名的纪要」的核心：若等会后全量标注再重导，既要 75 分钟，
+    还要再调一次 LLM 生成纪要。这里断言三条：① 只导出一次；② 导出时 store 已带名字；
+    ③ 快速结果里的簇向量被学进声纹库。
+    """
+    exports, export_threads, calls, statuses = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_fast_subprocess(monkeypatch, calls)
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken",
+                                       fast_diarize=True)
+    added = {}
+
+    class _FakePrints:
+        def add(self, name, vector):
+            added[name] = list(vector)
+            return True
+
+        def save(self):
+            added["saved"] = True
+
+        def match(self, vector, threshold=0.75):
+            return []
+
+        def people(self):
+            return list(added)
+
+    monkeypatch.setattr(win, "_voiceprints", _FakePrints())
+    monkeypatch.setattr(appmod.MainWindow, "_voiceprint_on",
+                        lambda self: True, raising=False)
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.status.connect(statuses.append)
+
+    win._stop()
+
+    assert _pump_until(qapp, lambda: bool(exports) and win.start_btn.isEnabled(), timeout=15.0)
+    # ① 只导一次（快速认人在 finish 线程里、导出之前完成）
+    assert len(exports) == 1, f"应当只导出一次：{len(exports)}"
+    # ② 导出那一刻 store 里已经有说话人 + 真名
+    assert recorder.store.segments()[0].speaker == "SPEAKER_00"
+    assert recorder.store.display_name("SPEAKER_00") == "Peter Ren"
+    # ③ 簇向量入库（下次开会更容易认出来）
+    assert added.get("Peter Ren") and added.get("saved")
+    # 传参正确：--fast + 回合文件 + first-index
+    assert "--fast" in calls["fast"]["args"] and calls["spans_arg"]
+    # 状态栏提示「快速识别中」与结果
+    assert any("快速识别发言人" in m for m in statuses), statuses
+    assert any("认出熟人" in m for m in statuses), statuses
+
+
+def test_fast_identify_skipped_when_disabled(win, qapp, dialogs, monkeypatch, tmp_path):
+    """FAST_DIARIZE=false：不跑快速认人，走「初版导出 → 后台全量标注 → 重导」。"""
+    exports, export_threads, calls, diarized = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)          # fast=False：快速认人返回 None
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken",
+                                       fast_diarize=False)
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.diarized.connect(lambda ok, msg: diarized.append((ok, msg)))
+
+    win._stop()
+
+    assert _pump_until(qapp, lambda: len(exports) == 2 and bool(diarized), timeout=15.0), (
+        f"关掉快速认人后应回到两次导出：exports={len(exports)}")
+    assert calls["subprocess"]["extra_args"] == []       # 传的是全量标注参数
+
+
+def test_fast_identify_failure_falls_back_to_full_diarize(
+        win, qapp, dialogs, monkeypatch, tmp_path):
+    """快速认人返回空（子进程失败/超时）：不能吞掉发言人标注，仍走全量标注。"""
+    exports, export_threads, calls, diarized = [], [], {}, []
+    monkeypatch.setattr(appmod, "export_all", _export_stub(exports, export_threads))
+    _fake_diarize_tools(monkeypatch, calls)
+    _fake_fast_subprocess(monkeypatch, calls, payload={"spans": [], "names": {}})
+    win.settings = dataclasses.replace(win.settings, hf_token="hf_faketoken",
+                                       fast_diarize=True)
+
+    recorder = _DiarizableRecorder(_write_wav(tmp_path))
+    _prepare_recording(win, recorder)
+    win.bridge.diarized.connect(lambda ok, msg: diarized.append((ok, msg)))
+
+    win._stop()
+
+    assert _pump_until(qapp, lambda: len(exports) == 2 and bool(diarized), timeout=15.0), (
+        f"快速失败后应回落到全量标注：exports={len(exports)} diarized={diarized}")
+    assert diarized[0][0] is True
+
+
+def test_next_speaker_index_avoids_collision(win):
+    """新标签从已有 SPEAKER_nn 的最大号 + 1 起编（否则会和录制中的标签合并错人）。"""
+    recorder = FakeRecorder(title="索引")
+    recorder.store.register_label("SPEAKER_02")
+    recorder.store.register_label("SPEAKER_07")
+    assert appmod.MainWindow._next_speaker_index(recorder.store) == 8
+    assert appmod.MainWindow._next_speaker_index(TranscriptStore()) == 0

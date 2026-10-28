@@ -89,6 +89,10 @@ class Settings:
     # 会后离线说话人标注（OFFLINE_DIARIZE）：录制结束、初版产物导出后，再对整场音频
     # 跑一遍 pyannote 并把「谁说的」补进逐字稿/纪要（耗时约 0.5~1.5 倍会议时长）。
     offline_diarize: bool = True
+    # 会后**快速**认人（FAST_DIARIZE，默认开）：导出产物之前先用发言回合的声纹向量
+    # 聚类 + 认熟人（1~3 分钟），这样逐字稿和纪要一次成型就带人名，不必等全量 pyannote
+    # 跑完再重导（重导还要再调一次 LLM）。关掉则退回「先导出无名字 → 后台全量标注」。
+    fast_diarize: bool = True
     # 声纹库（VOICEPRINT_ENABLED / VOICEPRINT_THRESHOLD）：会后算声纹向量记住「谁的声音」，
     # 下次自动认人；用户在表格里改名即入库学习。库是本机 声纹库.json（已 git 忽略）。
     voiceprint_enabled: bool = True
@@ -270,6 +274,7 @@ def load_settings(env_path: Path | None = None) -> Settings:
         close_to_tray=_bool_env("CLOSE_TO_TRAY", True),
         save_audio=_bool_env("SAVE_AUDIO", True),
         offline_diarize=_bool_env("OFFLINE_DIARIZE", True),
+        fast_diarize=_bool_env("FAST_DIARIZE", True),
         voiceprint_enabled=_bool_env("VOICEPRINT_ENABLED", True),
         voiceprint_threshold=_float_env_or("VOICEPRINT_THRESHOLD", 0.75),
     )
